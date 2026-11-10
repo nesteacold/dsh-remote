@@ -293,8 +293,14 @@ package đó; hiện plugin đang mượn bản trong `plugins/mobile-gateway`.
   bạn.
 - Không cho thiết bị tự nâng quyền của chính nó. Muốn mở rộng thì ghép lại, và
   phải qua tay bạn.
-- Nút thiết bị ở chân sidebar của upstream vẫn còn, trùng một phần với trang
-  Devices. Đang nằm trong danh sách dọn.
+- Khi đang nối tới một host remote, sidebar nhóm **thay** hẳn browser workspace
+  của DSH. Những phần trang trí mà plugin khác gắn vào từng dòng session — dấu
+  task đã hẹn giờ, icon của một integration — sẽ không hiện trong chế độ đó. Đây
+  là giới hạn của hệ slot chứ không phải thiếu một lời gọi: shell chỉ cho một
+  component render slot con khi chính đăng ký của nó khai báo slot con ấy, mà
+  browser gốc vẫn đang khai báo tất cả ở bên dưới, nên khai từ đây sẽ ném lỗi và
+  kéo cả sidebar nhóm sập theo. Bản thân dòng session vẫn giữ đủ thứ của nó: mở,
+  ghim, lưu trữ, chấm chưa đọc.
 - Mới test trên Windows với DSH 0.2.2-rc.1. App điện thoại có code native cho
   Android và iOS; phía iOS đã build được nhưng chưa chạy trên máy thật.
 

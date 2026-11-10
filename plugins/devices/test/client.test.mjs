@@ -88,10 +88,14 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
   // lower one ("lowest renders"). `sidebar.workspaces` ships occupied by the stock
   // browser (`tk`) at priority 0; client-p2b.test.mjs is where that slot is exercised,
   // but the rule lives here too so no fake in this package can pass a collision.
+  // The kinds are the shipped catalog's (client-ui-settings-general declares both
+  // settings.section slots `list`), and `register` below carries the rest of the
+  // rule: a `list`/`keyed` entry must carry its key option before a seat is even
+  // looked for, and a `list` seat is (id, priority).
   const SLOT_KINDS = {
     'sidebar.workspaces': 'single',
-    'settings.section': 'keyed',
-    'settings.section.icon': 'keyed',
+    'settings.section': 'list',
+    'settings.section.icon': 'list',
     'conversation.input.left': 'list',
     'conversation.input.dock': 'list',
     'conversation.input.right': 'list',
@@ -125,14 +129,30 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
         const kind = SLOT_KINDS[meta.name]
         if (!kind) throw new Error(`slot "${meta.name}" is not declared (a parent entry's children table must declare it)`)
         const priority = meta.priority ?? 0
-        const taken = occupants.get(meta.name).find((occupant) => (occupant.meta.priority ?? 0) === priority
-          && (kind === 'single' || occupant.meta.id === meta.id))
+        const held = occupants.get(meta.name)
+        // SlotCore.register switches on the declared kind: the mandatory option is
+        // checked BEFORE any collision (a `list` entry with no id throws on an empty
+        // slot too), the collision key is that option paired with the priority — so
+        // two entries at one priority are legal when their ids differ and the same id
+        // at the same priority throws — and `chain` is keyed by its own `select` with
+        // no collision seat at all.
+        let taken
+        if (kind === 'single') {
+          taken = held.find((occupant) => (occupant.meta.priority ?? 0) === priority)
+        } else if (kind === 'list' || kind === 'keyed') {
+          const option = kind === 'list' ? 'id' : 'key'
+          if (meta[option] === undefined) throw new Error(`${kind} slot "${meta.name}" requires options.${option}`)
+          taken = held.find((occupant) => (occupant.meta.priority ?? 0) === priority && occupant.meta[option] === meta[option])
+        } else if (meta.select === undefined) {
+          throw new Error(`chain slot "${meta.name}" requires options.select`)
+        }
         if (taken) {
           const by = taken.meta.registrant !== undefined ? ` (registered by ${taken.meta.registrant})` : ''
-          const what = kind === 'single' ? 'a registration' : kind === 'keyed' ? `an entry for key "${meta.id}"` : `an entry with id "${meta.id}"`
+          const what = kind === 'single' ? 'a registration'
+            : kind === 'keyed' ? `an entry for key "${meta.key}"` : `an entry with id "${meta.id}"`
           throw new Error(`${kind} slot "${meta.name}" already has ${what} at priority ${priority}${by} — register at a different priority to shadow it (lowest renders)`)
         }
-        occupants.get(meta.name).push({ meta })
+        held.push({ meta })
         return { meta, component }
       },
     },

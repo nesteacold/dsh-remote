@@ -1471,6 +1471,13 @@ window.__ModuleLoader__.load({
         const status = statusOf(id)
         const isPinned = pinned.has(id)
         const isArchived = archived.has(id)
+        // No per-row child seats here (sidebar.session.row.leading/.trailing/.hover,
+        // sidebar.workspaces.session.row.action). A row cannot render them: the shell
+        // hands `renderSlot` only to an entry that declares those children itself, and
+        // SlotCore.register refuses a child key another live entry declares — the stock
+        // browser declares all four and stays live under this shadow at priority 0.
+        // Measured cost of trying anyway: the registration throws and the grouped
+        // sidebar falls back entirely. Leave them out rather than re-add a broken call.
         return h('div', { key: id, className: 'dshdev-side-session', 'data-testid': 'session-row', 'data-depth': depth,
           style: depth > 0 ? { paddingLeft: 12 * depth } : undefined },
           h('button', { type: 'button', className: 'dshdev-side-title', title: titleOf(summary, id), 'data-testid': 'session-open',

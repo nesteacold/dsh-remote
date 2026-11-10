@@ -65,10 +65,14 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
   // browser (`tk`) at priority 0 — the collision that made spec 008 never render on
   // a live Host while a permissive fake let it pass. Modelling the rule here is the
   // point: a same-priority replacement must fail the suite, not a user's session.
+  // The kinds are the shipped catalog's (client-ui-settings-general declares both
+  // settings.section slots `list`), and `register` below carries the rest of the
+  // rule: a `list`/`keyed` entry must carry its key option before a seat is even
+  // looked for, and a `list` seat is (id, priority).
   const SLOT_KINDS = {
     'sidebar.workspaces': 'single',
-    'settings.section': 'keyed',
-    'settings.section.icon': 'keyed',
+    'settings.section': 'list',
+    'settings.section.icon': 'list',
     'conversation.input.left': 'list',
     'conversation.input.dock': 'list',
     'conversation.input.right': 'list',
@@ -139,15 +143,30 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
         const kind = SLOT_KINDS[meta.name]
         if (!kind) throw new Error(`slot "${meta.name}" is not declared (a parent entry's children table must declare it)`)
         const priority = meta.priority ?? 0
-        const sameSeat = (occupant) => (occupant.meta.priority ?? 0) === priority
-          && (kind === 'single' || occupant.meta.id === meta.id)
-        const taken = occupants.get(meta.name).find(sameSeat)
+        const held = occupants.get(meta.name)
+        // SlotCore.register switches on the declared kind: the mandatory option is
+        // checked BEFORE any collision (a `list` entry with no id throws on an empty
+        // slot too), the collision key is that option paired with the priority — so
+        // two entries at one priority are legal when their ids differ and the same id
+        // at the same priority throws — and `chain` is keyed by its own `select` with
+        // no collision seat at all.
+        let taken
+        if (kind === 'single') {
+          taken = held.find((occupant) => (occupant.meta.priority ?? 0) === priority)
+        } else if (kind === 'list' || kind === 'keyed') {
+          const option = kind === 'list' ? 'id' : 'key'
+          if (meta[option] === undefined) throw new Error(`${kind} slot "${meta.name}" requires options.${option}`)
+          taken = held.find((occupant) => (occupant.meta.priority ?? 0) === priority && occupant.meta[option] === meta[option])
+        } else if (meta.select === undefined) {
+          throw new Error(`chain slot "${meta.name}" requires options.select`)
+        }
         if (taken) {
           const by = taken.meta.registrant !== undefined ? ` (registered by ${taken.meta.registrant})` : ''
-          const what = kind === 'single' ? 'a registration' : kind === 'keyed' ? `an entry for key "${meta.id}"` : `an entry with id "${meta.id}"`
+          const what = kind === 'single' ? 'a registration'
+            : kind === 'keyed' ? `an entry for key "${meta.key}"` : `an entry with id "${meta.id}"`
           throw new Error(`${kind} slot "${meta.name}" already has ${what} at priority ${priority}${by} — register at a different priority to shadow it (lowest renders)`)
         }
-        occupants.get(meta.name).push({ slot: meta.name, meta, component })
+        held.push({ slot: meta.name, meta, component })
         return { meta, component }
       },
     },
@@ -297,6 +316,56 @@ test('grouped rendering: "Local workspaces" first, then one group per host with 
   // The archive affordance joins the workspace service (documented API).
   await click(byTestId(remoteRow, 'archive-toggle')[0])
   page.unmount()
+})
+
+test('remote session rows carry no per-row child seats: a shadowing entry is given no renderSlot, so a row is identical with or without occupants', async () => {
+  const ui = load()
+  await flush()
+  const entry = ui.entryOf('sidebar.workspaces')
+  assert.ok(entry, 'the replacement took the slot')
+  // Why there is nothing to render, pinned so a later attempt fails here instead of
+  // in a user's session: the renderer's standardKit hands `renderSlot` only to an
+  // entry that declares `children` (dsh-client-ui-renderer/lib/client.js:753-754) and
+  // that binding throws SlotOwnershipError for any key outside the same table
+  // (ib.:347-349); SlotCore.register refuses a child key another live entry already
+  // declares, and the stock browser — still live under this shadow at priority 0 —
+  // declares all four row seats (dsh-client-ui-workspace/lib/client.js:6050-6079).
+  assert.equal(entry.meta.children, undefined, 'the shadowing entry declares no child slots')
+
+  const ROW_SEATS = ['sidebar.session.row.leading', 'sidebar.session.row.trailing',
+    'sidebar.session.row.hover', 'sidebar.workspaces.session.row.action']
+  const seatCalls = []
+  const renderSlot = (key, owner) => { seatCalls.push([key, owner]); return null }
+  const without = await mount(React.createElement(entry.component, sidebarProps({ renderSlot })))
+  const before = text(without)
+  without.unmount()
+  // Now every row seat has an occupant, the way the shipped decorations arrive
+  // (schedule mark, forge panel). This fake models declarations for the grouped
+  // slot only, so the seats are occupied directly; components here are never given
+  // a kit, which is exactly the point — nothing can render them from our row.
+  let occupantRenders = 0
+  const Occupant = () => { occupantRenders += 1; return React.createElement('span', { 'data-testid': 'child-seat-occupant' }) }
+  for (const seat of ROW_SEATS) {
+    const held = ui.occupants.get(seat) ?? []
+    held.push({ slot: seat, meta: { name: seat, id: `probe.${seat}`, priority: 10 }, component: Occupant })
+    ui.occupants.set(seat, held)
+  }
+  const withSeats = await mount(React.createElement(entry.component, sidebarProps({ renderSlot })))
+  assert.equal(text(withSeats), before, 'an occupied row renders byte-identically: no gap, no layout shift')
+  assert.deepEqual(seatCalls, [], 'no child seat is reached for, even with a renderSlot in hand')
+  assert.equal(occupantRenders, 0, 'no occupant component is rendered by the grouped row')
+  // The row keeps every affordance it has today: title, unread dot, click-through.
+  const remoteRow = byTestId(withSeats, 'session-row')[1]
+  assert.equal(byTestId(remoteRow, 'session-open')[0].children.join(''), 'Fix the build')
+  assert.equal(byTestId(remoteRow, 'unread-dot').length, 1)
+  assert.equal(byTestId(remoteRow, 'pin-toggle').length, 1)
+  assert.equal(byTestId(remoteRow, 'archive-toggle').length, 1)
+  const props = sidebarProps()
+  const page2 = await mount(React.createElement(entry.component, props))
+  await click(byTestId(byTestId(page2, 'session-row')[1], 'session-open')[0])
+  assert.deepEqual(props.opened, ['h:r1:s-remote'], 'the row still opens its session')
+  page2.unmount()
+  withSeats.unmount()
 })
 
 test('one search box filters across every group; a group with no match disappears', async () => {

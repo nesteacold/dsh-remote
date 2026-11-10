@@ -308,8 +308,14 @@ when both are present.
   this version, deliberately. Use Tailscale or a VPN you control.
 - It does not let a device push a scope upgrade on itself. Re-pairing is the way
   to widen a grant, and that goes through the owner again.
-- The gateway's own sidebar button (from upstream) is still there and partly
-  duplicates the Devices page. Removing it is on the list.
+- While a remote host is connected, the grouped sidebar **replaces** the shipped
+  workspace browser. Row decorations other plugins add to session rows — a
+  scheduled-task mark, an integration's icon — do not render in that mode. This is
+  a limit of the slot system rather than a missing call: the shell lets a
+  component render a child slot only when its own registration declares that
+  child, and the shipped browser still declares all of them underneath, so
+  declaring them here throws and takes the grouped sidebar down with it. The rows
+  keep every affordance of their own: open, pin, archive, unread dot.
 - Tested on Windows with DSH 0.2.2-rc.1. The phone module has Android and iOS
   native code; the iOS side has been built but not run on a device by us.
 
