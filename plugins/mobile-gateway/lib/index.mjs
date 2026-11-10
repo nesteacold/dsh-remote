@@ -306,7 +306,11 @@ const Config = Schema.object({
   endpoints: Schema.array(Schema.string()).default([]),
   // HTTPS port of the plugin-owned TLS listener. 0 = ephemeral port (tests); the
   // bound port is reported by /mgw/status and used in the pairing QR.
-  lanPort: Schema.natural().min(0).max(65535).default(3081),
+  // 30081, not 3081: on Windows a listener inside the OS dynamic port range can
+  // collide with an outbound connection's source port and fail to bind at random.
+  // That range is 49152-65535 by default but is commonly retuned — one machine we
+  // measured ran 1024-15000, which covers 3081. 20000-39999 stays outside both.
+  lanPort: Schema.natural().min(0).max(65535).default(30081),
   tlsCertificateDir: Schema.string().default(''),
   webrtc: Schema.object({
     enabled: Schema.boolean().default(false),
@@ -2299,7 +2303,7 @@ function lanWebSocketUrls(options, wsPath, boundPort) {
 function tlsAdvertisedHosts(options, wsPath) {
   const hosts = new Set(['localhost', '127.0.0.1'])
   if (options.lanEnabled === true) {
-    for (const url of lanWebSocketUrls(options, wsPath, options.lanPort || 3081)) {
+    for (const url of lanWebSocketUrls(options, wsPath, options.lanPort || 30081)) {
       try { hosts.add(new URL(url).hostname.replace(/^\[|\]$/g, '')) } catch { /* ignore */ }
     }
   }
@@ -2506,7 +2510,7 @@ const plugin = {
       pairingTtlMs: DEFAULT_PAIRING_TTL_MS,
       lanEnabled: false,
       lanHost: '127.0.0.1',
-      lanPort: 3081,
+      lanPort: 30081,
       tlsCertificateDir: '',
     // Test-only override (never set by the bundle): `true` serves admin-only
     // request types to the loopback listener as the owner's own web server has

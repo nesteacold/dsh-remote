@@ -90,7 +90,7 @@ your sidebar.
 sequenceDiagram
     autonumber
     participant You
-    participant Host as Remote DSH Host<br/>gateway :3081
+    participant Host as Remote DSH Host<br/>gateway :30081
     participant Local as This DSH<br/>Devices page
 
     You->>Host: Settings → Devices → "Pair a device"
@@ -245,7 +245,7 @@ To use it from elsewhere, set the listen address in the gateway config:
   config:
     lanEnabled: true
     lanHost: 100.64.0.7   # a private LAN address, or this machine's Tailscale address
-    lanPort: 3081
+    lanPort: 30081
 ```
 
 A Tailscale address is the better default: reachable from your own devices,

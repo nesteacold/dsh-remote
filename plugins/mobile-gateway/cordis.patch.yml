@@ -42,7 +42,7 @@
         # is replaced only by POST /mgw/tls/regenerate (loopback only).
         lanEnabled: false
         lanHost: 127.0.0.1
-        lanPort: 3081
+        lanPort: 30081
         # tlsCertificateDir: /path/to/mobile-gateway-tls
         # v1 hard-disables the Cloudflare Tunnel and the `cloudflared` download
         # (T031, FR-011/R9): /mgw/cloudflare* answers 403 `cloudflare/disabled`,

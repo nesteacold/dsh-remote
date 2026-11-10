@@ -84,7 +84,7 @@ Máy kia chạy DSH. Ghép đôi một lần là phiên của nó hiện trong s
 sequenceDiagram
     autonumber
     participant Ban as Bạn
-    participant Host as Máy kia<br/>gateway :3081
+    participant Host as Máy kia<br/>gateway :30081
     participant Local as Máy này<br/>trang Devices
 
     Ban->>Host: Settings → Devices → tạo mã ghép đôi
@@ -237,7 +237,7 @@ Muốn dùng từ máy khác thì đặt địa chỉ lắng nghe trong config c
   config:
     lanEnabled: true
     lanHost: 100.64.0.7   # IP LAN nội bộ, hoặc địa chỉ Tailscale của máy này
-    lanPort: 3081
+    lanPort: 30081
 ```
 
 Địa chỉ Tailscale là lựa chọn gọn hơn: máy của bạn vào được, người ngoài không
