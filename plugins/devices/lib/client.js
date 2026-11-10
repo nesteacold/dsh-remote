@@ -220,6 +220,9 @@ window.__ModuleLoader__.load({
         sidebarGrouping: 'Sidebar grouping',
         sidebarOn: 'grouped by host',
         sidebarOffState: 'off',
+        // --- the grant is short: remote sessions/workspaces cannot appear (spec 008) ---
+        missingRemoteScope: 'Remote sessions and workspaces cannot appear until this device is paired again on that host with the "Use this host remotely" (harness:remote) permission.',
+        hostRefused: 'The host refused the last request',
       },
       vi: {
         title: 'Thiết bị',
@@ -423,6 +426,9 @@ window.__ModuleLoader__.load({
         sidebarGrouping: 'Nhóm thanh bên',
         sidebarOn: 'nhóm theo host',
         sidebarOffState: 'tắt',
+        // --- thiếu quyền: phiên và workspace từ xa không hiển thị được (spec 008) ---
+        missingRemoteScope: 'Phiên và workspace từ xa sẽ không hiện ra cho tới khi thiết bị này được ghép đôi lại trên host đó kèm quyền "Dùng host này từ xa" (harness:remote).',
+        hostRefused: 'Host đã từ chối yêu cầu vừa rồi',
       },
     }
     let hostLanguage = ''
@@ -498,6 +504,8 @@ window.__ModuleLoader__.load({
 .dshdev-switch[aria-checked=true]::after{left:19px}
 .dshdev-switch:disabled{opacity:.5;cursor:default}
 .dshdev-err{color:${colors.danger};margin:8px 0}
+/* A short grant: visible on the remote's own row, but it blocks nothing. */
+.dshdev-warn{margin-top:6px;padding:6px 10px;border-left:3px solid ${colors.danger};border-radius:6px;background:${colors.hover};color:${colors.text};font-size:12px}
 .dshdev-msg{margin:6px 0;padding:8px 10px;border-radius:8px;background:${colors.hover};white-space:pre-wrap;word-break:break-word}
 .dshdev-msg.user{border-left:3px solid ${colors.accent}}
 .dshdev-otp{font-family:ui-monospace,monospace;font-size:34px;font-weight:700;letter-spacing:.12em;text-align:center;padding:14px 0}
@@ -1218,6 +1226,19 @@ window.__ModuleLoader__.load({
             note ? h('span', { className: 'dshdev-muted' }, note) : null)) : null)
     }
 
+    const scopesOfGrant = (remote) => (remote && remote.device && Array.isArray(remote.device.scopes) ? remote.device.scopes : null)
+    /**
+     * The grant a remote Host made does not include `harness:remote`, so the merged
+     * session/workspace lists carry Local rows only — the feature is dead while every
+     * indicator stays green (spec 008, measured end to end). Re-pairing is the only
+     * fix: the gateway has no scope-update route.
+     * A gateway older than scopes sends no list at all; then nothing is claimed.
+     */
+    const lacksRemoteScope = (remote) => {
+      const scopes = scopesOfGrant(remote)
+      return scopes !== null && !scopes.includes('harness:remote')
+    }
+
     function ConnectTab() {
       useLang()
       const [remotes, setRemotes] = React.useState([])
@@ -1249,6 +1270,13 @@ window.__ModuleLoader__.load({
               h('div', { className: 'dshdev-grow' },
                 h('div', { className: 'dshdev-row' }, h('strong', null, remote.name), statusBadge(remote.status)),
                 h('div', { className: 'dshdev-muted' }, remote.address),
+                lacksRemoteScope(remote)
+                  ? h('div', { className: 'dshdev-warn', 'data-testid': 'missing-remote-scope', role: 'status' }, tr('missingRemoteScope'))
+                  : null,
+                remote.hostError
+                  ? h('div', { className: 'dshdev-muted', 'data-testid': 'host-refused' },
+                    `${tr('hostRefused')} — ${remote.hostError.code}${remote.hostError.scope ? ` (${remote.hostError.scope})` : ''}`)
+                  : null,
                 remote.approvals && remote.approvals.length ? h('div', { className: 'dshdev-badge bad' }, `${tr('approvals')}: ${remote.approvals.length}`) : null),
               h('button', { type: 'button', className: 'dshdev-btn', disabled: remote.status === 'revoked', onClick: () => setOpenId(remote.id) }, tr('open')),
               h('button', { type: 'button', className: 'dshdev-btn danger', onClick: () => remove(remote) }, tr('removeRemote')))))))

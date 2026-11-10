@@ -723,6 +723,32 @@ test('session/list concatenates Local and every host, newest activity first', as
   assertNoNamespacedId(hostB)
 })
 
+test('a host that refuses session/list is reported in status(); a later success clears it', async () => {
+  // Measured end to end: a grant without `harness:remote` makes the Host refuse the
+  // bridge call, the merged list keeps only Local rows, and the only symptom used to
+  // be the log line. The refusal now rides `status().hosts[].error`, which the
+  // Devices page shows on that host's row.
+  const refusal = Object.assign(new Error('scope refused'), { code: 'auth/forbidden-scope', scope: 'harness:remote' })
+  let reply = refusal
+  const hostB = createFakeRemote('hostB', 'Host B', { replies: { get 'session/list'() { return reply } } })
+  const harness = createHarness({ remotes: [hostB] })
+  const answer = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  assert.equal(answer.ok, true, 'a failing remote must not fail the merged list')
+  const [host] = harness.router.status().hosts
+  assert.equal(host.hostId, 'hostB')
+  assert.equal(host.error.code, 'auth/forbidden-scope')
+  assert.equal(host.error.scope, 'harness:remote')
+  assert.ok(harness.logs.some((line) => line.includes('session/list from hostB failed: auth/forbidden-scope')),
+    'the id-only log line stays the audit trail')
+  // Re-paired with the scope: the next merged list carries the rows and no error.
+  reply = { items: [session('sb1', 200)] }
+  const healed = await harness.gateway.dispatchRpc('session/list', { args: {} }, undefined, {})
+  assert.deepEqual(healed.value.items.map((item) => item.sessionId), ['h:hostB:sb1'])
+  assert.deepEqual(harness.router.status().hosts, [{ hostId: 'hostB', hostName: 'Host B', online: true }],
+    'a host that never refused a call carries no error field')
+  harness.router.uninstall()
+})
+
 // -- transport: remote streams --------------------------------------------
 
 // -- reload stacking (measured live on 0.2.2-rc.1) --------------------------

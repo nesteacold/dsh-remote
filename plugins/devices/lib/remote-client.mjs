@@ -713,6 +713,10 @@ export function verificationCode(certSha256, clientNonce, serverNonce) {
  *  4. The Host answers `pairing-pending` with a 6-digit code (also derived here
  *     and compared: a mismatch aborts) -> `onPending(code)` so the UI can show it.
  *  5. Wait (cancelable via `signal`) for `paired` + `hello`, or a rejection.
+ * No scope list travels with this claim: the Host's pairing OFFER (kind + scopes,
+ * `POST /mgw/pair`) is what the owner approves, and `pairing-proof` carries only a
+ * nonce — so asking for `harness:remote` here would need a gateway change. A short
+ * grant is reported on the Devices page instead (lib/client.js `missingRemoteScope`).
  * Resolves `{ token, device, hello, certSha256, gatewayId, gatewayName }`.
  */
 export async function claimWithOtp({ url, otp, clientDeviceId, deviceName, onPending, signal, timeoutMs = 10_000,

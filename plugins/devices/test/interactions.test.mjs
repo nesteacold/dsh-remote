@@ -20,6 +20,7 @@ import { test } from 'node:test'
 
 import { PINNED_DSH_VERSION, createHostRouter, hostIdsIn, namespaceId } from '../lib/host-router.mjs'
 import { RemoteConnection, claimPairing } from '../lib/remote-client.mjs'
+import { requestJson } from './fixture-http.mjs'
 
 // The remote gateway is imported read-only; nothing in it is edited (spec 008).
 const gatewayPlugin = (await import('../../mobile-gateway/lib/index.mjs')).default
@@ -639,12 +640,8 @@ async function startRealGateway(t) {
   const base = `http://127.0.0.1:${port}`
   const api = {
     base, listeners, calls: host.calls,
-    async post(route, body) {
-      const response = await fetch(`${base}/mgw/${route}`, { method: 'POST',
-        headers: { 'Content-Type': 'application/json', Origin: base }, body: JSON.stringify(body ?? {}) })
-      return { status: response.status, data: await response.json() }
-    },
-    async get(route) { return (await fetch(`${base}/mgw/${route}`)).json() },
+    post(route, body) { return requestJson(base, 'POST', `/mgw/${route}`, { body: body ?? {}, headers: { Origin: base } }) },
+    async get(route) { return (await requestJson(base, 'GET', `/mgw/${route}`)).data },
   }
   for (let attempt = 0; attempt < 250; attempt += 1) {
     const status = await api.get('status')

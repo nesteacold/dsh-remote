@@ -138,6 +138,8 @@ const APPROVAL_EVENT = 'approval/request'
 const QUESTION_EVENT = 'user-questions/request'
 /** How many remote cards one controller keeps addressable (bounded like the buffer). */
 const MAX_TRACKED_CARDS = 128
+/** How many per-host refusals the status keeps for the Devices page (bounded). */
+const MAX_HOST_ERRORS = 32
 
 /** A refusal this module produced; `code` rides the Gateway failure vocabulary. */
 export class HostRouterError extends Error {
@@ -632,6 +634,14 @@ export class HostRouter {
    *   approvalId?: string, argsHash?: string, kind: 'approval'|'question'}>}
    */
   #cards = new Map()
+  /**
+   * The last call a host refused, per host (`{code, scope?, at}`), so the Devices
+   * page can show it on that host's row. A failing remote contributes no rows to
+   * a merged answer, which otherwise looks exactly like a host with nothing in it
+   * (spec 008: a short grant showed as a connected host with an empty sidebar).
+   * @type {Map<string, {code: string, scope?: string, at: number}>}
+   */
+  #hostErrors = new Map()
 
   constructor(deps = {}) {
     this.#gateway = deps.gateway
@@ -695,6 +705,7 @@ export class HostRouter {
     this.#merges.clear()
     this.#eventSinks.clear()
     this.#cards.clear()
+    this.#hostErrors.clear()
     if (!this.#installed) return
     const gateway = this.#gateway
     const dispatchOurs = gateway.dispatchRpc === this.#wrapped.dispatchRpc
@@ -714,18 +725,40 @@ export class HostRouter {
 
   /**
    * What the Devices page shows: whether remote routing is live, and why not.
+   * A host whose last call was refused also carries that refusal (`error`), so the
+   * page never presents an empty-but-connected host as a healthy one.
    * @returns {{remote: boolean, reason: string|null, hosts: object[], merged: string[]}}
    */
   status() {
     let hosts = []
     try {
-      hosts = this.#hosts().map((host) => ({
-        hostId: String(host?.hostId ?? ''),
-        hostName: String(host?.hostName ?? host?.hostId ?? ''),
-        online: host?.online !== false,
-      }))
+      hosts = this.#hosts().map((host) => {
+        const hostId = String(host?.hostId ?? '')
+        const error = this.#hostErrors.get(hostId)
+        return {
+          hostId,
+          hostName: String(host?.hostName ?? host?.hostId ?? ''),
+          online: host?.online !== false,
+          // Only when there is something to say: an entry stays exactly as before
+          // for a host that never refused a call.
+          ...(error ? { error } : {}),
+        }
+      })
     } catch { hosts = [] }
     return { remote: this.#installed, reason: this.#installed ? null : this.#reason, hosts, merged: [...MERGED_ENDPOINTS] }
+  }
+
+  /** Remember the last refusal of one host (the log line stays the audit trail). */
+  #noteHostError(hostId, error) {
+    if (typeof hostId !== 'string' || hostId === '') return
+    this.#hostErrors.delete(hostId)
+    this.#hostErrors.set(hostId, {
+      code: typeof error?.code === 'string' ? error.code : 'error',
+      // `auth/forbidden-scope` names the permission the caller lacked.
+      ...(typeof error?.scope === 'string' ? { scope: error.scope } : {}),
+      at: Date.now(),
+    })
+    while (this.#hostErrors.size > MAX_HOST_ERRORS) this.#hostErrors.delete(this.#hostErrors.keys().next().value)
   }
 
   // -- the carrier wrappers -------------------------------------------------
@@ -981,8 +1014,11 @@ export class HostRouter {
         const rows = Array.isArray(value?.items) ? value.items : []
         // Each row is remote data: a row that names a host namespace is refused
         // and takes that host's whole contribution with it.
-        return rows.map((row) => this.#ingress(host.hostId, row, 'session/list row'))
+        const renamed = rows.map((row) => this.#ingress(host.hostId, row, 'session/list row'))
+        this.#hostErrors.delete(host.hostId)
+        return renamed
       } catch (error) {
+        this.#noteHostError(host.hostId, error)
         this.#log(`session/list from ${host.hostId} failed: ${error?.code ?? 'error'}`)
         return []
       }
@@ -1299,6 +1335,7 @@ export class HostRouter {
         } catch (error) {
           if (hostControl.signal.aborted || lifetime.signal.aborted) return
           // A broken follow stream is a dead host as far as the sidebar cares.
+          this.#noteHostError(host.hostId, error)
           this.#log(`workspace/follow from ${host.hostId} stopped: ${error?.code ?? 'error'}`)
           if (pumps.get(host.hostId) === hostControl) drop(host.hostId)
         }

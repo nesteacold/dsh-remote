@@ -244,7 +244,11 @@ export const plugin = {
 
     const view = (remote) => {
       const entry = live.get(remote.id)
-      return publicRemote(remote, entry, entry ? [...entry.approvals.values()] : [])
+      // A call this Host refused (e.g. `auth/forbidden-scope` for `harness:remote`)
+      // is shown on that remote's row: a failing host contributes no merged rows,
+      // which is otherwise indistinguishable from a host that simply has none.
+      const hostError = hostRouter?.status().hosts.find((host) => host.hostId === remote.id)?.error ?? null
+      return { ...publicRemote(remote, entry, entry ? [...entry.approvals.values()] : []), hostError }
     }
 
     const requireRemote = (id) => {

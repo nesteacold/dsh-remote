@@ -434,6 +434,61 @@ await check('errors from the server are shown, not swallowed', async () => {
   page.unmount()
 })
 
+await check('a remote granted no harness:remote says so on its row (en and vi); one that has it says nothing', async () => {
+  // Measured end to end: without the scope the merged session/list answers Local
+  // rows only, so the host looks connected and empty. The row must name the
+  // consequence and the fix instead of leaving it to a log line.
+  const shortGrant = { id: 'r1', name: 'Sigma', address: '192.168.1.40:3081', status: 'online', approvals: [],
+    device: { kind: 'desktop', scopes: ['sessions:read', 'prompt:send', 'approval:respond'] } }
+  const fullGrant = { ...shortGrant, id: 'r2', name: 'Omega', device: { kind: 'desktop', scopes: ['sessions:read', 'harness:remote'] } }
+  const ui = load({ remotes: [shortGrant] })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  const warnings = () => find(page, (node) => node.props['data-testid'] === 'missing-remote-scope')
+  assert.equal(warnings().length, 1, 'exactly one warning, on the short-grant row')
+  assert.equal(warnings()[0].children.join(''), DICT.en.missingRemoteScope, 'the English sentence names the consequence and the fix')
+  assert.match(DICT.en.missingRemoteScope, /Remote sessions and workspaces cannot appear/)
+  assert.match(DICT.en.missingRemoteScope, /paired again/)
+  // Both languages carry the sentence, and it is not an English copy.
+  assert.ok(DICT.vi.missingRemoteScope)
+  assert.notEqual(DICT.vi.missingRemoteScope, DICT.en.missingRemoteScope)
+  assert.match(DICT.vi.missingRemoteScope, /ghép đôi lại/)
+  // Nothing blocks: the row's buttons stay usable.
+  assert.equal(button(page, 'Open').props.disabled, false)
+  await act(async () => { ui.setLocale('vi') })
+  assert.equal(warnings()[0].children.join(''), DICT.vi.missingRemoteScope, 'the Vietnamese sentence renders too')
+  page.unmount()
+
+  const withScope = load({ remotes: [fullGrant] })
+  const other = await mount(React.createElement(withScope.api.testing.ConnectTab))
+  await flush()
+  assert.equal(find(other, (node) => node.props['data-testid'] === 'missing-remote-scope').length, 0, 'no noise when the grant has the scope')
+  assert.ok(!text(other).includes('Remote sessions and workspaces cannot appear'))
+  // A gateway that predates scopes sends no list at all: nothing is claimed about it.
+  const legacy = load({ remotes: [{ id: 'r3', name: 'Old', address: '192.168.1.41:3081', status: 'online', approvals: [] }] })
+  const legacyPage = await mount(React.createElement(legacy.api.testing.ConnectTab))
+  await flush()
+  assert.equal(find(legacyPage, (node) => node.props['data-testid'] === 'missing-remote-scope').length, 0)
+  other.unmount()
+  legacyPage.unmount()
+})
+
+await check('a per-host refusal is shown on the remote row; the log line stays the audit trail', async () => {
+  const remote = { id: 'r1', name: 'Sigma', address: '192.168.1.40:3081', status: 'online', approvals: [],
+    device: { kind: 'desktop', scopes: ['sessions:read', 'harness:remote'] },
+    hostError: { code: 'auth/forbidden-scope', scope: 'harness:remote', at: 1 } }
+  const ui = load({ remotes: [remote] })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const refused = find(page, (node) => node.props['data-testid'] === 'host-refused')
+  assert.equal(refused.length, 1)
+  assert.match(text(page), /auth\/forbidden-scope/)
+  assert.match(text(page), /harness:remote/)
+  assert.ok(text(page).includes(ui.api.testing.DICT.en.hostRefused))
+  page.unmount()
+})
+
 const ONLINE = { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } }
 const checkboxes = (page) => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
 const ticked = (page) => checkboxes(page).map((node, index) => (node.props.checked ? ALL[index] : null)).filter(Boolean)

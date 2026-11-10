@@ -10,6 +10,7 @@ import path from 'node:path'
 import { createRequire } from 'node:module'
 
 import { check, delay, finish, mountPlugin, tempDir } from './helpers.mjs'
+import { requestJson } from './fixture-http.mjs'
 
 const require = createRequire(import.meta.url)
 const gatewayPlugin = (await import('../../mobile-gateway/lib/index.mjs')).default
@@ -77,11 +78,8 @@ async function startGateway() {
   const base = `http://127.0.0.1:${port}`
   const api = {
     base, hostCalls, listeners, typertGateway: ctx.typertGateway,
-    async post(route, body) {
-      const response = await fetch(`${base}/mgw/${route}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base }, body: JSON.stringify(body ?? {}) })
-      return { status: response.status, data: await response.json() }
-    },
-    async get(route) { return (await fetch(`${base}/mgw/${route}`)).json() },
+    post(route, body) { return requestJson(base, 'POST', `/mgw/${route}`, { body: body ?? {}, headers: { Origin: base } }) },
+    async get(route) { return (await requestJson(base, 'GET', `/mgw/${route}`)).data },
     async close() { dispose(); await new Promise((resolve) => server.close(resolve)); fs.rmSync(directory, { recursive: true, force: true }) },
   }
   for (let attempt = 0; attempt < 250; attempt += 1) {
