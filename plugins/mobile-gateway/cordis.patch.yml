@@ -1,0 +1,65 @@
+# dsh-plugin-mobile-gateway bundle patch.
+# Applied after dsh-base and dsh-web-app: inserts the persistent /ws/mobile
+# gateway row into the host plane (it consumes `webServer`, the Host Remote
+# Gateway and the `session/event` feed, and publishes no service of its own).
+- insert:
+    - id: mobile-gateway
+      name: '@dsh-ext/mobile-gateway'
+      config:
+        # Secure by default: every mobile WebSocket must authenticate with a
+        # paired device credential. Pair/revoke APIs remain local-machine only.
+        # There is no `requireAuth` switch (T023): authentication is permanent.
+        #
+        # T011/T012: the owner switch. Off means the gateway accepts no
+        # companion traffic at all (HTTP 403, error code `remote/disabled`) and
+        # no non-loopback socket exists. `gatewayEnabled` is the legacy alias
+        # and stays false; the plugin only starts enabled when this key is true.
+        remoteControl:
+          enabled: false
+        gatewayEnabled: false
+        # Optional startup mode: disabled | temporary | persistent.
+        # Saved management-UI choices take precedence over startup config.
+        # Remote control must also be enabled for any mode but `disabled`.
+        # gatewayMode: persistent
+        # gatewayName: Home PC
+        # gatewayStateFile: /path/to/instance-gateway.json
+        # Optional additional reachable addresses for this SAME gateway:
+        # endpoints:
+        #   - wss://gateway.example.com/ws/mobile
+        gatewayWaitTimeoutMs: 300000
+        adminLoopbackOnly: true
+        pairingTtlMs: 300000
+        # DSH WebUI remains loopback-only on 3080. The plugin-owned remote
+        # listener is HTTPS + WSS only (T017/T018, FR-003): no plaintext remote
+        # endpoint exists, and credentials are never accepted in a URL query
+        # (T020/T023) — device authentication is permanent (FR-007).
+        # The LAN listener is OFF by default (FR-001/SC-001): a default install
+        # must not carry a non-loopback socket. When the owner turns remote
+        # control on, the plugin binds 127.0.0.1 unless lanHost is changed
+        # deliberately. lanPort 0 = ephemeral port.
+        # T016 (R1): the self-signed certificate lives in
+        # <deviceFile dir>/mobile-gateway-tls (override: tlsCertificateDir) and
+        # is replaced only by POST /mgw/tls/regenerate (loopback only).
+        lanEnabled: false
+        lanHost: 127.0.0.1
+        lanPort: 3081
+        # tlsCertificateDir: /path/to/mobile-gateway-tls
+        # v1 hard-disables the Cloudflare Tunnel and the `cloudflared` download
+        # (T031, FR-011/R9): /mgw/cloudflare* answers 403 `cloudflare/disabled`,
+        # `cloudflare.state` is always `disabled` (`hardDisabled: true`), and no
+        # binary is fetched or spawned — so these three keys are inert. They stay
+        # in the schema behind a compile-time flag for a future spec; do not set
+        # `cloudflaredPath` expecting an external binary to be used in v1.
+        # cloudflarePort: 3082
+        # cloudflaredPath: /path/to/cloudflared
+        # The public-IP setup Helper that writes this file is disabled in v1 too
+        # (bin/setup-ip.mjs exits 1 for every command but --help), so under v1 the
+        # file is only read if you create it yourself.
+        publicUrlFile: /etc/dsh-mobile-gateway/public-url
+
+# This bundle inserts only the gateway's own row. It deliberately does not
+# patch `session-query-sqlite` or any other plugin's row (constitution A1):
+# a non-insert patch assigns the target's whole `config`, so the gateway would
+# override DSH's `openAt: never` default for every profile that installs it.
+# Enabling the full-text session index is the owner's own patch-layer choice;
+# see README.md ("Optional: Full-Text Session Search").

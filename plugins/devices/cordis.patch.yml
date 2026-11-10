@@ -1,0 +1,15 @@
+# @dsh-ext/devices bundle patch (spec 008).
+# Applied after dsh-base and dsh-web-app: inserts one row that consumes
+# `webServer` and registers the `/devices` route prefix. It opens no listener of
+# its own; the Devices page talks to the Host's loopback web server, and the
+# plugin dials out (pinned WSS) to remote Hosts the user pairs.
+- insert:
+    - id: devices
+      name: '@dsh-ext/devices'
+      config:
+        # Plugin data directory (remote records + one 0600 token file per remote).
+        # Empty = ~/.dsh/devices-page.
+        dataDir: ''
+        # FR2: outbound pairing is limited to private/loopback/Tailscale addresses.
+        # Set true only to pair with a Host that has a public wss:// endpoint.
+        allowPublicRemotes: false

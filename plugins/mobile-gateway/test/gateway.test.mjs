@@ -1,0 +1,1401 @@
+import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
+import { createRequire } from 'node:module'
+
+const require = createRequire(import.meta.url)
+const fs = require('node:fs')
+const http = require('node:http')
+const os = require('node:os')
+const path = require('node:path')
+const crypto = require('node:crypto')
+const plugin = (await import('../lib/index.mjs')).default
+const { handleQuery } = await import('../lib/index.mjs')
+const assert = await import('node:assert/strict')
+
+// 会话列表只传标题投影，大量会话不能把完整投影带到公网连接。
+{
+  const items = Array.from({ length: 855 }, (_, index) => Object.freeze({
+    sessionId: `session-${index}`, updatedAt: index, running: index === 0, blank: false,
+    cwd: '/workspace', agentPreset: 'standard', parentSessionId: null, origin: 'user',
+    projections: Object.freeze({ asOfSeq: 42, extra: 'discard', values: Object.freeze({
+      title: `会话 ${index} 👏`,
+      turnOutline: [{ turn: 1, seq: 1, prompt: '问题', response: 'x'.repeat(16_000) }],
+      todos: [{ content: '任务', status: 'pending' }],
+      contextPressure: { pressureTokens: 1000 },
+    }) }),
+  }))
+  const source = Object.freeze({ items: Object.freeze(items), archivedSessionIds: ['archived'] })
+  const originalJson = JSON.stringify(source)
+  const api = { sessions: {
+    list: async () => source,
+    history: async () => ({ historyFormatVersion: 4, cursor: 42, events: [], hasMore: false,
+      projections: items[0].projections }),
+  } }
+  const frame = await handleQuery(api, null, null, { type: 'sessions' })
+  assert.deepEqual(frame, { kind: 'sessions', archivedSessionIds: ['archived'],
+    items: items.map(item => ({ ...item,
+      projections: { asOfSeq: 42, values: { title: item.projections.values.title } },
+    })) })
+  const originalBytes = Buffer.byteLength(originalJson)
+  const compactBytes = Buffer.byteLength(JSON.stringify(frame))
+  assert.ok(originalBytes > 13 * 1024 * 1024)
+  assert.ok(compactBytes < 512 * 1024)
+  assert.ok(compactBytes < originalBytes * 0.05)
+  assert.equal(JSON.stringify(source), originalJson, '不能修改 Host 返回的原始数据')
+  const history = await handleQuery(api, null, null, { type: 'history', sessionId: 'session-0' })
+  assert.deepEqual(history.projections, items[0].projections, '历史仍保留完整投影')
+  console.log(`PASS compact sessions: ${originalBytes} B -> ${compactBytes} B`)
+
+  for (const projections of [undefined, null, { asOfSeq: 0, values: {} },
+    { asOfSeq: 1, values: { title: null, turnOutline: [] } },
+    { values: { title: '', todos: [] } }]) {
+    const item = { sessionId: 'untitled', updatedAt: 0, running: false, blank: true,
+      ...(projections === undefined ? {} : { projections }) }
+    api.sessions.list = async () => ({ items: [item] })
+    const result = await handleQuery(api, null, null, { type: 'sessions' })
+    const expected = projections ? {
+      ...(projections.asOfSeq === undefined ? {} : { asOfSeq: projections.asOfSeq }),
+      values: Object.hasOwn(projections.values, 'title') ? { title: projections.values.title } : {},
+    } : projections
+    assert.deepEqual(result.items, [{ ...item,
+      ...(projections === undefined ? {} : { projections: expected }) }])
+  }
+  api.sessions.list = async () => ({ items: [] })
+  assert.deepEqual(await handleQuery(api, null, null, { type: 'sessions' }), { kind: 'sessions', items: [] })
+  api.sessions.list = async () => { throw { code: 'unavailable', message: 'Host unavailable' } }
+  assert.deepEqual(await handleQuery(api, null, null, { type: 'sessions' }), {
+    kind: 'error', code: 'unavailable', message: 'Host unavailable', requestType: 'sessions',
+  })
+}
+
+// Delivery declarations must survive the conversation history projection.
+{
+  const delivery = { type: 'deliverables/presented', seq: 4, time: 4,
+    data: { turn: 1, callId: 'present-1', files: [{ path: 'build/三亚攻略.pdf', description: 'A4 共 8 页' }] } }
+  const api = { sessions: { history: async () => ({ historyFormatVersion: 4, cursor: 4,
+    hasMore: false, projections: { asOfSeq: 4, values: {} }, events: [{ event: delivery }] }) } }
+  const page = await handleQuery(api, null, null, { type: 'history', sessionId: 's1', view: 'conversation' })
+  assert.deepEqual(page.events, [delivery])
+}
+{
+  const calls = []
+  const api = { sessions: {
+    create: async (payload) => { calls.push(payload); return { sessionId: 'empty-1' } },
+    prompt: () => { throw new Error('Empty creation must never start an agent turn') },
+  } }
+  const created = await handleQuery(api, null, null, { type: 'session-create', requestId: 'r1', workspaceId: ' w1 ', cwd: '/ignored' })
+  assert.deepEqual(created, { kind: 'session-created', sessionId: 'empty-1', requestId: 'r1' })
+  assert.deepEqual(calls, [{ workspaceId: 'w1' }])
+  api.sessions.create = async () => { throw new Error('creation failed') }
+  const failed = await handleQuery(api, null, null, { type: 'session-create', requestId: 'r2' })
+  assert.equal(failed.kind, 'error')
+  assert.equal(failed.requestType, 'session-create')
+  assert.equal(failed.requestId, 'r2')
+}
+
+// Compact V4 history and reject stale/unversioned cursor coordinates before RPC.
+{
+  const stream = [{ type: 'text-chunks', time0: 1, index: 0, dt: [], texts: ['x'.repeat(100_000)] },
+    { type: 'chunk', time: 2, chunk: { type: 'finish', reason: { kind: 'error',
+      failure: { message: 'Provider unavailable', code: 'TRANSPORT', status: 503 } } } }]
+  let historyCalls = 0
+  let forkCalls = 0
+  const api = { sessions: {
+    history: async () => { historyCalls++; return { historyFormatVersion: 4, cursor: 5, hasMore: true,
+      projections: { asOfSeq: 5, values: {} }, events: [
+        { event: { type: 'system/message', seq: 1, time: 1, data: { message: { content: [{ type: 'text', text: 'private system prompt' }] } } } },
+        { event: { type: 'assistant/message', seq: 2, time: 2, data: { turn: 1, step: 0, interrupted: true, usage: { outputTokens: 3 }, stream,
+          message: { content: [{ type: 'text', text: 'answer' }] } } } },
+        { event: { type: 'assistant/attempt', seq: 3, time: 3, data: { turn: 1, step: 1, stream } } },
+      ] } },
+    fork: async () => { forkCalls++; return { sessionId: 'branch' } },
+  } }
+  const page = await handleQuery(api, null, null, { type: 'history', sessionId: 's1', view: 'conversation' })
+  assert.deepEqual(page.events.map(event => event.type), ['assistant/message', 'assistant/attempt'])
+  assert.ok(page.events.every(event => !('stream' in event.data)))
+  assert.deepEqual(page.events[1].data.finish, { kind: 'error',
+    failure: { message: 'Provider unavailable', code: 'TRANSPORT', status: 503 } })
+  assert.ok(page.bytes < 1000)
+  assert.equal(page.events[0].data.interrupted, true)
+  assert.equal(page.historyFormatVersion, 4)
+  assert.equal(page.cursor, 5)
+  assert.equal(page.nextBeforeSeq, 2)
+  const raw = await handleQuery(api, null, null, { type: 'history', sessionId: 's1' })
+  assert.equal(raw.events[2].data.stream[0].texts[0].length, 100_000)
+  for (const historyFormatVersion of [undefined, 1, 2, 3]) {
+    const error = await handleQuery(api, null, null, { type: 'history', sessionId: 's1', beforeSeq: 2, historyFormatVersion })
+    assert.equal(error.code, 'history-format-mismatch')
+    assert.equal(error.resetRequired, true)
+    const forkError = await handleQuery(api, null, null, { type: 'fork', sessionId: 's1', atSeq: 2, historyFormatVersion })
+    assert.equal(forkError.code, 'history-format-mismatch')
+  }
+  assert.equal(historyCalls, 2)
+  assert.equal(forkCalls, 0)
+  await handleQuery(api, null, null, { type: 'history', sessionId: 's1', beforeSeq: 2, historyFormatVersion: 4 })
+  await handleQuery(api, null, null, { type: 'fork', sessionId: 's1', atSeq: 2, historyFormatVersion: 4 })
+  assert.equal(historyCalls, 3)
+  assert.equal(forkCalls, 1)
+  assert.equal((await handleQuery(api, null, null, { type: 'fork', sessionId: 's1', atSeq: 2.5, historyFormatVersion: 4 })).code, 'bad-request')
+  api.sessions.history = async () => ({ hasMore: true, events: [{ event: { type: 'system/message', seq: 10, data: {} } }] })
+  const hidden = await handleQuery(api, null, null, { type: 'history', sessionId: 's1', view: 'conversation' })
+  assert.deepEqual(hidden.events, [])
+  assert.equal(hidden.nextBeforeSeq, 10)
+}
+
+const directoryTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-directory-'))
+const fileDownloadRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-files-'))
+const fileDownloadDir = path.join(fileDownloadRoot, 'builds')
+const fileDownloadBytes = Buffer.alloc(150 * 1024, 0x5a)
+const outsideFile = path.join(os.tmpdir(), `dsh-mobile-outside-${process.pid}.bin`)
+fs.mkdirSync(fileDownloadDir)
+fs.writeFileSync(path.join(fileDownloadDir, 'app-release.apk'), fileDownloadBytes)
+fs.writeFileSync(path.join(fileDownloadRoot, 'guide.pdf'), Buffer.from('%PDF-1.7\nmobile gateway\n'))
+fs.writeFileSync(path.join(fileDownloadRoot, '三亚 攻略.pdf'), Buffer.from('%PDF-1.7\nChinese name\n'))
+fs.writeFileSync(outsideFile, Buffer.from('outside workspace'))
+fs.symlinkSync(outsideFile, path.join(fileDownloadRoot, 'outside-link.bin'))
+
+const listeners = {}
+const presetSession = { agentPreset: 'standard', sessionListMetadata: { blank: true, lastPromptAt: null } }
+let disposer = null
+// The DSH web server dispatches /mgw to the route the plugin registered.
+let managementRoute = null
+const server = http.createServer((req, res) => {
+  if (managementRoute && req.url.startsWith('/mgw')) {
+    managementRoute.handler(req, res)
+    return
+  }
+  res.writeHead(404)
+  res.end()
+})
+const webServer = {
+  port: 18086,
+  register(route) { managementRoute = route; return () => { managementRoute = null } },
+  registerUpgrade(route) { server.on('upgrade', (req, socket, head) => route.handler(req, socket, head)); return () => {} },
+}
+function fakeApi() {
+  const promptCalls = []
+  const createCalls = []
+  const cancelCalls = []
+  const queueUpdateCalls = []
+  const archiveCalls = []
+  const renameCalls = []
+  const settingsUpdates = []
+  const goalCalls = []
+  const imageAttachment = {
+    attachmentId: 'att-image-1',
+    mediaType: 'image/png',
+    bytes: 8,
+    width: 2,
+    height: 2,
+    name: 'sample.png',
+  }
+  const recordGoalCall = (method) => async (request) => {
+    goalCalls.push({ method, payload: request.payload })
+    const value = method === 'clear'
+      ? { cleared: true }
+      : { ref: { id: request.payload.ref.id, revision: request.payload.ref.revision + 1 } }
+    return { rpcId: 'r', result: { ok: true, value } }
+  }
+  return {
+    promptCalls,
+    cancelCalls,
+    queueUpdateCalls,
+    archiveCalls,
+    renameCalls,
+    settingsUpdates,
+    goalCalls,
+    get _createCalls() { return createCalls },
+    skills: {
+      async list() {
+        return {
+          rpcId: 'r',
+          result: {
+            ok: true,
+            value: {
+              skills: [
+                { name: 'android-cli', description: 'Install and use the Android CLI', whenToUse: 'Use for Android device automation', modelInvocable: true },
+                { name: 'design-taste-frontend', description: 'Improve frontend visual design', modelInvocable: false },
+              ],
+            },
+          },
+        }
+      },
+    },
+    llm: {
+      async models() { return { rpcId: 'r', result: { ok: true, value: { groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat', reasoning: { efforts: [{ id: 'low', name: 'Low' }] } }] }], failures: [] } } } },
+      async providers() { return { rpcId: 'r', result: { ok: true, value: { providers: [{ provider: 'deepseek', displayName: 'DeepSeek', declared: true }] } } } },
+    },
+    agentPresets: {
+      async list() { return { rpcId: 'r', result: { ok: true, value: { presets: [{ id: 'standard', isDefault: true }, { id: 'minimal', isDefault: false }] } } } },
+    },
+    permissionPresets: {
+      async catalog() { return { rpcId: 'r', result: { ok: true, value: { options: [{ value: 'ask', name: 'Ask' }, { value: 'workspace-write', name: 'Workspace Write' }], defaultOptions: [{ value: 'ask', name: 'Ask' }, { value: 'code', name: 'Code' }], defaultPreset: 'ask' } } } },
+    },
+    schedule: {
+      async catalog() { return { rpcId: 'r', result: { ok: true, value: { items: [{ id: 'reminder-1', sessionId: 's1', target: { kind: 'session', sessionId: 's1' }, involvedSessionIds: ['s1'], status: 'active', kind: 'every', title: '检查构建', prompt: '检查构建状态', everySeconds: 300, scheduledAt: '2099-01-01T00:00:00.000Z' }] } } } },
+      async list() { return { rpcId: 'r', result: { ok: true, value: { items: [{ id: 'reminder-1', kind: 'every', title: '检查构建', prompt: '检查构建状态', everySeconds: 300, scheduledAt: '2099-01-01T00:00:00.000Z' }] } } } },
+      async history() { return { rpcId: 'r', result: { ok: true, value: { id: 'reminder-1', records: [], earlierRecordsUnavailable: false, earlierRecordsPruned: false, retention: { days: 30, records: 200 } } } } },
+      async view(req) { return { rpcId: 'r', result: { ok: true, value: { id: req.payload.id, target: { kind: 'session', sessionId: 's1' }, involvedSessionIds: ['s1'], status: 'active', kind: 'every', title: '检查构建', prompt: '检查构建状态', everySeconds: 300, scheduledAt: '2099-01-01T00:00:00.000Z' } } } },
+      async edit(req) { return { rpcId: 'r', result: { ok: true, value: req.payload.action === 'delete'
+        ? { id: req.payload.id, deleted: true }
+        : { id: req.payload.id, title: req.payload.patch.title, status: 'active' } } } },
+    },
+    workspace: {
+      async list() { return { rpcId: 'r', result: { ok: true, value: { items: [], archivedSessionIds: [] } } } },
+      async create() { return { rpcId: 'r', result: { ok: true, value: { workspace: { workspaceId: 'w', path: '/tmp', title: 't', sessionIds: [], createdAt: 'c', updatedAt: 'u' }, created: true } } } },
+      async archiveSession(req) {
+        archiveCalls.push(req.payload)
+        return { rpcId: 'r', result: { ok: true, value: { archivedSessionIds: [req.payload.sessionId] } } }
+      },
+    },
+    settings: {
+      async describe() { return { rpcId: 'r', result: { ok: true, value: { writable: true, hasDocument: false, namespaces: [
+        { ns: 'agent-preset-registry', schema: { properties: {} }, value: { selectedDefault: 'standard' }, revision: 1 },
+        { ns: 'permission', schema: { properties: {} }, value: { defaultPreset: 'ask' }, revision: 1 },
+      ] } } } },
+      async update(req) { settingsUpdates.push(req.payload); return { rpcId: 'r', result: { ok: true, value: { ns: req.payload.ns, value: req.payload.patch, revision: 2 } } } },
+    },
+    goals: {
+      edit: recordGoalCall('edit'),
+      pause: recordGoalCall('pause'),
+      resume: recordGoalCall('resume'),
+      clear: recordGoalCall('clear'),
+    },
+    sessions: {
+      async list() {
+        return {
+          rpcId: 'r',
+          result: {
+            ok: true,
+            value: {
+              items: [
+                { sessionId: 's1', cwd: fileDownloadRoot, updatedAt: 1, running: false, blank: false, projections: { asOfSeq: 42, values: { title: '鼓掌 👏 ' + String.fromCharCode(0xd83d) + '…', turnOutline: [{ response: '鼓掌 ' + String.fromCharCode(0xd83d) + '…', prompt: '👏' }] } } },
+                { sessionId: 's2', cwd: fileDownloadRoot, updatedAt: 2, running: false, blank: false },
+              ],
+            },
+          },
+        }
+      },
+      async history() {
+        const fakeEvents = [
+          { type: 'user/message', seq: 1, time: 1, data: { content: [{ type: 'image', attachment: imageAttachment }, { type: 'text', text: 'hi' }] } },
+          { type: 'assistant/chunk', seq: 2, time: 2, data: { turn: 1, step: 0, chunk: { type: 'text-delta', text: 'a' } } },
+          { type: 'assistant/message', seq: 3, time: 3, data: { turn: 1, step: 0, message: { content: [{ type: 'text', text: 'hello' }] } } },
+          { type: 'tool/call', seq: 4, time: 4, data: { turn: 1, step: 0, callId: 'c1', name: 'bash', arguments: '{}' } },
+          { type: 'tool/result', seq: 5, time: 5, data: { turn: 1, step: 0, message: { role: 'tool', source: { kind: 'tool', callId: 'c1' }, toolCallId: 'c1', content: [{ type: 'text', text: 'x'.repeat(5000) }, { type: 'image', attachment: imageAttachment }] } } },
+          { type: 'request/header', seq: 6, time: 6, data: { header: { system: 'sys'.repeat(2000) }, reason: 'initial' } },
+          { type: 'assistant/message', seq: 7, time: 7, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'done' }] } } },
+        ]
+        return { rpcId: 'r', result: { ok: true, value: { events: fakeEvents.map((e) => ({ event: e })), hasMore: false, projections: { asOfSeq: 42, values: { tokenUsage: { totals: { inputTokens: 10, outputTokens: 5 }, last: null }, contextPressure: { contextWindow: 128000, pressureTokens: 1500, surfaceTokens: 2000 }, permissions: { currentValue: 'ask' }, sessionStats: { turns: 6, steps: 69, llmMs: 2280000, toolMs: 41400, ttftMs: 2600, ttftSteps: 1, decodeMs: 5000, decodeTokens: 385, lastTurn: 6, openStep: null, pendingCalls: {} }, todos: [{ content: 'Inspect Android CLI/SDK environment', status: 'completed' }, { content: 'Get android CLI running', status: 'in_progress' }, { content: 'Choose project template', status: 'pending' }], goal: { goal: { id: 'goal-1', revision: 7, objective: '初始化一个 Android app', phase: 'active', maxGoalRounds: 12 }, roundsStarted: 3, createdAt: 1, updatedAt: 2 } } } } } }
+      },
+      async search() { return { rpcId: 'r', result: { ok: true, value: { items: [], hasMore: false } } } },
+      async attachment(req) {
+        return {
+          rpcId: 'r',
+          result: {
+            ok: true,
+            value: { attachment: { ...imageAttachment, attachmentId: req.payload.attachment.attachmentId }, data: 'iVBORw0KGgo=' },
+          },
+        }
+      },
+      async models() { return { rpcId: 'r', result: { ok: true, value: { current: { provider: 'deepseek', model: 'deepseek-chat' }, routable: true, groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat', reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'low' } }] }], failures: [] } } } },
+      async selectModel(req) { return { rpcId: 'r', result: { ok: true, value: { selected: req.payload } } } },
+      async prompt(req) { promptCalls.push(req.payload); return { rpcId: 'r', result: { ok: true, value: { accepted: true, command: { kind: 'success', text: 'switched to ' + (req.payload.content[0].text) } } } } },
+      async create(req) { createCalls.push(req.payload); return { rpcId: 'r', result: { ok: true, value: { sessionId: 's-new-' + createCalls.length } } } },
+      async fork(req) { return { rpcId: 'r', result: { ok: true, value: { sessionId: 's-branch-1' } } } },
+      async cancel(req) { cancelCalls.push(req.payload); return { rpcId: 'r', result: { ok: true, value: { accepted: true } } } },
+      async updateQueue(req) { queueUpdateCalls.push(req.payload); return { rpcId: 'r', result: { ok: true, value: { accepted: true } } } },
+      async rename(req) {
+        renameCalls.push(req.payload)
+        return { rpcId: 'r', result: { ok: true, value: { title: req.payload.title.trim(), seq: 95 } } }
+      },
+    },
+  }
+}
+const api = fakeApi()
+const ctx = {
+  get(name) { return name === 'webServer' ? webServer : undefined },
+  on(name, fn) { listeners[name] = fn; return () => {} },
+  effect(fn) { disposer = fn() },
+}
+ctx.connection = createTestConnection()
+ctx.remoteAccess = createTestRemoteAccess()
+ctx.webServer = webServer
+const invokeCalls = []
+const controlFrames = []
+const initialTurnOutline = [{ turn: 1, seq: 1, prompt: '调整输入框阴影', response: '已减轻阴影。' }]
+const workspaceFrames = []
+const liveFollows = new Map()
+const savedSelections = []
+ctx.agentDefaultModel = {
+  currentSelection() { return { provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' } },
+  async saveSelection(sel) { savedSelections.push(sel) },
+}
+ctx.typertGateway = {
+  async invoke(req) {
+    assert.equal(req.peer, ctx.connection.peers[0])
+    assert.equal(req.peer.signal.aborted, false)
+    invokeCalls.push(req)
+    if (req.namespace === 'agentPresets' && req.method === 'select') {
+      assert.equal(req.args.agentId, 'preset-session')
+      presetSession.agentPreset = req.args.agentPreset
+      listeners['session/event']({ id: 'preset-session' }, {
+        type: 'agent-preset/selected', seq: 9500, time: 100, data: { agentPreset: req.args.agentPreset },
+      })
+      return req.args.agentPreset
+    }
+    if (req.namespace === 'commands' && req.method === 'list') {
+      return [
+        { name: 'compact', description: 'Compact older conversation history' },
+        { name: 'permission', description: 'Switch the permission preset', input: { hint: '<preset>' } },
+        { name: 'plan', description: 'Enter or leave plan mode', input: { hint: '[off|message]', attachments: true } },
+      ]
+    }
+    if (req.namespace === 'commands' && req.args && req.args.line === '/permission missing') {
+      throw { code: 'unknown-command', message: 'no such command' }
+    }
+    if (req.namespace === 'commands' && req.args && req.args.line === '/plan fail') {
+      return { commandId: 'cmd-error', result: { kind: 'error', text: 'plan failed' } }
+    }
+    if (req.namespace === 'commands') return { commandId: 'cmd-1', result: { kind: 'success', text: 'switched' } }
+    const request = req.args.request || {}
+    const unwrap = async (method, payload = request) => (await method({ payload })).result.value
+    if (req.namespace === 'session') {
+      if (req.method === 'list') return unwrap(api.sessions.list)
+      if (req.method === 'search') return unwrap(api.sessions.search)
+      if (req.method === 'create') return unwrap(api.sessions.create, request)
+      if (req.method === 'prompt') {
+        return unwrap(api.sessions.prompt, request)
+      }
+      if (req.method === 'events') {
+        const value = await unwrap(api.sessions.history)
+        return { records: value.events.map(entry => ({ type: 'event', event: entry.event })), cursor: 91, hasMore: false }
+      }
+      if (req.method === 'attachment') return unwrap(api.sessions.attachment)
+      if (req.method === 'fork') return unwrap(api.sessions.fork)
+      if (req.method === 'cancel') return unwrap(api.sessions.cancel)
+      if (req.method === 'updateQueue') return unwrap(api.sessions.updateQueue)
+      if (req.method === 'rename') return unwrap(api.sessions.rename)
+      if (req.method === 'selectModel') return unwrap(api.sessions.selectModel)
+      if (req.method === 'modelCatalog') {
+        const catalog = await unwrap(api.sessions.models, {})
+        return {
+          default: ctx.agentDefaultModel.currentSelection(),
+          routableProviders: catalog.groups.map((group) => group.id),
+          groups: catalog.groups,
+          failures: catalog.failures,
+        }
+      }
+      if (req.method === 'canOpenWorkspacePath') return true
+    }
+    if (req.namespace === 'workspace' && req.method === 'create') return unwrap(api.workspace.create)
+    if (req.namespace === 'workspace' && req.method === 'archiveSession') return unwrap(api.workspace.archiveSession)
+    if (req.namespace === 'settings' && req.method === 'describe') return unwrap(api.settings.describe, {})
+    if (req.namespace === 'settings' && req.method === 'update') {
+      return unwrap(api.settings.update, { ns: req.args.ns, patch: req.args.patch })
+    }
+    if (req.namespace === 'skills' && req.method === 'list') return unwrap(api.skills.list)
+    if (req.namespace === 'agentPresets' && req.method === 'list') return unwrap(api.agentPresets.list, {})
+    if (req.namespace === 'permissionPresets' && req.method === 'catalog') return unwrap(api.permissionPresets.catalog, {})
+    if (req.namespace === 'schedule') {
+      const value = await unwrap(api.schedule[req.method], req.args.request ?? {})
+      return req.method === 'catalog' ? value.items : value
+    }
+    if (req.namespace === 'llm' && req.method === 'listConfigurableProviders') {
+      return (await unwrap(api.llm.providers, {})).providers
+    }
+    if (req.namespace === 'goals') {
+      const payload = { sessionId: req.args.agentId, ref: req.args.ref, ...(req.args.request || {}) }
+      const value = await unwrap(api.goals[req.method], payload)
+      return req.method === 'clear'
+        ? { id: req.args.ref.id, revision: req.args.ref.revision + 1 }
+        : { id: value.ref.id, revision: value.ref.revision }
+    }
+    throw new Error(`unexpected Remote call ${req.namespace}/${req.method}`)
+  },
+  async stream(req) {
+    assert.equal(req.peer, ctx.connection.peers[0])
+    assert.equal(req.peer.signal.aborted, false)
+    if (req.namespace === 'session' && req.method === 'follow' && req.args.request.address.sessionId === 'preset-session') {
+      return (async function* () {
+        yield { type: 'snapshot', header: { version: 4, id: 'preset-session' }, cursor: 9500, records: [], hasMore: false,
+          projections: { asOfSeq: 9500, values: structuredClone(presetSession) } }
+      })()
+    }
+    if (req.namespace === 'workspace' && req.method === 'follow') {
+      const value = (await api.workspace.list()).result.value
+      return (async function* () {
+        yield { type: 'baseline', value }
+        while (!req.signal.aborted) {
+          if (workspaceFrames.length > 0) yield workspaceFrames.shift()
+          else await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+      })()
+    }
+    if (req.namespace === 'session' && req.method === 'follow' && req.args.request.assistantStream === true) {
+      const sessionId = req.args.request.address.sessionId
+      const state = liveFollows.get(sessionId)
+      assert.ok(state, 'test requires a live follow fixture')
+      assert.equal(req.args.request.maxMessages, 12, 'live opening must bound history at the Host')
+      state.signals.push(req.signal)
+      return (async function* () {
+        yield { ...structuredClone(state.snapshot), assistantStream: state.snapshot.assistantStream ?? { revision: 0 } }
+        while (!req.signal.aborted) {
+          if (state.frames.length) yield state.frames.shift()
+          else await new Promise(resolve => setTimeout(resolve, 5))
+        }
+      })()
+    }
+    if (req.namespace === 'session' && req.method === 'follow') {
+      if (req.args.request.address.sessionId === 'broken-history') {
+        assert.equal(req.args.request.maxMessages, 1)
+        throw Object.assign(new Error('adapter refuses this format v0 Session: unexpected member origin'),
+          { code: 'SESSION_QUERY_PERSISTENCE_FAILED' })
+      }
+      const value = (await api.sessions.history()).result.value
+      const records = value.events.map((entry) => ({ type: 'event', event: entry.event }))
+      return (async function* () {
+        yield { type: 'snapshot', header: { version: 4, id: req.args.request.address.sessionId }, cursor: 91, records, hasMore: value.hasMore, projections: value.projections }
+      })()
+    }
+    if (req.namespace === 'session' && req.method === 'control') {
+      return (async function* () {
+        yield {
+          type: 'baseline',
+          value: {
+            projections: {
+              s1: { asOfSeq: 92, values: { turnOutline: initialTurnOutline, inbox: {
+                'next-turn': [{ id: 'message-1', role: 'user', source: { kind: 'user', rpcId: 'prompt-1' }, content: [{ type: 'text', text: '原消息' }] }],
+                'next-step': [],
+              } } },
+            },
+          },
+        }
+        while (!req.signal.aborted) {
+          if (controlFrames.length > 0) yield controlFrames.shift()
+          else await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+      })()
+    }
+    throw new Error(`unexpected Remote stream ${req.namespace}/${req.method}`)
+  },
+}
+// T016/T017: apply() also loads (or creates) the TLS identity before it
+// registers the upgrade route, so the dispatch suite waits for it.
+await plugin.apply(ctx, {
+  gatewayEnabled: true,
+  // Test-only: serve admin operations to the loopback listener as the owner's
+  // own web server always could (the companion channel never does, T022).
+  legacyAdmin: true,
+  // T017: the plugin-owned TLS listener pairs the dispatch device; no LAN
+  // advertising is needed for a loopback-only test.
+  lanEnabled: true,
+  requireHostApproval: false, // spec 008 P1b: these tests exercise the direct claim path; pairing-approval.test.mjs covers the default
+  lanHost: '127.0.0.1',
+  lanPort: 0,
+  // T016: a per-run certificate directory (the default would sit beside the
+  // fixed device file and be reused across runs).
+  tlsCertificateDir: fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-dispatch-tls-')),
+  deviceFile: '/tmp/dsh-mobile-gateway-dispatch-test-devices.json',
+  fileDownloadChunkBytes: 64 * 1024,
+})
+server.listen(webServer.port)
+
+const WebSocket = require('ws')
+function waitFor(pred, timeout) { return new Promise((res) => { const t0 = Date.now(); const iv = setInterval(() => { if (pred()) { clearInterval(iv); res(true) } else if (Date.now() - t0 > timeout) { clearInterval(iv); res(false) } }, 20) }) }
+
+// T022/T023: the dispatch table below exercises the admin surface. Each payload
+// carries the test-only `legacyAdmin` marker; a device token without it gets
+// `op/forbidden` (test/allowlist.test.mjs).
+const admin = (payload) => ({ type: payload.type, ...payload, legacyAdmin: true })
+// T023 (FR-007): every socket needs a paired device credential, so the suite
+// pairs once through the management API and reconnects with the token.
+const dispatchDeviceId = 'a2c1b4d6-0000-4000-8000-00000000d15c'
+let dispatchToken = null
+let dispatchDevice = null
+let dispatchLanUrl = null
+async function pairDispatchDevice() {
+  const created = await fetch(`http://127.0.0.1:${webServer.port}/mgw/pair`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Dispatch phone' }),
+  })
+  const { payload } = await created.json()
+  // The plugin-owned TLS listener presents the certificate the QR pins; it is
+  // the only listener that can redeem a v3 offer (T019; research R2: the DSH
+  // loopback route has no certificate of its own).
+  const lan = (await (await fetch(`http://127.0.0.1:${webServer.port}/mgw/status`)).json()).lan
+  dispatchLanUrl = lan.urls[0]
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(lan.urls[0], ['dsh-mobile-v1', `dsh-pair.${payload.pairingCode}`], {
+      rejectUnauthorized: false,
+      headers: { 'X-DSH-Device-ID': dispatchDeviceId },
+    })
+    const timer = setTimeout(() => { socket.terminate(); reject(new Error('dispatch pairing timed out')) }, 5_000)
+    socket.on('message', (data) => {
+      const frame = JSON.parse(data.toString())
+      if (frame.kind !== 'paired') return
+      clearTimeout(timer)
+      dispatchToken = frame.token
+      dispatchDevice = frame.device
+      socket.close()
+      resolve(frame)
+    })
+    socket.on('error', (error) => { clearTimeout(timer); reject(error) })
+  })
+}
+/** A WebSocket for the paired dispatch device (token in the header). */
+function openCompanionSocket(extraHeaders = {}) {
+  // Device credentials are accepted only on the plugin-owned TLS listener (the
+  // plaintext DSH loopback route has no certificate to pin).
+  return new WebSocket(dispatchLanUrl, ['dsh-mobile-v1'], {
+    rejectUnauthorized: false,
+    headers: { Authorization: `Bearer ${dispatchToken}`, 'X-DSH-Device-ID': dispatchDeviceId, ...extraHeaders },
+  })
+}
+
+;(async () => {
+  await pairDispatchDevice()
+  const ws = openCompanionSocket()
+  const got = []
+  ws.on('message', (d) => got.push(JSON.parse(d.toString())))
+  ws.on('error', (error) => console.error('dispatch socket error:', error.message))
+  await new Promise((r) => ws.once('open', r))
+  await waitFor(() => got.length > 0, 2000)
+
+  const interactionResults = []
+  listeners['session/event']({ id: 's1' }, { type: 'tool/result', seq: 9000, time: 1, data: {
+    turn: 1, step: 0, message: { role: 'tool', source: { kind: 'tool', callId: 'failed-call' }, toolCallId: 'failed-call', isError: true, content: [{ type: 'text', text: 'failed' }] },
+    error: { name: 'ToolError', code: 'DENIED', reason: 'permission denied' },
+  } })
+  listeners['session/event']({ id: 's1' }, { type: 'assistant/attempt', seq: 9001, time: 2, data: {
+    turn: 1, step: 0, stream: [{ type: 'chunk', time: 1, chunk: { type: 'finish', reason: { kind: 'error',
+      failure: { message: 'Rate limited', code: 'RATE_LIMIT', status: 429 } } } }],
+  } })
+  assert.equal(await waitFor(() => got.some(frame => frame.seq === 9001), 2000), true)
+  assert.equal(got.find(frame => frame.seq === 9000).event.isError, true)
+  assert.equal(got.find(frame => frame.seq === 9000).event.preview, 'failed')
+  assert.equal(got.find(frame => frame.seq === 9000).event.output, 'failed')
+  assert.equal(got.find(frame => frame.seq === 9000).event.error.reason, 'permission denied')
+  assert.equal(got.find(frame => frame.seq === 9001).event.stream[0].type, 'chunk')
+  assert.equal(got.find(frame => frame.seq === 9001).event.finish.failure.status, 429)
+  const retry = { turn: 1, step: 0, retryId: 'retry-1', provider: 'deepseek', mode: 'normal',
+    retry: 1, maxRetries: 5, delayMs: 1000, failure: { message: 'Rate limited', code: 'RATE_LIMIT', status: 429 } }
+  listeners['session/event']({ id: 's1' }, { type: 'llm/retry', seq: 9002, time: 3, data: retry })
+  listeners['session/event']({ id: 's1' }, { type: 'llm/retry-started', seq: 9003, time: 4,
+    data: { turn: 1, step: 0, retryId: 'retry-1', retry: 1 } })
+  listeners['session/event']({ id: 's1' }, { type: 'turn/end', seq: 9004, time: 5, data: {
+    turn: 1, reason: { kind: 'error', error: retry.failure },
+  } })
+  assert.equal(await waitFor(() => got.some(frame => frame.seq === 9004), 2000), true)
+  assert.deepEqual(got.find(frame => frame.seq === 9002).event, { type: 'llm/retry', ...retry })
+  assert.equal(got.find(frame => frame.seq === 9003).event.retryId, 'retry-1')
+  assert.equal(got.find(frame => frame.seq === 9004).event.reason, 'error')
+  assert.deepEqual(got.find(frame => frame.seq === 9004).event.reasonDetails.error, retry.failure)
+  interactionResults.push(['v4 failed tool and attempt payloads', true])
+
+  listeners['session/event']({ id: 's1' }, { type: 'user/message', seq: 8999, time: 5, data: { id: 'quoted-message', source: { kind: 'user', rpcId: 'quote-replay' }, content: [{ type: 'text', text: '> 来自 Web 的引用\n\n回复' }] } })
+  await waitFor(() => got.some(frame => frame.seq === 8999), 2000)
+  assert.deepEqual(got.find(frame => frame.seq === 8999).event.textParts[0], { type: 'quote', text: '来自 Web 的引用' })
+  assert.equal(got.find(frame => frame.seq === 8999).event.requestId, 'quote-replay')
+  const delivered = { turn: 1, callId: 'present-pdf', files: [
+    { path: 'guide.pdf', description: 'PDF 攻略', ignored: 'not on wire' },
+    { path: path.join(fileDownloadRoot, '三亚 攻略.pdf') },
+  ] }
+  listeners['session/event']({ id: 's1' }, { type: 'deliverables/presented', seq: 9005, time: 6, data: delivered })
+  assert.equal(await waitFor(() => got.some(frame => frame.seq === 9005), 2000), true)
+  assert.deepEqual(got.find(frame => frame.seq === 9005).event, { type: 'deliverables/presented',
+    turn: 1, callId: 'present-pdf', files: [
+      { path: 'guide.pdf', description: 'PDF 攻略' }, { path: delivered.files[1].path },
+    ] })
+  // Contract §3.5: the companion `hello` carries exactly the package
+  // CAPABILITIES, not the upstream admin list of the legacy client.
+  assert.deepEqual(got.find(frame => frame.kind === 'hello').capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+  interactionResults.push(['live delivery keeps paths and descriptions', true])
+
+  const generatedRef = { attachmentId: 'generated-image', mediaType: 'image/png', bytes: 8, width: 1024, height: 768 }
+  const generatedBlock = { type: 'image', attachment: generatedRef }
+  for (const [index, type] of ['tool/result', 'tool/ptc-dispatch', 'tool/code-dispatch'].entries()) {
+    const seq = 9010 + index
+    listeners['session/event']({ id: 's1' }, { type, seq, time: 7, data: {
+      turn: 1, parentCallId: 'run-code', subCallId: 'generate-1', name: 'generate_image',
+      ...(type === 'tool/result' ? { message: { toolCallId: 'generate-1', content: [generatedBlock] } }
+        : { content: [generatedBlock] }),
+    } })
+    assert.equal(await waitFor(() => got.some(frame => frame.seq === seq), 2000), true)
+    assert.deepEqual(got.find(frame => frame.seq === seq).event.images, [generatedRef])
+    if (type !== 'tool/result') assert.equal(got.find(frame => frame.seq === seq).event.parentCallId, 'run-code')
+  }
+  assert.deepEqual(got.find(frame => frame.kind === 'hello').capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+  interactionResults.push(['live generated tool images and subcalls', true])
+
+  // Auxiliary queries must report the real failure with their own request identity.
+  for (const type of ['permission-options', 'context-usage', 'session-stats']) {
+    const firstResponse = got.length
+    ws.send(JSON.stringify(admin({ type, sessionId: 'broken-history' })))
+    assert.equal(await waitFor(() => got.slice(firstResponse).some(frame => frame.kind === 'error' && frame.requestType === type), 2000), true)
+    const reply = got.slice(firstResponse).find(frame => frame.kind === 'error' && frame.requestType === type)
+    assert.equal(reply.kind, 'error')
+    assert.equal(reply.requestType, type)
+    assert.equal(reply.sessionId, 'broken-history')
+    assert.equal(reply.code, 'SESSION_QUERY_PERSISTENCE_FAILED')
+    assert.match(reply.message, /unexpected member origin/)
+    interactionResults.push([`${type} preserves history failure and correlation`, true])
+  }
+
+  // Opening byte budget keeps a contiguous latest suffix, without changing stream state.
+  for (const oversizedLatest of [false, true]) {
+    const sessionId = `opening-budget-${oversizedLatest}`
+    const records = Array.from({ length: 60 }, (_, index) => ({ type: 'event', event: {
+      type: 'assistant/message', seq: index + 1, time: index + 1, surfaceOp: 'append',
+      data: { turn: index + 1, step: 1, message: { content: [{ type: 'text',
+        text: `${index + 1}:` + '历史正文。'.repeat(oversizedLatest && index === 59 ? 30_000 : 4_000),
+      }] } },
+    } }))
+    const prefix = { revision: 4, activeAttempt: { attemptId: 'active', turn: 61, step: 1,
+      startedAfterSeq: 65, nextIndex: 1,
+      stream: [{ type: 'text-chunks', time0: 100, index: 0, texts: ['继续生成'], dt: [] }] } }
+    const projections = { asOfSeq: 65, values: { todos: [{ content: '任务', status: 'completed' }],
+      turnOutline: records.map(({ event }) => ({ turn: event.data.turn, seq: event.seq,
+        prompt: `第 ${event.data.turn} 轮`, response: '预览' })) } }
+    const state = { signals: [], frames: [], snapshot: {
+      type: 'snapshot', header: { version: 4, id: sessionId }, cursor: 65,
+      records, hasMore: false, projections, assistantStream: prefix,
+    } }
+    liveFollows.set(sessionId, state)
+    const socket = openCompanionSocket({ 'X-DSH-Channel': 'conversation' })
+    const frames = []
+    socket.on('message', data => frames.push(JSON.parse(data.toString())))
+    await new Promise(resolve => socket.once('open', resolve))
+    try {
+      socket.send(JSON.stringify(admin({ type: 'subscribe', sessionId, assistantStream: true })))
+      assert.equal(await waitFor(() => frames.some(frame => frame.kind === 'session-snapshot'), 2000), true,
+        JSON.stringify(frames.map((frame) => frame.kind === 'error' ? `${frame.code}:${frame.requestType}:${frame.message}` : frame.kind)))
+      const snapshot = frames.find(frame => frame.kind === 'session-snapshot')
+      assert.equal(snapshot.hasMore, true)
+      assert.equal(snapshot.nextBeforeSeq, snapshot.events[0].seq)
+      assert.deepEqual(snapshot.events.map(event => event.seq),
+        Array.from({ length: snapshot.events.length }, (_, index) => snapshot.nextBeforeSeq + index))
+      assert.equal(snapshot.events.at(-1).seq, 60)
+      assert.equal(snapshot.events.at(-1).data.message.content[0].text, records.at(-1).event.data.message.content[0].text)
+      assert.equal(snapshot.cursor, 65, 'filtered history tail must not replace durable watermark')
+      assert.deepEqual(snapshot.assistantStream, prefix)
+      assert.deepEqual(snapshot.projections, projections)
+      if (oversizedLatest) assert.equal(snapshot.events.length, 1)
+      else {
+        assert.ok(snapshot.bytes <= 256 * 1024)
+        assert.ok(snapshot.events.length < records.length)
+        console.log(`opening budget: ${Buffer.byteLength(JSON.stringify(records))} -> ${snapshot.bytes} bytes; ${records.length} -> ${snapshot.events.length} events`)
+      }
+      interactionResults.push([`rc2 bounded opening with oversized latest=${oversizedLatest}`, true])
+    } finally { socket.terminate() }
+  }
+
+  // rc.2 follow: authoritative snapshot, independent token identity, real settlement.
+  {
+    const state = { signals: [], frames: [], snapshot: {
+      type: 'snapshot', header: { version: 4, id: 'live-1' }, cursor: 41,
+      records: [], hasMore: false, projections: { asOfSeq: 41, values: {} }, assistantStream: { revision: 0 },
+    } }
+    liveFollows.set('live-1', state)
+    const socket = openCompanionSocket({ 'X-DSH-Channel': 'conversation' })
+    const frames = []
+    socket.on('message', data => frames.push(JSON.parse(data.toString())))
+    await new Promise(resolve => socket.once('open', resolve))
+    try {
+      socket.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 'live-1', assistantStream: true })))
+      assert.equal(await waitFor(() => frames.some(frame => frame.kind === 'session-snapshot'), 2000), true)
+      const baseline = frames.find(frame => frame.kind === 'session-snapshot')
+      assert.equal(baseline.historyFormatVersion, 4)
+      assert.equal(baseline.cursor, 41)
+      assert.equal(baseline.replace, true)
+      state.frames.push({ type: 'assistant-stream', frame: { type: 'start', attemptId: 'a1', revision: 1, startedAfterSeq: 41, turn: 2, step: 3 } })
+      for (const [index, text] of ['Hello', ' world'].entries()) state.frames.push({ type: 'assistant-stream', frame: {
+        type: 'chunk', attemptId: 'a1', revision: index + 2, index, time: 100 + index, chunk: { type: 'text-delta', index: 0, text },
+      } })
+      const finalEvent = { type: 'assistant/message', seq: 42, time: 102,
+        surfaceOp: 'append', data: { turn: 2, step: 3, interrupted: true, usage: { outputTokens: 2 },
+          message: { content: [{ type: 'text', text: 'Hello world' }] } } }
+      state.frames.push({ type: 'event', event: finalEvent }, { type: 'assistant-stream', frame: {
+        type: 'end', attemptId: 'a1', revision: 4, index: 2, outcome: { kind: 'committed', eventType: 'assistant/message', seq: 42 },
+      } })
+      listeners['session/event']({ id: 'live-1' }, finalEvent)
+      assert.equal(await waitFor(() => frames.some(frame => frame.frame?.type === 'end'), 2000), true)
+      const chunks = frames.filter(frame => frame.frame?.type === 'chunk')
+      assert.equal(chunks.length, 2)
+      assert.ok(chunks.every(frame => !('seq' in frame) && !('seq' in frame.frame) && frame.frame.turn === 2 && frame.frame.step === 3))
+      assert.equal(frames.filter(frame => frame.kind === 'event').length, 1)
+      assert.equal(frames.find(frame => frame.kind === 'event').event.interrupted, true)
+      assert.equal(frames.find(frame => frame.kind === 'event').event.usage.outputTokens, 2)
+      assert.equal(frames.find(frame => frame.kind === 'event').surfaceOp, 'append')
+      const delivery = { type: 'deliverables/presented', seq: 43, time: 103,
+        data: { turn: 2, callId: 'present-follow', files: [{ path: 'guide.pdf', description: 'PDF' }] } }
+      state.frames.push({ type: 'event', event: delivery })
+      assert.equal(await waitFor(() => frames.some(frame => frame.seq === 43), 2000), true)
+      assert.deepEqual(frames.find(frame => frame.seq === 43).event, { type: delivery.type, ...delivery.data })
+      assert.equal(frames.find(frame => frame.seq === 43).streamId, baseline.streamId)
+      socket.send(JSON.stringify(admin({ type: 'unsubscribe' })))
+      assert.equal(await waitFor(() => state.signals[0].aborted, 2000), true)
+      interactionResults.push(['rc2 ordered follow and independent chunks', true])
+    } finally { socket.terminate() }
+
+    // A new connection joining mid-generation receives the entire active prefix.
+    state.snapshot.assistantStream = { revision: 2, activeAttempt: { attemptId: 'a1', turn: 2, step: 3,
+      startedAfterSeq: 41, nextIndex: 1, stream: [{ type: 'text-chunks', time0: 100, index: 0, dt: [], texts: ['Hello'] }] } }
+    const reconnect = openCompanionSocket({ 'X-DSH-Channel': 'conversation' })
+    const restored = []
+    reconnect.on('message', data => restored.push(JSON.parse(data.toString())))
+    await new Promise(resolve => reconnect.once('open', resolve))
+    reconnect.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 'live-1', assistantStream: true })))
+    assert.equal(await waitFor(() => restored.some(frame => frame.kind === 'session-snapshot'), 2000), true)
+    assert.equal(restored.find(frame => frame.kind === 'session-snapshot').assistantStream.activeAttempt.stream[0].texts[0], 'Hello')
+    reconnect.terminate()
+    assert.equal(await waitFor(() => state.signals.at(-1).aborted, 2000), true)
+    interactionResults.push(['rc2 reconnect restores prefix and disconnect cancels follow', true])
+  }
+
+  // 两条真实 WebSocket：暂停对话接收后，控制连接仍能读取文件并管理会话。
+  {
+    const control = openCompanionSocket({ 'X-DSH-Channel': 'control' })
+    const conversation = openCompanionSocket({ 'X-DSH-Channel': 'conversation' })
+    const controls = []
+    const conversations = []
+    control.on('message', data => controls.push(JSON.parse(data.toString())))
+    conversation.on('message', data => conversations.push(JSON.parse(data.toString())))
+    try {
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'hello') && conversations.some(f => f.kind === 'hello'), 2000), true)
+      // Contract §3.5: the companion `hello` lists exactly the package
+      // CAPABILITIES; split channels, projections, schedules and plugin
+      // management are no longer advertised to a phone.
+      assert.deepEqual(controls.find(f => f.kind === 'hello').capabilities, ['sessions-read', 'prompt', 'cancel', 'approval-v1'])
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'projection-baseline'), 2000), true)
+      assert.deepEqual(controls.find(f => f.kind === 'projection-baseline').projections.s1.values.turnOutline, initialTurnOutline)
+      assert.equal(conversations.some(f => f.kind === 'projection-baseline'), false)
+      // 大纲更新走控制连接，不受旧单连接的会话订阅过滤。
+      ws.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 'another-session' })))
+      assert.equal(await waitFor(() => got.some(f => f.kind === 'subscribed' && f.sessionId === 'another-session'), 2000), true)
+      const updatedOutline = [...initialTurnOutline, { turn: 2, seq: 93, prompt: '继续调整', response: '' }]
+      controlFrames.push({ type: 'projection', sessionId: 's1', changes: [{ key: 'turnOutline', val: updatedOutline }, { key: 'todos', val: [] }], seq: 93 })
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'turn-outline-updated' && f.asOfSeq === 93)
+        && got.some(f => f.kind === 'turn-outline-updated' && f.asOfSeq === 93), 2000), true)
+      assert.deepEqual(controls.find(f => f.kind === 'turn-outline-updated' && f.asOfSeq === 93).turnOutline, updatedOutline)
+      // 其他投影更新不能覆盖已缓存的大纲；新设备获得最近状态。
+      controlFrames.push({ type: 'projection', sessionId: 's1', key: 'todos', value: [], seq: 94 })
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'tasks-updated' && f.asOfSeq === 94), 2000), true)
+      const reconnected = openCompanionSocket({ 'X-DSH-Channel': 'control' })
+      const recovered = []
+      reconnected.on('message', data => recovered.push(JSON.parse(data.toString())))
+      try {
+        assert.equal(await waitFor(() => recovered.some(f => f.kind === 'projection-baseline'), 2000), true)
+        assert.deepEqual(recovered.find(f => f.kind === 'projection-baseline').projections.s1.values.turnOutline, updatedOutline)
+      } finally { reconnected.terminate() }
+      controlFrames.push({ type: 'projection', sessionId: 's1', key: 'turnOutline', value: [], seq: 95 })
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'turn-outline-updated' && f.asOfSeq === 95), 2000), true)
+      assert.deepEqual(controls.find(f => f.kind === 'turn-outline-updated' && f.asOfSeq === 95).turnOutline, [])
+      controlFrames.push({ type: 'projection', sessionId: 's1', key: 'turnOutline', value: null, seq: 96 })
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'turn-outline-updated' && f.asOfSeq === 96), 2000), true)
+      assert.equal(controls.find(f => f.kind === 'turn-outline-updated' && f.asOfSeq === 96).turnOutline, null)
+      assert.equal(conversations.some(f => f.kind === 'turn-outline-updated'), false)
+      ws.send(JSON.stringify(admin({ type: 'unsubscribe' })))
+      assert.equal(await waitFor(() => got.some(f => f.kind === 'subscribed' && f.sessionId === null), 2000), true)
+      // 测试入口不属于 DSH 安装，不能上报虚构的适配基线版本。
+      assert.equal(controls.find(f => f.kind === 'hello').dshVersion, undefined)
+      // T022: a device token can never manage plugins — the refusal names the op.
+      control.send(JSON.stringify({ type: 'plugin-catalog', requestId: 'device-plugin-catalog' }))
+      assert.equal(await waitFor(() => controls.some(f => f.requestId === 'device-plugin-catalog'), 2000), true)
+      assert.equal(controls.find(f => f.requestId === 'device-plugin-catalog').code, 'op/forbidden')
+      conversation.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 's1' })))
+      assert.equal(await waitFor(() => conversations.some(f => f.kind === 'subscribed'), 2000), true)
+      listeners['session/event']({ id: 's1' }, { type: 'session/title', seq: 7001, time: Date.now(), data: { title: 'split test' } })
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'session-title-changed') && conversations.some(f => f.seq === 7001), 2000), true)
+      assert.equal(controls.some(f => f.seq === 7001 && f.event), false)
+      assert.equal(conversations.some(f => f.kind === 'session-title-changed' || f.kind === 'session-archives'), false)
+      conversation.pause()
+      for (let seq = 7002; seq < 7258; seq++) {
+        listeners['session/event']({ id: 's1' }, { type: 'assistant/message', seq, time: Date.now(), data: { message: { content: [{ type: 'text', text: 'x'.repeat(4096) }] }, turn: 1, step: 1 } })
+      }
+      control.send(JSON.stringify(admin({ type: 'file-list', requestId: 'split-files', sessionId: 's1' })))
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'file-list' && f.requestId === 'split-files'), 2000), true)
+      control.send(JSON.stringify(admin({ type: 'session-rename', sessionId: 's1', title: 'split renamed' })))
+      assert.equal(await waitFor(() => controls.some(f => f.kind === 'session-renamed'), 2000), true)
+      assert.equal(controls.some(f => f.event), false)
+      conversation.resume()
+      conversation.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 'preset-session' })))
+      assert.equal(await waitFor(() => conversations.some(f => f.kind === 'subscribed' && f.sessionId === 'preset-session'), 2000), true)
+      control.send(JSON.stringify(admin({ type: 'session-agent-preset', sessionId: 'preset-session', requestId: 'preset-state' })))
+      assert.equal(await waitFor(() => controls.some(f => f.requestId === 'preset-state'), 2000), true)
+      assert.equal(controls.find(f => f.requestId === 'preset-state').locked, false)
+      control.send(JSON.stringify(admin({ type: 'select-agent-preset', sessionId: 'preset-session', agentPreset: 'minimal', requestId: 'preset-select' })))
+      assert.equal(await waitFor(() => controls.some(f => f.requestId === 'preset-select')
+        && conversations.some(f => f.event?.type === 'agent-preset/selected'), 2000), true)
+      assert.equal(controls.find(f => f.requestId === 'preset-select').agentPreset, 'minimal')
+      assert.equal(controls.find(f => f.kind === 'session-agent-preset-updated').agentPreset, 'minimal')
+      assert.equal(conversations.find(f => f.event?.type === 'agent-preset/selected').event.agentPreset, 'minimal')
+      assert.equal(conversations.some(f => f.kind === 'session-agent-preset-updated'), false)
+      presetSession.sessionListMetadata = { blank: false, lastPromptAt: 101 }
+      listeners['session/event']({ id: 'preset-session' }, { type: 'turn/start', seq: 9501, time: 101, data: { turn: 0 } })
+      assert.equal(await waitFor(() => conversations.some(f => f.event?.type === 'turn/start'), 2000), true)
+      assert.equal(conversations.find(f => f.event?.type === 'turn/start').time, 101)
+      control.send(JSON.stringify(admin({ type: 'select-agent-preset', sessionId: 'preset-session', agentPreset: 'standard', requestId: 'preset-locked' })))
+      assert.equal(await waitFor(() => controls.some(f => f.requestId === 'preset-locked')
+        && controls.some(f => f.kind === 'session-agent-preset-updated' && f.locked), 2000), true)
+      assert.equal(controls.find(f => f.requestId === 'preset-locked').code, 'agent-preset/locked')
+      conversation.send(JSON.stringify(admin({ type: 'select-agent-preset', sessionId: 'preset-session', agentPreset: 'standard' })))
+      assert.equal(await waitFor(() => conversations.some(f => f.code === 'wrong-channel' && f.requestType === 'select-agent-preset'), 2000), true)
+      interactionResults.push(['session preset state, selection, locking and split-channel notifications', true])
+      conversation.send(JSON.stringify(admin({ type: 'file-list', requestId: 'wrong-lane', sessionId: 's1' })))
+      assert.equal(await waitFor(() => conversations.some(f => f.code === 'wrong-channel'), 2000), true)
+    } finally {
+      conversation.terminate()
+      control.terminate()
+    }
+  }
+
+  const archiveBaselineReady = await waitFor(() => got.some((m) => m.kind === 'session-archives' && m.archivedSessionIds.length === 0), 2000)
+  interactionResults.push(['session archive baseline on connect', archiveBaselineReady])
+  const queueBaselineReady = await waitFor(() => got.some((m) => m.kind === 'session-queues' && m.queues.s1?.[0]?.id === 'message-1'), 2000)
+  const queueBaseline = got.find((m) => m.kind === 'session-queues' && m.queues.s1?.[0]?.id === 'message-1')
+  interactionResults.push(['session queue baseline on connect', queueBaselineReady && queueBaseline.queues.s1[0].placement === 'queued' && queueBaseline.queues.s1[0].message.content[0].text === '原消息'])
+  let questionDownstreamCalls = 0
+  let approvalDownstreamCalls = 0
+  let questionDownstreamAborts = 0
+  let approvalDownstreamAborts = 0
+  const waitForMobileQuestion = (request) => () => {
+    questionDownstreamCalls += 1
+    return new Promise((resolve, reject) => {
+      request.signal.addEventListener('abort', () => {
+        questionDownstreamAborts += 1
+        reject(request.signal.reason)
+      }, { once: true })
+    })
+  }
+  const waitForMobileApproval = (request) => () => {
+    approvalDownstreamCalls += 1
+    return new Promise((resolve, reject) => {
+      request.signal.addEventListener('abort', () => {
+        approvalDownstreamAborts += 1
+        reject(request.signal.reason)
+      }, { once: true })
+    })
+  }
+  const questionOneRequest = {
+    agent: { id: 's1' },
+    questions: [
+      { id: 'direction', header: 'Research', question: 'Choose a direction', options: [{ label: 'Core', description: 'Architecture' }, { label: 'Mobile' }], multiSelect: false },
+      { id: 'detail', question: 'Anything else?', options: [], multiSelect: false },
+    ],
+  }
+  const questionOne = listeners['user-questions/request'](questionOneRequest, waitForMobileQuestion(questionOneRequest))
+  const questionTwoRequest = {
+    agent: { id: 's2' },
+    questions: [{ id: 'confirm', question: 'Continue?', options: [{ label: 'Yes' }, { label: 'No' }], multiSelect: false }],
+  }
+  const questionTwo = listeners['user-questions/request'](questionTwoRequest, waitForMobileQuestion(questionTwoRequest)).then(
+    (value) => value,
+    (error) => error,
+  )
+  // T024/T026: a remotely decidable approval binds the `tool/call` content;
+  // seed it the way the Host emits it before the approval pipeline.
+  listeners['session/event']({ id: 's1' }, { type: 'tool/call', seq: 9101, time: 1, data: { turn: 1, step: 0, callId: 'call-1', name: 'bash', arguments: '{"command":"rm -rf build"}' } })
+  listeners['session/event']({ id: 's2' }, { type: 'tool/call', seq: 9102, time: 2, data: { turn: 1, step: 0, callId: 'call-2', name: 'bash', arguments: '{"path":"C:/outside"}' } })
+  listeners['session/event']({ id: 's-web-approval' }, { type: 'tool/call', seq: 9103, time: 3, data: { turn: 1, step: 0, callId: 'call-3', name: 'bash', arguments: '{"command":"ls"}' } })
+  const approvalOneRequest = {
+    agent: { id: 's1' },
+    toolName: 'bash',
+    callId: 'call-1',
+    reason: 'escalate sandbox to danger-full-access',
+    displayReason: { en: 'Allow this command?', 'zh-CN': '允许执行此命令？' },
+  }
+  const approvalOne = listeners['approval/request'](approvalOneRequest, waitForMobileApproval(approvalOneRequest))
+  const approvalTwoRequest = {
+    agent: { id: 's2' },
+    toolName: 'bash',
+    callId: 'call-2',
+    reason: 'write outside the workspace',
+    displayReason: { en: 'Allow writing outside the workspace?', 'zh-CN': '允许写入工作区以外的位置？' },
+  }
+  const approvalTwo = listeners['approval/request'](approvalTwoRequest, waitForMobileApproval(approvalTwoRequest))
+
+  const requestedReady = await waitFor(() => got.filter((m) => m.kind === 'question-requested').length === 2, 2000)
+  const requested = got.find((m) => m.kind === 'question-requested' && m.sessionId === 's1')
+  const requestedTwo = got.find((m) => m.kind === 'question-requested' && m.sessionId === 's2')
+  interactionResults.push(['question requested on Mobile and offered to WebUI', requestedReady && requested && requested.questions.length === 2 && requested.questions[0].options[0].description === 'Architecture' && questionDownstreamCalls === 2])
+
+  ws.send(JSON.stringify(admin({
+    type: 'question-answer',
+    rpcId: requested.rpcId,
+    sessionId: 's1',
+    answers: [
+      { id: 'direction', selected: ['Not offered'] },
+      { id: 'detail', selected: [] },
+    ],
+  })
+  ))
+  const invalidAnswerReady = await waitFor(() => got.some((m) => m.kind === 'error' && m.requestType === 'question-answer' && m.code === 'bad-response'), 2000)
+  interactionResults.push(['question answer validation', invalidAnswerReady])
+
+  ws.send(JSON.stringify(admin({
+    type: 'question-answer',
+    rpcId: requested.rpcId,
+    sessionId: 's1',
+    answers: [
+      { id: 'direction', selected: ['Mobile'] },
+      { id: 'detail', selected: [], custom: 'Security' },
+    ],
+  })
+  ))
+  const answerReady = await waitFor(() => got.some((m) => m.kind === 'question-response' && m.rpcId === requested.rpcId), 2000)
+  const answerReceipt = got.find((m) => m.kind === 'question-response' && m.rpcId === requested.rpcId)
+  const answerValue = await questionOne
+  interactionResults.push(['question answer', answerReady && answerReceipt.accepted === true && answerValue.answers[1].custom === 'Security'])
+  const answeredResolved = await waitFor(() => got.some((m) => m.kind === 'question-resolved' && m.rpcId === requested.rpcId && m.outcome === 'answered'), 2000)
+  interactionResults.push(['question answered resolution', answeredResolved])
+  const questionWebUICancelled = await waitFor(() => questionDownstreamAborts === 1, 2000)
+  interactionResults.push(['Mobile question answer cancels the WebUI request', questionWebUICancelled && questionOneRequest.signal.aborted])
+
+  const approvalRequestedReady = await waitFor(() => got.filter((m) => m.kind === 'approval-requested').length === 2, 2000)
+  const requestedApproval = got.find((m) => m.kind === 'approval-requested' && m.sessionId === 's1')
+  const requestedApprovalTwo = got.find((m) => m.kind === 'approval-requested' && m.sessionId === 's2')
+  interactionResults.push(['approval requested on Mobile and offered to WebUI', approvalRequestedReady && requestedApproval && requestedApproval.toolName === 'bash' && requestedApproval.callId === 'call-1' && requestedApproval.reason === 'escalate sandbox to danger-full-access' && requestedApproval.displayReason['zh-CN'] === '允许执行此命令？' && approvalDownstreamCalls === 2])
+
+  const approvalReplayCount = got.filter((m) => m.kind === 'approval-requested' && m.rpcId === requestedApprovalTwo.rpcId).length
+  ws.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 's2' })))
+  const subscribedApprovalReady = await waitFor(() => got.filter((m) => m.kind === 'approval-requested' && m.rpcId === requestedApprovalTwo.rpcId).length > approvalReplayCount, 2000)
+  const subscribedApproval = got.filter((m) => m.kind === 'approval-requested' && m.rpcId === requestedApprovalTwo.rpcId).at(-1)
+  const wrongSessionApprovalCount = got.filter((m) => m.kind === 'approval-requested' && m.rpcId === requestedApproval.rpcId).length
+  interactionResults.push(['approval replayed when existing session is opened', subscribedApprovalReady && subscribedApproval && subscribedApproval.replay === true && wrongSessionApprovalCount === 1])
+  ws.send(JSON.stringify(admin({ type: 'unsubscribe' })))
+  await waitFor(() => got.some((m) => m.kind === 'subscribed' && m.sessionId === null), 2000)
+
+  // Reopening a Session happens on the conversation lane, but interaction
+  // frames must be restored on the companion control lane.
+  {
+    const control = openCompanionSocket({ 'X-DSH-Channel': 'control' })
+    const conversation = openCompanionSocket({ 'X-DSH-Channel': 'conversation' })
+    const controls = []
+    const conversations = []
+    control.on('message', data => controls.push(JSON.parse(data.toString())))
+    conversation.on('message', data => conversations.push(JSON.parse(data.toString())))
+    try {
+      assert.equal(await waitFor(() => controls.some(frame => frame.kind === 'hello') && conversations.some(frame => frame.kind === 'hello'), 2000), true)
+      const beforeApprovalReplay = controls.filter(frame => frame.kind === 'approval-requested' && frame.rpcId === requestedApprovalTwo.rpcId).length
+      const beforeQuestionReplay = controls.filter(frame => frame.kind === 'question-requested' && frame.rpcId === requestedTwo.rpcId).length
+      conversation.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 's2' })))
+      assert.equal(await waitFor(() => conversations.some(frame => frame.kind === 'subscribed' && frame.sessionId === 's2'), 2000), true)
+      const restored = await waitFor(() => (
+        controls.filter(frame => frame.kind === 'approval-requested' && frame.rpcId === requestedApprovalTwo.rpcId).length > beforeApprovalReplay &&
+        controls.filter(frame => frame.kind === 'question-requested' && frame.rpcId === requestedTwo.rpcId).length > beforeQuestionReplay
+      ), 2000)
+      const replayedApproval = controls.filter(frame => frame.kind === 'approval-requested' && frame.rpcId === requestedApprovalTwo.rpcId).at(-1)
+      const replayedQuestion = controls.filter(frame => frame.kind === 'question-requested' && frame.rpcId === requestedTwo.rpcId).at(-1)
+      interactionResults.push(['split-channel Session reopen restores question and approval on control lane', restored && replayedApproval?.replay === true && replayedApproval.displayReason['zh-CN'] === '允许写入工作区以外的位置？' && replayedQuestion?.replay === true])
+    } finally {
+      conversation.terminate()
+      control.terminate()
+    }
+  }
+
+  ws.send(JSON.stringify(admin({
+    type: 'approval-response',
+    rpcId: requestedApproval.rpcId,
+    sessionId: 's1',
+    approvalId: requestedApproval.approvalId,
+    argsHash: requestedApproval.argsHash,
+    outcome: 'allowed-once',
+  })
+  ))
+  const approvalAllowedReady = await waitFor(() => got.some((m) => m.kind === 'approval-response' && m.rpcId === requestedApproval.rpcId), 2000)
+  const approvalAllowedReceipt = got.find((m) => m.kind === 'approval-response' && m.rpcId === requestedApproval.rpcId)
+  interactionResults.push(['approval allowed once', approvalAllowedReady && approvalAllowedReceipt.accepted === true && approvalAllowedReceipt.outcome === 'allowed-once' && await approvalOne === 'allowed-once'])
+  const approvalAllowedResolved = await waitFor(() => got.some((m) => m.kind === 'approval-resolved' && m.rpcId === requestedApproval.rpcId && m.approvalId === requestedApproval.approvalId && m.outcome === 'allowed-once'), 2000)
+  interactionResults.push(['approval allowed resolution', approvalAllowedResolved])
+  const approvalWebUICancelled = await waitFor(() => approvalDownstreamAborts === 1, 2000)
+  interactionResults.push(['Mobile approval decision cancels the WebUI request', approvalWebUICancelled && approvalOneRequest.signal.aborted])
+
+  ws.send(JSON.stringify(admin({
+    type: 'approval-response',
+    rpcId: requestedApprovalTwo.rpcId,
+    sessionId: 's2',
+    approvalId: requestedApprovalTwo.approvalId,
+    argsHash: requestedApprovalTwo.argsHash,
+    outcome: 'rejected',
+  })
+  ))
+  const approvalRejectedReady = await waitFor(() => got.some((m) => m.kind === 'approval-response' && m.rpcId === requestedApprovalTwo.rpcId), 2000)
+  const approvalRejectedReceipt = got.find((m) => m.kind === 'approval-response' && m.rpcId === requestedApprovalTwo.rpcId)
+  interactionResults.push(['approval rejected', approvalRejectedReady && approvalRejectedReceipt.accepted === true && approvalRejectedReceipt.outcome === 'rejected' && await approvalTwo === 'rejected'])
+  const approvalRejectedResolved = await waitFor(() => got.some((m) => m.kind === 'approval-resolved' && m.rpcId === requestedApprovalTwo.rpcId && m.approvalId === requestedApprovalTwo.approvalId && m.outcome === 'rejected'), 2000)
+  interactionResults.push(['approval rejected resolution', approvalRejectedResolved])
+  const rejectedApprovalWebUICancelled = await waitFor(() => approvalDownstreamAborts === 2, 2000)
+  interactionResults.push(['Mobile approval rejection cancels the WebUI request', rejectedApprovalWebUICancelled && approvalTwoRequest.signal.aborted])
+
+  let resolveWebApproval
+  const webApproval = listeners['approval/request']({
+    agent: { id: 's-web-approval' },
+    toolName: 'bash',
+    callId: 'call-3',
+    reason: 'choose from WebUI or Mobile',
+  }, () => new Promise(resolve => { resolveWebApproval = resolve }))
+  const webApprovalRequest = await waitFor(() => got.some(frame => frame.kind === 'approval-requested' && frame.sessionId === 's-web-approval'), 2000)
+  resolveWebApproval('allowed-once')
+  const webApprovalValue = await webApproval
+  const webApprovalResolved = await waitFor(() => got.some(frame => frame.kind === 'approval-resolved' && frame.sessionId === 's-web-approval' && frame.outcome === 'allowed-once'), 2000)
+  interactionResults.push(['WebUI approval closes the shared request on Mobile', webApprovalRequest && webApprovalValue === 'allowed-once' && webApprovalResolved])
+
+  let resolveWebQuestion
+  const webQuestion = listeners['user-questions/request']({
+    agent: { id: 's-web-question' },
+    questions: [{ id: 'choice', question: 'Choose anywhere', options: [{ label: 'WebUI' }, { label: 'Mobile' }], multiSelect: false }],
+  }, () => new Promise(resolve => { resolveWebQuestion = resolve }))
+  const webQuestionRequest = await waitFor(() => got.some(frame => frame.kind === 'question-requested' && frame.sessionId === 's-web-question'), 2000)
+  resolveWebQuestion({ answers: [{ id: 'choice', selected: ['WebUI'] }] })
+  const webQuestionValue = await webQuestion
+  const webQuestionResolved = await waitFor(() => got.some(frame => frame.kind === 'question-resolved' && frame.sessionId === 's-web-question' && frame.outcome === 'answered'), 2000)
+  interactionResults.push(['WebUI question closes the shared request on Mobile', webQuestionRequest && webQuestionValue.answers[0].selected[0] === 'WebUI' && webQuestionResolved])
+
+  ws.send(JSON.stringify(admin({ type: 'approval-response', rpcId: requestedApprovalTwo.rpcId, sessionId: 's2', approvalId: requestedApprovalTwo.approvalId, outcome: 'later' })))
+  const badApprovalReady = await waitFor(() => got.some((m) => m.kind === 'error' && m.requestType === 'approval-response'), 2000)
+  interactionResults.push(['approval invalid outcome', badApprovalReady])
+
+  controlFrames.push({
+      type: 'projection',
+      sessionId: 's1',
+      key: 'todos',
+      value: [{ content: 'Inspect Android CLI/SDK environment', status: 'completed' }],
+      seq: 93,
+  })
+  controlFrames.push({
+      type: 'projection',
+      sessionId: 's1',
+      key: 'goal',
+      value: { goal: { id: 'goal-1', revision: 8, objective: '初始化一个 Android app', phase: 'paused', maxGoalRounds: 12 }, roundsStarted: 3, createdAt: 1, updatedAt: 3 },
+      seq: 94,
+  })
+  controlFrames.push({
+    type: 'projection',
+    sessionId: 's1',
+    key: 'inbox',
+    value: {
+      'next-turn': [{ id: 'message-1', role: 'user', source: { kind: 'user', rpcId: 'prompt-1' }, content: [{ type: 'text', text: 'WebUI 修改后' }] }],
+      'next-step': [
+        { id: 'message-2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '立即处理' }] },
+        { id: 'message-3', role: 'user', source: { kind: 'tool' }, content: [{ type: 'text', text: '上下文' }] },
+      ],
+    },
+    seq: 95,
+  })
+  const tasksUpdated = await waitFor(() => got.some((m) => m.kind === 'tasks-updated' && m.asOfSeq === 93), 2000)
+  const goalUpdated = await waitFor(() => got.some((m) => m.kind === 'goal-updated' && m.asOfSeq === 94), 2000)
+  const queueUpdated = await waitFor(() => got.some((m) => m.kind === 'session-queue' && m.sessionId === 's1' && m.items[0]?.message.content[0]?.text === 'WebUI 修改后'), 2000)
+  interactionResults.push(['live task projection', tasksUpdated && got.find((m) => m.kind === 'tasks-updated' && m.asOfSeq === 93).todos[0].status === 'completed'])
+  interactionResults.push(['live goal projection', goalUpdated && got.find((m) => m.kind === 'goal-updated' && m.asOfSeq === 94).goal.goal.phase === 'paused'])
+  interactionResults.push(['live session queue update', queueUpdated && (() => {
+    const items = got.find((m) => m.kind === 'session-queue' && m.items[0]?.message.content[0]?.text === 'WebUI 修改后').items
+    return items[1].placement === 'steering' && items[2].placement === 'context' && items[2].rpcId === undefined
+  })()])
+
+  controlFrames.push({ type: 'projection', sessionId: 's1', key: 'inbox', value: { 'next-turn': [], 'next-step': [] }, seq: 96 })
+  assert.equal(await waitFor(() => got.some(frame => frame.kind === 'session-queue' && frame.sessionId === 's1' && frame.items.length === 0), 2000), true)
+  controlFrames.push({ type: 'baseline', value: { projections: {
+    s1: { asOfSeq: 97, values: { turnOutline: initialTurnOutline } },
+    'outline-detached': { asOfSeq: 8, values: { turnOutline: initialTurnOutline } },
+  } } })
+  assert.equal(await waitFor(() => got.some(frame => frame.kind === 'projection-baseline'
+    && frame.projections['outline-detached']?.values.turnOutline?.length === 1), 2000), true)
+  controlFrames.push({ type: 'baseline', value: { projections: {
+    s1: { asOfSeq: 94, values: { todos: [], goal: null } },
+  } } })
+  assert.equal(await waitFor(() => got.some(frame => frame.kind === 'projection-baseline' && frame.projections.s1?.values.goal === null), 2000), true)
+  assert.equal(await waitFor(() => got.some(frame => frame.kind === 'session-queues' && !('s1' in frame.queues)), 2000), true)
+  assert.equal(await waitFor(() => got.some(frame => frame.kind === 'goal-updated' && frame.goal === null && frame.asOfSeq === 94), 2000), true)
+  const resetBaseline = got.findLast(frame => frame.kind === 'projection-baseline')
+  assert.equal(resetBaseline.projections.s1.values.turnOutline, null, '缺少投影时显式清空旧大纲')
+  assert.equal('outline-detached' in resetBaseline.projections, false)
+  assert.equal(await waitFor(() => got.some(frame => frame.kind === 'turn-outline-updated'
+    && frame.sessionId === 's1' && frame.asOfSeq === 94 && frame.turnOutline === null), 2000), true)
+  assert.equal(await waitFor(() => got.some(frame => frame.kind === 'turn-outline-updated'
+    && frame.sessionId === 'outline-detached' && frame.asOfSeq === 8 && frame.turnOutline === null), 2000), true)
+  interactionResults.push(['control reconnect restores projection baseline', true])
+  workspaceFrames.push({ type: 'archived', archivedSessionIds: ['s1'] })
+  const archivesUpdated = await waitFor(() => got.some((m) => m.kind === 'session-archives' && m.archivedSessionIds.includes('s1')), 2000)
+  interactionResults.push(['live session archive state', archivesUpdated])
+
+  ws.send(JSON.stringify(admin({ type: 'subscribe', sessionId: 's2' })))
+  await waitFor(() => got.some((m) => m.kind === 'subscribed' && m.sessionId === 's2'), 2000)
+  listeners['session/event']({ id: 's1' }, {
+    type: 'session/title',
+    seq: 95,
+    time: 95,
+    data: { title: 'WebUI 新名称', messageSeqs: [], source: { kind: 'user' } },
+  })
+  const titleChanged = await waitFor(() => got.some((m) => m.kind === 'session-title-changed' && m.sessionId === 's1' && m.seq === 95), 2000)
+  const filteredTitleEvent = got.some((m) => m.kind === 'event' && m.sessionId === 's1' && m.seq === 95)
+  interactionResults.push(['live session title metadata ignores conversation filter', titleChanged && !filteredTitleEvent && got.find((m) => m.kind === 'session-title-changed' && m.seq === 95).title === 'WebUI 新名称'])
+  ws.send(JSON.stringify(admin({ type: 'unsubscribe' })))
+  await waitFor(() => got.filter((m) => m.kind === 'subscribed' && m.sessionId === null).length >= 2, 2000)
+  listeners['session/event']({ id: 's1' }, {
+    type: 'session/title',
+    seq: 96,
+    time: 96,
+    data: { title: '第二个名称', messageSeqs: [], source: { kind: 'fallback' } },
+  })
+  const titleEventReady = await waitFor(() => got.some((m) => m.kind === 'event' && m.sessionId === 's1' && m.seq === 96), 2000)
+  const titleEvent = got.find((m) => m.kind === 'event' && m.sessionId === 's1' && m.seq === 96)
+  interactionResults.push(['session title remains in ordered event stream', titleEventReady && titleEvent.event.title === '第二个名称' && titleEvent.event.source.kind === 'fallback'])
+
+  ws.send(JSON.stringify(admin({ type: 'file-list', requestId: 'files-1', sessionId: 's1' })))
+  const fileListReady = await waitFor(() => got.some((m) => m.kind === 'file-list' && m.requestId === 'files-1'), 2000)
+  const fileList = got.find((m) => m.kind === 'file-list' && m.requestId === 'files-1')
+  interactionResults.push(['file list workspace only', fileListReady && fileList.path === '.' && fileList.entries.some((e) => e.path === 'builds' && e.kind === 'directory') && fileList.entries.some((e) => e.path === 'guide.pdf' && e.mediaType === 'application/pdf') && !fileList.entries.some((e) => e.name === 'outside-link.bin')])
+
+  // Both card paths and Markdown absolute paths resolve to the download grammar.
+  for (const [inputPath, expectedPath] of [
+    ['guide.pdf', 'guide.pdf'],
+    [path.join(fileDownloadRoot, 'guide.pdf'), 'guide.pdf'],
+    [path.join(fs.realpathSync(fileDownloadRoot), 'guide.pdf'), 'guide.pdf'],
+    ['三亚 攻略.pdf', '三亚 攻略.pdf'],
+  ]) {
+    const requestId = `resolve-${crypto.randomUUID()}`
+    ws.send(JSON.stringify(admin({ type: 'file-resolve', requestId, sessionId: 's1', path: inputPath })))
+    assert.equal(await waitFor(() => got.some(frame => frame.requestId === requestId), 2000), true)
+    const resolved = got.find(frame => frame.requestId === requestId)
+    assert.equal(resolved.kind, 'file-resolved')
+    assert.equal(resolved.path, expectedPath)
+    assert.equal(resolved.name, path.basename(expectedPath))
+    assert.equal(resolved.mediaType, 'application/pdf')
+    assert.equal(resolved.sessionId, 's1')
+    assert.equal(resolved.size, fs.statSync(path.join(fileDownloadRoot, expectedPath)).size)
+    assert.ok(resolved.modifiedAt > 0)
+  }
+  for (const [inputPath, expectedCode] of [
+    ['../outside.bin', 'bad-request'], [outsideFile, 'file-not-allowed'],
+    ['outside-link.bin', 'file-not-allowed'], ['missing.pdf', 'file-not-found'],
+    ['builds', 'file-not-regular'], ['', 'bad-request'], ['bad\0.pdf', 'bad-request'],
+  ]) {
+    const requestId = `resolve-error-${expectedCode}-${inputPath}`
+    ws.send(JSON.stringify(admin({ type: 'file-resolve', requestId, sessionId: 's1', path: inputPath })))
+    assert.equal(await waitFor(() => got.some(frame => frame.requestId === requestId), 2000), true)
+    const error = got.find(frame => frame.requestId === requestId)
+    assert.equal(error.kind, 'error')
+    assert.equal(error.requestType, 'file-resolve')
+    assert.equal(error.code, expectedCode)
+  }
+  interactionResults.push(['file references resolve native paths and reject unsafe targets', true])
+
+  ws.send(JSON.stringify(admin({ type: 'file-download-open', requestId: 'download-1', sessionId: 's1', path: 'builds/app-release.apk' })))
+  const openedReady = await waitFor(() => got.some((m) => m.kind === 'file-download-opened' && m.requestId === 'download-1'), 2000)
+  const opened = got.find((m) => m.kind === 'file-download-opened' && m.requestId === 'download-1')
+  interactionResults.push(['file download open', openedReady && opened.name === 'app-release.apk' && opened.mediaType === 'application/vnd.android.package-archive' && opened.size === fileDownloadBytes.length && opened.chunkBytes === 64 * 1024])
+
+  const downloadedChunks = []
+  let nextOffset = 0
+  let completedDownload = null
+  while (openedReady && !completedDownload) {
+    const beforeChunks = got.filter((m) => m.kind === 'file-download-chunk' && m.transferId === opened.transferId).length
+    ws.send(JSON.stringify(admin({ type: 'file-download-read', transferId: opened.transferId, offset: nextOffset })))
+    const chunkReady = await waitFor(() => got.filter((m) => m.kind === 'file-download-chunk' && m.transferId === opened.transferId).length > beforeChunks, 2000)
+    const chunk = got.filter((m) => m.kind === 'file-download-chunk' && m.transferId === opened.transferId).at(-1)
+    if (!chunkReady || !chunk || chunk.offset !== nextOffset) break
+    downloadedChunks.push(Buffer.from(chunk.data, 'base64'))
+    nextOffset += downloadedChunks.at(-1).length
+    if (chunk.eof) completedDownload = chunk
+  }
+  const downloadedBytes = Buffer.concat(downloadedChunks)
+  const expectedSha256 = crypto.createHash('sha256').update(fileDownloadBytes).digest('hex')
+  interactionResults.push(['file download chunks + sha256', completedDownload && downloadedBytes.equals(fileDownloadBytes) && completedDownload.sha256 === expectedSha256])
+
+  ws.send(JSON.stringify(admin({ type: 'file-download-open', requestId: 'cancel-1', sessionId: 's1', path: 'guide.pdf' })))
+  const cancelOpenReady = await waitFor(() => got.some((m) => m.kind === 'file-download-opened' && m.requestId === 'cancel-1'), 2000)
+  const cancelOpen = got.find((m) => m.kind === 'file-download-opened' && m.requestId === 'cancel-1')
+  if (cancelOpenReady) ws.send(JSON.stringify(admin({ type: 'file-download-cancel', transferId: cancelOpen.transferId })))
+  const cancelledDownloadReady = await waitFor(() => cancelOpenReady && got.some((m) => m.kind === 'file-download-cancelled' && m.transferId === cancelOpen.transferId), 2000)
+  interactionResults.push(['file download cancel', cancelledDownloadReady])
+
+  ws.send(JSON.stringify(admin({ type: 'file-download-open', requestId: 'escape-1', sessionId: 's1', path: '../outside.bin' })))
+  const escapedPathReady = await waitFor(() => got.some((m) => m.kind === 'error' && m.requestType === 'file-download-open' && m.code === 'bad-request'), 2000)
+  interactionResults.push(['file download rejects parent path', escapedPathReady])
+
+  ws.send(JSON.stringify(admin({ type: 'file-download-open', requestId: 'symlink-1', sessionId: 's1', path: 'outside-link.bin' })))
+  const symlinkPathReady = await waitFor(() => got.some((m) => m.kind === 'error' && m.requestType === 'file-download-open' && m.code === 'file-not-allowed'), 2000)
+  interactionResults.push(['file download rejects escaping symlink', symlinkPathReady])
+
+  ws.send(JSON.stringify(admin({ type: 'question-cancel', rpcId: requestedTwo.rpcId, sessionId: 's2' })))
+  const cancelReady = await waitFor(() => got.some((m) => m.kind === 'question-response' && m.rpcId === requestedTwo.rpcId), 2000)
+  const cancelReceipt = got.find((m) => m.kind === 'question-response' && m.rpcId === requestedTwo.rpcId)
+  const cancelError = await questionTwo
+  interactionResults.push(['question cancel', cancelReady && cancelReceipt.accepted === true && cancelError.code === 'ASK_CANCELLED'])
+  const cancelledResolved = await waitFor(() => got.some((m) => m.kind === 'question-resolved' && m.rpcId === requestedTwo.rpcId && m.outcome === 'cancelled'), 2000)
+  interactionResults.push(['question cancelled resolution', cancelledResolved])
+  listeners['session/event']({ id: 's1' }, {
+    type: 'user/message',
+    seq: 88,
+    time: 88,
+    data: { id: 'user-live-88', content: [{ type: 'image', attachment: { attachmentId: 'att-live', mediaType: 'image/jpeg', bytes: 12, width: 3, height: 4, name: 'live.jpg' } }, { type: 'text', text: 'live image' }], source: { kind: 'user' } },
+  })
+  const liveImageReady = await waitFor(() => got.some((m) => m.kind === 'event' && m.seq === 88), 2000)
+  const liveImageEvent = got.find((m) => m.kind === 'event' && m.seq === 88)
+  interactionResults.push(['live image reference', liveImageReady && liveImageEvent.event.images[0].attachmentId === 'att-live' && liveImageEvent.event.text === 'live image'])
+  interactionResults.push(['live user message identity', liveImageReady && liveImageEvent.event.raw?.id === 'user-live-88'])
+  listeners['session/event']({ id: 's1' }, {
+    type: 'command/run',
+    seq: 89,
+    time: 89,
+    data: { commandId: 'cmd-compact', name: 'compact', source: { kind: 'user' } },
+  })
+  listeners['session/event']({ id: 's1' }, {
+    type: 'compaction/summary',
+    seq: 90,
+    time: 90,
+    data: { compactionId: 'compact-1', sourceCommandId: 'cmd-compact', shadowedSeqs: [1, 2, 3], shadowedTokenCount: 7230 },
+  })
+  listeners['session/event']({ id: 's1' }, {
+    type: 'command/done',
+    seq: 91,
+    time: 91,
+    data: { commandId: 'cmd-compact', kind: 'success', text: 'Compacted 3 history items.', sourceEventSeq: 90 },
+  })
+  const commandEventsReady = await waitFor(() => got.some((m) => m.kind === 'event' && m.seq === 91), 2000)
+  const commandRun = got.find((m) => m.kind === 'event' && m.seq === 89)
+  const compactSummary = got.find((m) => m.kind === 'event' && m.seq === 90)
+  const commandDone = got.find((m) => m.kind === 'event' && m.seq === 91)
+  interactionResults.push(['live command lifecycle', commandEventsReady && commandRun.event.name === 'compact' && commandRun.event.commandId === 'cmd-compact' && compactSummary.event.shadowedItemCount === 3 && compactSummary.event.shadowedTokenCount === 7230 && commandDone.event.outcome === 'success' && commandDone.event.sourceEventSeq === 90])
+  listeners['schedule/changed']()
+  interactionResults.push(['schedule change asks Mobile to refetch', await waitFor(() => got.some((m) => m.kind === 'schedule-changed'), 2000)])
+  for (const [name, pass] of interactionResults) console.log((pass ? 'PASS ' : 'FAIL ') + name)
+
+  const deepseekChatOptionId = Buffer.from(JSON.stringify(['deepseek', 'deepseek-chat']), 'utf8').toString('base64url')
+  const scheduleRecord = { id: 'reminder-1', kind: 'every', title: '检查构建', prompt: '检查构建状态', everySeconds: 300, scheduledAt: '2099-01-01T00:00:00.000Z' }
+  const cases = [
+    ['workspaces', admin({ type: 'workspaces' }), (m) => m.kind === 'workspaces'],
+    ['sessions compact Unicode title', admin({ type: 'sessions' }), (m) => m.kind === 'sessions' && m.items[0].projections.asOfSeq === 42 && m.items[0].projections.values.title === '鼓掌 👏 �…' && Object.keys(m.items[0].projections.values).length === 1],
+    ['history+projections', admin({ type: 'history', sessionId: 's1' }), (m) => m.kind === 'history' && m.sessionId === 's1' && m.projections && m.projections.values.tokenUsage && m.bytes > 0],
+    ['history image reference', admin({ type: 'history', sessionId: 's1', view: 'conversation' }), (m) => m.kind === 'history' && m.events[0].data.content[0].attachment.attachmentId === 'att-image-1'],
+    ['attachment bytes', admin({ type: 'attachment', sessionId: 's1', attachmentId: 'att-image-1' }), (m) => m.kind === 'attachment' && m.sessionId === 's1' && m.attachment.mediaType === 'image/png' && m.data === 'iVBORw0KGgo='],
+    ['attachment missing id', admin({ type: 'attachment', sessionId: 's1' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['history byte-capped', admin({ type: 'history', sessionId: 's1', maxBytes: 300 }), (m) => m.kind === 'history' && m.bytes <= 350 && m.hasMore === true && typeof m.nextBeforeSeq === 'number' && m.events.length >= 1 && m.events[0].seq === m.nextBeforeSeq],
+    ['history conversation trim', admin({ type: 'history', sessionId: 's1', view: 'conversation', maxBytes: 200000 }), (m) => m.kind === 'history' && m.view === 'conversation' && !m.events.some((e) => e.type === 'assistant/chunk' || e.type === 'request/header') && m.events.some((e) => e.type === 'tool/result') && (() => { const tr = m.events.find((e) => e.type === 'tool/result'); const txt = tr.data.message.content[0].text; return txt.length <= 2001 && tr.data.images[0].attachmentId === 'att-image-1'; })() && m.hasMore === false && m.nextBeforeSeq === undefined],
+    ['search', admin({ type: 'search', query: 'q' }), (m) => m.kind === 'search'],
+    ['host', admin({ type: 'host' }), (m) => m.kind === 'host'],
+    ['directories', admin({ type: 'directories', path: '/tmp' }), (m) => m.kind === 'directories'],
+    ['directory-create', admin({ type: 'directory-create', path: directoryTestRoot, name: 'Sources' }), (m) => m.kind === 'directory-create' && m.path === path.join(directoryTestRoot, 'Sources') && fs.statSync(m.path).isDirectory()],
+    ['directory-create duplicate', admin({ type: 'directory-create', path: directoryTestRoot, name: 'Sources' }), (m) => m.kind === 'error' && m.code === 'directory-exists'],
+    ['directory-create missing name', admin({ type: 'directory-create', path: directoryTestRoot }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['directory-create dot name', admin({ type: 'directory-create', path: directoryTestRoot, name: '..' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['directory-create nested name', admin({ type: 'directory-create', path: directoryTestRoot, name: 'nested/child' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['directory-create relative parent', admin({ type: 'directory-create', path: 'relative', name: 'Sources' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['directory-create missing parent', admin({ type: 'directory-create', path: path.join(directoryTestRoot, 'missing'), name: 'Sources' }), (m) => m.kind === 'error' && m.code === 'directory-create-failed'],
+    ['workspace-create', admin({ type: 'workspace-create', path: '/tmp' }), (m) => m.kind === 'workspace-create'],
+    ['models', admin({ type: 'models', sessionId: 's1' }), (m) => m.kind === 'models' && m.groups[0].models[0].reasoning.efforts.length === 2],
+    ['commands + skills', admin({ type: 'commands', sessionId: 's1', locale: 'zh-CN' }), (m) => {
+      const commands = m.groups?.[0]?.items || []
+      const skills = m.groups?.[1]?.items || []
+      return m.kind === 'commands' && m.sessionId === 's1' && m.locale === 'zh-CN' && m.groups.length === 2 &&
+        m.groups[0].title === '命令' && m.groups[1].title === '技能' && commands.length === 4 &&
+        commands[0].name === 'compact' && commands[0].ui.kind === 'immediate' && commands[0].ui.submitRequest === 'command-execute' && commands[0].ui.submitText === '/compact' &&
+        commands[1].name === 'permission' && commands[1].ui.kind === 'select' && commands[1].ui.optionsRequest === 'command-options' && commands[1].ui.insertText === '/permission' &&
+        commands[2].ui.kind === 'input' && commands[2].ui.insertText === '/plan ' && commands[2].ui.hint === '[off|message]' && commands[2].ui.displayHint === '描述你的任务以生成计划' && commands[2].ui.submitRequest === 'command-execute' && commands[2].ui.images === true &&
+        commands[3].name === 'model' && commands[3].description === '选择本会话使用的模型' && commands[3].ui.kind === 'select' &&
+        skills.length === 2 && skills[0].id === 'skill:android-cli' && skills[0].ui.kind === 'input' && skills[0].ui.submitRequest === 'message' && skills[0].ui.insertText === '/android-cli ' && skills[0].whenToUse === 'Use for Android device automation' &&
+        skills[1].modelInvocable === false && skills[1].description.startsWith('仅用户 · ') && invokeCalls.some((c) => c.namespace === 'commands' && c.method === 'list' && c.args.agentId === 's1')
+    }],
+    ['commands English locale', admin({ type: 'commands', sessionId: 's1', locale: 'en-US' }), (m) => m.kind === 'commands' && m.locale === 'en' && m.groups[0].title === 'Commands' && m.groups[1].title === 'Skills' && m.groups[0].items[2].ui.displayHint === 'describe your task to generate plan' && m.groups[1].items[1].description.startsWith('user-only · ')],
+    ['commands missing sessionId', admin({ type: 'commands' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['command-execute compact', admin({ type: 'command-execute', sessionId: 's1', line: '/compact' }), (m) => m.kind === 'command-executed' && m.commandId === 'cmd-1' && m.line === '/compact' && m.result.kind === 'success' && api.promptCalls.length === 0 && invokeCalls.some((c) => c.namespace === 'commands' && c.method === 'execute' && c.args.agentId === 's1' && c.args.line === '/compact' && Array.isArray(c.args.submittedAttachments) && c.args.submittedAttachments.length === 0)],
+    ['command-execute plan args + image', admin({ type: 'command-execute', sessionId: 's1', line: '/plan 帮我完成 Android 端适配', images: [{ mediaType: 'image/png', data: 'iVBORw0KGgo=' }] }), (m) => m.kind === 'command-executed' && invokeCalls.some((c) => c.method === 'execute' && c.args.line === '/plan 帮我完成 Android 端适配' && c.args.submittedAttachments.length === 1 && c.args.submittedAttachments[0].type === 'image' && c.args.submittedAttachments[0].data === 'iVBORw0KGgo=') && api.promptCalls.length === 0],
+    ['command-execute handler error', admin({ type: 'command-execute', sessionId: 's1', line: '/plan fail' }), (m) => m.kind === 'command-executed' && m.commandId === 'cmd-error' && m.result.kind === 'error' && m.result.text === 'plan failed'],
+    ['command-execute rejects compact image', admin({ type: 'command-execute', sessionId: 's1', line: '/compact', images: [{ mediaType: 'image/png', data: 'iVBORw0KGgo=' }] }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'command-execute'],
+    ['command-execute unknown', admin({ type: 'command-execute', sessionId: 's1', line: '/missing' }), (m) => m.kind === 'error' && m.code === 'unknown-command'],
+    ['command-execute invalid line', admin({ type: 'command-execute', sessionId: 's1', line: 'compact' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['command-execute missing sessionId', admin({ type: 'command-execute', line: '/compact' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['command-options permission', admin({ type: 'command-options', sessionId: 's1', command: 'permission' }), (m) => m.kind === 'command-options' && m.command === 'permission' && m.options.length === 2 && m.options[0].id === 'ask' && m.options[0].selected === true && m.options[1].id === 'workspace-write'],
+    ['command-select permission', admin({ type: 'command-select', sessionId: 's1', command: 'permission', optionId: 'workspace-write' }), (m) => m.kind === 'command-selected' && m.command === 'permission' && m.selected.id === 'workspace-write' && m.selected.selected === true && invokeCalls.some((c) => c.method === 'execute' && c.args.line === '/permission workspace-write')],
+    ['command-options model', admin({ type: 'command-options', sessionId: 's1', command: 'model' }), (m) => m.kind === 'command-options' && m.command === 'model' && m.options.length === 1 && m.options[0].id === deepseekChatOptionId && m.options[0].label === 'DeepSeek Chat' && m.options[0].selected === true],
+    ['command-select model', admin({ type: 'command-select', sessionId: 's1', command: 'model', optionId: deepseekChatOptionId }), (m) => m.kind === 'command-selected' && m.command === 'model' && m.selected.label === 'DeepSeek Chat' && m.value.provider === 'deepseek' && m.value.model === 'deepseek-chat'],
+    ['command-options unsupported', admin({ type: 'command-options', sessionId: 's1', command: 'goal' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['select-model', admin({ type: 'select-model', sessionId: 's1', provider: 'deepseek', model: 'deepseek-chat', reasoningEffort: 'high' }), (m) => m.kind === 'select-model' && m.selected.reasoningEffort === 'high'],
+    ['select-model missing field', admin({ type: 'select-model', sessionId: 's1', provider: 'deepseek' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['permission-options', admin({ type: 'permission-options', sessionId: 's1' }), (m) => m.kind === 'permission-options' && m.namespace.ns === 'permission' && m.sessionPermissions?.currentValue === 'ask' && m.sessionPermissions.options[0].value === 'ask' && m.defaultOptions[1].value === 'code'],
+    ['schedule catalog', admin({ type: 'schedule-catalog' }), (m) => m.kind === 'schedule-catalog' && m.items[0].sessionId === 's1' && m.items[0].status === 'active' && invokeCalls.some((c) => c.namespace === 'schedule' && c.method === 'catalog' && Object.keys(c.args).length === 0)],
+    ['schedule list', admin({ type: 'schedule-list', sessionId: 's1' }), (m) => m.kind === 'schedule-list' && m.sessionId === 's1' && m.items[0].kind === 'every' && invokeCalls.some((c) => c.namespace === 'schedule' && c.method === 'catalog')],
+    ['host schedule pagination', admin({ type: 'schedule-list', limit: 10, offset: 0, requestId: 'host-page' }), (m) => m.kind === 'schedule-list' && m.requestId === 'host-page' && m.items.length === 1 && invokeCalls.some(c => c.namespace === 'schedule' && c.method === 'list' && c.args.request.limit === 10 && !('sessionId' in c.args.request))],
+    ['host schedule CAS edit', admin({ type: 'schedule-edit', id: 'reminder-1', action: 'update', expectedUpdatedAt: null, patch: { title: '宿主任务' }, requestId: 'host-edit' }), m => m.kind === 'schedule-edit' && m.requestId === 'host-edit' && m.title === '宿主任务'],
+    ['schedule history', admin({ type: 'schedule-history', sessionId: 's1', id: 'reminder-1', limit: 20, before: 'message-1' }), (m) => m.kind === 'schedule-history' && m.id === 'reminder-1' && m.records.length === 0 && invokeCalls.some((c) => c.namespace === 'schedule' && c.method === 'history' && c.args.request.limit === 20 && c.args.request.before === 'message-1')],
+    ['schedule history invalid limit', admin({ type: 'schedule-history', sessionId: 's1', id: 'reminder-1', limit: 101 }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'schedule-history'],
+    ['schedule update', admin({ type: 'schedule-update', sessionId: 's1', id: 'reminder-1', expected: { ...scheduleRecord, sessionId: 's1', status: 'active' }, title: '检查新构建', requestId: 'edit-1' }), (m) => m.kind === 'schedule-update' && m.requestId === 'edit-1' && m.record.title === '检查新构建' && invokeCalls.some((c) => c.namespace === 'schedule' && c.method === 'edit' && c.args.request.id === 'reminder-1' && c.args.request.action === 'update' && c.args.request.expectedUpdatedAt === null && c.args.request.patch.title === '检查新构建')],
+    ['schedule update mismatched record', admin({ type: 'schedule-update', sessionId: 's1', id: 'reminder-1', expected: { ...scheduleRecord, id: 'other' } }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'schedule-update'],
+    ['schedule delete', admin({ type: 'schedule-delete', sessionId: 's1', id: 'reminder-1' }), (m) => m.kind === 'schedule-delete' && m.deleted === true && invokeCalls.some((c) => c.namespace === 'schedule' && c.method === 'edit' && c.args.request.action === 'delete' && c.args.request.id === 'reminder-1')],
+    ['permission', admin({ type: 'permission', sessionId: 's1', name: 'code' }), (m) => m.kind === 'permission' && m.set === 'code' && m.commandId === 'cmd-1' && invokeCalls.some((c) => c.namespace === 'commands' && c.method === 'execute' && c.args.line === '/permission code' && c.args.agentId === 's1' && Array.isArray(c.args.submittedAttachments) && c.args.submittedAttachments.length === 0 && !('agent' in c.args)) && api.promptCalls.length === 0],
+    ['permission missing name', admin({ type: 'permission', sessionId: 's1' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['permission unknown command', admin({ type: 'permission', sessionId: 's1', name: 'missing' }), (m) => m.kind === 'error' && m.code === 'unknown-command'],
+    ['context-usage', admin({ type: 'context-usage', sessionId: 's1' }), (m) => m.kind === 'context-usage' && m.tokenUsage.totals.inputTokens === 10 && m.contextPressure.contextWindow === 128000 && m.asOfSeq === 42],
+    ['tasks', admin({ type: 'tasks', sessionId: 's1' }), (m) => m.kind === 'tasks' && m.sessionId === 's1' && m.asOfSeq === 42 && m.todos.length === 3 && m.todos[1].status === 'in_progress'],
+    ['goal', admin({ type: 'goal', sessionId: 's1' }), (m) => m.kind === 'goal' && m.sessionId === 's1' && m.asOfSeq === 42 && m.goal.goal.objective === '初始化一个 Android app' && m.goal.goal.phase === 'active'],
+    ['goal-edit', admin({ type: 'goal-edit', sessionId: 's1', ref: { id: 'goal-1', revision: 7 }, objective: '完成 Android app 初始化' }), (m) => m.kind === 'goal-edit' && m.ref.revision === 8 && api.goalCalls.some((c) => c.method === 'edit' && c.payload.objective === '完成 Android app 初始化')],
+    ['goal-pause', admin({ type: 'goal-pause', sessionId: 's1', ref: { id: 'goal-1', revision: 8 } }), (m) => m.kind === 'goal-pause' && m.ref.revision === 9 && api.goalCalls.some((c) => c.method === 'pause')],
+    ['goal-resume', admin({ type: 'goal-resume', sessionId: 's1', ref: { id: 'goal-1', revision: 9 } }), (m) => m.kind === 'goal-resume' && m.ref.revision === 10 && api.goalCalls.some((c) => c.method === 'resume')],
+    ['goal-clear', admin({ type: 'goal-clear', sessionId: 's1', ref: { id: 'goal-1', revision: 10 } }), (m) => m.kind === 'goal-clear' && m.cleared === true && api.goalCalls.some((c) => c.method === 'clear')],
+    ['goal mutation missing ref', admin({ type: 'goal-pause', sessionId: 's1' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'goal-pause'],
+    ['message keeps slash text as prompt', admin({ type: 'message', sessionId: 's1', text: '/compact' }), (m) => { const p = api.promptCalls[api.promptCalls.length - 1]; return m.kind === 'sent' && p.content.length === 1 && p.content[0].text === '/compact'; }],
+    ['create empty session', admin({ type: 'session-create', requestId: 'create-1', workspaceId: 'w1', cwd: '/ignored' }), (m) => m.kind === 'session-created' && m.requestId === 'create-1' && Boolean(m.sessionId) && JSON.stringify(api._createCalls.at(-1)) === JSON.stringify({ workspaceId: 'w1' })],
+    ['create empty session requires correlation', admin({ type: 'session-create' }), (m) => m.kind === 'error' && m.requestType === 'session-create' && m.code === 'bad-request'],
+    ['message create in workspace', admin({ type: 'message', text: 'hi', workspaceId: 'w1' }), (m) => m.kind === 'sent' && api._createCalls.length >= 1 && JSON.stringify(api._createCalls[api._createCalls.length - 1]) === JSON.stringify({ workspaceId: 'w1' })],
+    ['message create with cwd', admin({ type: 'message', text: 'hi', cwd: '/tmp' }), (m) => m.kind === 'sent' && JSON.stringify(api._createCalls[api._createCalls.length - 1]) === JSON.stringify({ cwd: '/tmp' })],
+    ['message create both -> workspaceId wins', admin({ type: 'message', text: 'hi', workspaceId: 'w2', cwd: '/tmp' }), (m) => m.kind === 'sent' && JSON.stringify(api._createCalls[api._createCalls.length - 1]) === JSON.stringify({ workspaceId: 'w2' })],
+    ['queued message quotes', admin({ type: 'queue-update', sessionId: 's1', itemId: 'message-1', action: 'edit', textParts: [{ type: 'quote', text: '原文' }, { type: 'text', text: '修改后的回复' }] }), m => m.kind === 'queue-item-updated' && api.queueUpdateCalls.at(-1).action.content[0].text === '> 原文\n\n修改后的回复'],
+    ['message ordered quotes', admin({ type: 'message', sessionId: 's1', requestId: 'quote-ws', textParts: [{ type: 'quote', text: '原回复\n第二行' }, { type: 'text', text: '请展开' }] }), (m) => { const p = api.promptCalls.at(-1); return m.kind === 'sent' && m.requestId === 'quote-ws' && p.requestId === 'quote-ws' && p.content[0].text === '> 原回复\n> 第二行\n\n请展开' }],
+    ['message image upload', admin({ type: 'message', sessionId: 's1', text: 'describe this', clientTimeZone: 'Asia/Shanghai', images: [{ mediaType: 'image/jpeg', data: '/9j/2Q==', name: 'photo.jpg' }] }), (m) => { const p = api.promptCalls[api.promptCalls.length - 1]; return m.kind === 'sent' && p.clientTimeZone === 'Asia/Shanghai' && p.content[0].type === 'image' && p.content[0].data === '/9j/2Q==' && p.content[1].text === 'describe this' }],
+    ['message image only', admin({ type: 'message', sessionId: 's1', images: [{ mediaType: 'image/png', data: 'iVBORw0KGgo=' }] }), (m) => { const p = api.promptCalls[api.promptCalls.length - 1]; return m.kind === 'sent' && p.content.length === 1 && p.content[0].type === 'image' }],
+    ['message invalid image', admin({ type: 'message', sessionId: 's1', images: [{ mediaType: 'image/tiff', data: 'AA==' }] }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['agent-presets', admin({ type: 'agent-presets' }), (m) => m.kind === 'agent-presets' && m.presets.length === 2 && m.presets[0].isDefault === true],
+    ['defaults', admin({ type: 'defaults' }), (m) => m.kind === 'defaults' && m.agentPresetDefault === 'standard' && m.permissionDefault === 'ask' && m.permissionDefaultOptions[1].value === 'code' && m.modeSelectionEnabled === true],
+    ['set-default agent-preset', admin({ type: 'set-default', target: 'agent-preset', value: 'minimal' }), (m) => m.kind === 'set-default' && m.applied === true && api.settingsUpdates.some((u) => u.ns === 'agent-preset-registry' && u.patch.selectedDefault === 'minimal')],
+    ['set-default permission', admin({ type: 'set-default', target: 'permission', value: 'code' }), (m) => m.kind === 'set-default' && m.applied === true && api.settingsUpdates.some((u) => u.ns === 'permission' && u.patch.defaultPreset === 'code')],
+    ['set-default bad target', admin({ type: 'set-default', target: 'nope', value: 'x' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['session-stats', admin({ type: 'session-stats', sessionId: 's1' }), (m) => m.kind === 'session-stats' && m.sessionStats.turns === 6 && m.sessionStats.steps === 69 && m.sessionStats.llmMs === 2280000 && m.tokenUsage.totals.inputTokens === 10 && m.asOfSeq === 42],
+    ['default-model', admin({ type: 'default-model' }), (m) => m.kind === 'default-model' && m.selection.provider === 'deepseek' && m.selection.model === 'deepseek-chat' && m.selection.reasoningEffort === 'high'],
+    ['save-default-model', admin({ type: 'save-default-model', provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'medium' }), (m) => m.kind === 'save-default-model' && m.saved.provider === 'deepseek' && m.saved.model === 'deepseek-reasoner' && m.saved.reasoningEffort === 'medium' && savedSelections.length === 1 && savedSelections[0].reasoningEffort === 'medium'],
+    ['save-default-model missing fields', admin({ type: 'save-default-model', provider: 'deepseek' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['fork', admin({ type: 'fork', sessionId: 's1', atSeq: 42, historyFormatVersion: 4 }), (m) => m.kind === 'fork' && m.sessionId === 's-branch-1'],
+    ['fork missing sessionId', admin({ type: 'fork' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+    ['session cancel', admin({ type: 'session-cancel', sessionId: 's1' }), (m) => m.kind === 'session-cancelled' && m.sessionId === 's1' && m.accepted === true && api.cancelCalls.some((call) => call.sessionId === 's1')],
+    ['session cancel missing sessionId', admin({ type: 'session-cancel' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'session-cancel'],
+    ['continue after session cancel', admin({ type: 'message', sessionId: 's1', text: '继续' }), (m) => { const p = api.promptCalls[api.promptCalls.length - 1]; return m.kind === 'sent' && m.sessionId === 's1' && p.sessionId === 's1' && p.content[0].text === '继续'; }],
+    ['queue edit', admin({ type: 'queue-update', sessionId: 's1', itemId: 'message-1', action: 'edit', text: ' 修改后的消息 ' }), (m) => { const p = api.queueUpdateCalls.at(-1); return m.kind === 'queue-item-updated' && m.accepted === true && m.action === 'edit' && p.itemId === 'message-1' && p.action.kind === 'edit' && p.action.content[0].text === ' 修改后的消息 '; }],
+    ['queue remove', admin({ type: 'queue-update', sessionId: 's1', itemId: 'message-2', action: 'remove' }), (m) => { const p = api.queueUpdateCalls.at(-1); return m.kind === 'queue-item-updated' && m.action === 'remove' && p.action.kind === 'remove'; }],
+    ['queue steer', admin({ type: 'queue-update', sessionId: 's1', itemId: 'message-3', action: 'steer' }), (m) => { const p = api.queueUpdateCalls.at(-1); return m.kind === 'queue-item-updated' && m.action === 'steer' && p.action.kind === 'steer'; }],
+    ['queue edit empty text', admin({ type: 'queue-update', sessionId: 's1', itemId: 'message-1', action: 'edit', text: '   ' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'queue-update'],
+    ['queue update invalid action', admin({ type: 'queue-update', sessionId: 's1', itemId: 'message-1', action: 'later' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'queue-update'],
+    ['queue update missing itemId', admin({ type: 'queue-update', sessionId: 's1', action: 'remove' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'queue-update'],
+    ['session archive', admin({ type: 'session-archive', sessionId: 's1' }), (m) => m.kind === 'session-archived' && m.sessionId === 's1' && m.archivedSessionIds.includes('s1') && api.archiveCalls.some((call) => call.sessionId === 's1')],
+    ['session archive missing sessionId', admin({ type: 'session-archive' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'session-archive'],
+    ['session rename', admin({ type: 'session-rename', sessionId: 's1', title: ' App 新名称 ' }), (m) => m.kind === 'session-renamed' && m.sessionId === 's1' && m.title === 'App 新名称' && m.seq === 95 && api.renameCalls.some((call) => call.sessionId === 's1' && call.title === ' App 新名称 ')],
+    ['session rename empty title', admin({ type: 'session-rename', sessionId: 's1', title: '   ' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'session-rename'],
+    ['session rename missing sessionId', admin({ type: 'session-rename', title: '新名称' }), (m) => m.kind === 'error' && m.code === 'bad-request' && m.requestType === 'session-rename'],
+    ['models global (no sessionId)', admin({ type: 'models' }), (m) => m.kind === 'models' && m.groups.length === 1 && m.groups[0].models[0].id === 'deepseek-chat' && m.current === undefined],
+    ['providers', admin({ type: 'providers' }), (m) => m.kind === 'providers' && m.providers[0].provider === 'deepseek'],
+    ['missing sessionId', admin({ type: 'history' }), (m) => m.kind === 'error' && m.code === 'bad-request'],
+  ]
+  const results = [...interactionResults]
+  let i = 0
+  const sendNext = () => {
+    if (i >= cases.length) { finish(); return }
+    const [name, payload, check] = cases[i]
+    const before = got.length
+    ws.send(JSON.stringify(payload))
+    waitFor(() => got.length > before, 3000).then((ok) => {
+      const m = got[got.length - 1]
+      const pass = ok && check(m)
+      results.push([name, pass])
+      console.log((pass ? 'PASS ' : 'FAIL ') + name, pass ? '' : JSON.stringify(m).slice(0, 160))
+      i++
+      sendNext()
+    })
+  }
+  function finish() {
+    const failed = results.filter(([, ok]) => !ok)
+    console.log(failed.length === 0 ? '\nFULL GATEWAY DISPATCH TESTS PASSED (' + results.length + ')' : `\n${failed.length} FAILED`)
+    ws.close(); disposer(); server.close()
+    assert.equal(ctx.connection.peers[0].signal.aborted, true)
+    process.exit(failed.length === 0 ? 0 : 1)
+  }
+  sendNext()
+})().catch((e) => { console.error(e); process.exit(1) })

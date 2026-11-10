@@ -1,0 +1,41 @@
+{
+  "name": "@dsh-ext/devices",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Devices page inside DSH Settings (Qoder-style): allow this Host to be controlled from other devices (pairing, authorized devices) and connect this Host to other Hosts' mobile-gateway as a desktop client. Spec 008.",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "NOTICE-ds-harness-remote"
+  ],
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node test/guards.test.mjs && node test/pin.test.mjs && node test/store.test.mjs && node test/client.test.mjs && node --test --test-isolation=none test/client-p2b.test.mjs && node --test --test-isolation=none test/stream-open.test.mjs && node test/remove-copy.test.mjs && node test/host-router.test.mjs && node --test --test-isolation=none test/interactions.test.mjs && node --test --test-isolation=none test/session-cache.test.mjs && node test/e2e.test.mjs && node test/e2e-otp.test.mjs && node test/pairing-trust.test.mjs && node test/subagent-history.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "license": "MIT",
+  "engines": {
+    "dsh": "0.2.2-rc.1",
+    "node": ">=24.9"
+  }
+}

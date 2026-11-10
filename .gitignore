@@ -1,0 +1,65 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# build output
+dist/
+build/
+out/
+.expo/
+.expo-shared/
+apps/mobile-companion/android/.gradle/
+apps/mobile-companion/android/app/build/
+apps/mobile-companion/android/build/
+apps/mobile-companion/ios/Pods/
+apps/mobile-companion/ios/build/
+*.ipa
+*.apk
+*.aab
+*.dex
+*.jar
+*.class
+
+# artifacts and reports
+artifacts/
+coverage/
+.nyc_output/
+*.lcov
+
+# logs and scratch
+*.log
+*.log.*
+.focused.log*
+.verification-tests.log
+native-tests.log
+*.err.log
+*.tmp
+*.bak
+*.orig
+*.rej
+.t036-npm-test.log
+
+# local secrets and state — never in git
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.token
+tokens/
+credentials*
+*.credentials.yaml
+
+# editor and OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# local tooling
+.wiki-cache/
+.dsh-wiki/

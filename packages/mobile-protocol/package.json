@@ -1,0 +1,26 @@
+{
+  "name": "@dsh-ext/mobile-protocol",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Wire contract shared by plugins/mobile-gateway and apps/mobile-companion (contract v1, revision 2).",
+  "type": "module",
+  "main": "src/index.mjs",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.mjs",
+      "default": "./src/index.mjs"
+    }
+  },
+  "files": [
+    "src/index.mjs",
+    "index.d.ts"
+  ],
+  "engines": {
+    "node": ">=24.9"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

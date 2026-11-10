@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "DSH Mobile Gateway 运行时架构",
+    "subtitle": "移动 App 经网关访问 DSH Host，并接收会话、控制与工作区的实时状态",
+    "locale": "zh-CN",
+    "output": "runtime-architecture.html",
+    "quality_profile": "showcase",
+    "visual_preset": "signal-flow",
+    "viewBox": [1300, 700],
+    "views": [
+      {
+        "id": "request-path",
+        "label": "请求主链路",
+        "focus": ["mobileApp", "gatewayIngress", "protocolAdapter", "typertGateway", "dshRuntime"],
+        "note": "查看移动请求从 WebSocket 接入到 DSH Runtime 的完整调用链。"
+      },
+      {
+        "id": "realtime-path",
+        "label": "实时状态链路",
+        "focus": ["dshRuntime", "streamBridge", "gatewayIngress", "mobileApp"],
+        "note": "查看会话事件、运行状态与工作区变化如何增量推送回 App。"
+      },
+      {
+        "id": "security-data",
+        "label": "安全与数据",
+        "focus": ["deviceRegistry", "gatewayIngress", "fileTransfer", "durableState"],
+        "note": "查看设备鉴权、Token 摘要、附件和 Host 持久化边界。"
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [40, 80],
+    "cols": 5,
+    "gapX": 70,
+    "gapY": 120,
+    "cellW": 180,
+    "cellH": 76
+  },
+  "components": [
+    {
+      "id": "mobileApp",
+      "type": "frontend",
+      "label": "移动端 App",
+      "sublabel": "控制通道 + 会话通道",
+      "pos": [40, 330],
+      "size": [150, 76]
+    },
+    {
+      "id": "dshWebUi",
+      "type": "frontend",
+      "label": "DSH WebUI",
+      "sublabel": "同进程管理界面",
+      "pos": [40, 80],
+      "size": [150, 76]
+    },
+    {
+      "id": "gatewayIngress",
+      "type": "cloud",
+      "label": "网关接入",
+      "sublabel": "WSS / LAN · /ws/mobile",
+      "tag": "Nginx 可选",
+      "pos": [250, 330],
+      "size": [180, 76]
+    },
+    {
+      "id": "deviceRegistry",
+      "type": "security",
+      "label": "设备认证",
+      "sublabel": "配对码 · Token 摘要",
+      "pos": [250, 80],
+      "size": [180, 76]
+    },
+    {
+      "id": "protocolAdapter",
+      "type": "backend",
+      "label": "协议路由与适配",
+      "sublabel": "控制 / 会话 → Host 调用",
+      "pos": [500, 330],
+      "size": [180, 76]
+    },
+    {
+      "id": "fileTransfer",
+      "type": "backend",
+      "label": "附件传输",
+      "sublabel": "上传 · 下载 · 工作区文件",
+      "pos": [250, 500],
+      "size": [180, 76]
+    },
+    {
+      "id": "streamBridge",
+      "type": "messagebus",
+      "label": "实时状态桥",
+      "sublabel": "SessionEvent · control · workspace",
+      "pos": [500, 500],
+      "size": [180, 76]
+    },
+    {
+      "id": "typertGateway",
+      "type": "backend",
+      "label": "Remote Gateway",
+      "sublabel": "invoke / stream",
+      "pos": [750, 330],
+      "size": [180, 76]
+    },
+    {
+      "id": "dshRuntime",
+      "type": "backend",
+      "label": "DSH Runtime",
+      "sublabel": "Session · Workspace · HITL",
+      "pos": [1000, 330],
+      "size": [180, 76]
+    },
+    {
+      "id": "durableState",
+      "type": "database",
+      "label": "本地持久化",
+      "sublabel": "设备 · 附件 · Session 历史",
+      "pos": [1000, 500],
+      "size": [180, 76]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "客户端",
+      "wraps": ["mobileApp", "dshWebUi"],
+      "pad": 24
+    },
+    {
+      "kind": "region",
+      "label": "Mobile Gateway 插件进程",
+      "wraps": ["gatewayIngress", "deviceRegistry", "protocolAdapter", "fileTransfer", "streamBridge"],
+      "pad": 28
+    },
+    {
+      "kind": "region",
+      "label": "DSH Host",
+      "wraps": ["typertGateway", "dshRuntime", "durableState"],
+      "pad": 28
+    }
+  ],
+  "connections": [
+    {
+      "id": "mobileTransport",
+      "from": "mobileApp",
+      "to": "gatewayIngress",
+      "label": "WS / WSS",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [220, 352]
+    },
+    {
+      "id": "webUiManagement",
+      "from": "dshWebUi",
+      "to": "gatewayIngress",
+      "label": "管理 API",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[115, 230], [340, 230]]
+    },
+    {
+      "id": "deviceAuth",
+      "from": "deviceRegistry",
+      "to": "gatewayIngress",
+      "label": "鉴权",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [340, 170]
+    },
+    {
+      "id": "protocolFrames",
+      "from": "gatewayIngress",
+      "to": "protocolAdapter",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "hostCalls",
+      "from": "protocolAdapter",
+      "to": "typertGateway",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "remoteContract",
+      "from": "typertGateway",
+      "to": "dshRuntime",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "persistHostState",
+      "from": "dshRuntime",
+      "to": "durableState",
+      "label": "历史 / 工作区",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [1090, 430]
+    },
+    {
+      "id": "emitRuntimeState",
+      "from": "dshRuntime",
+      "to": "streamBridge",
+      "label": "事件 / 状态",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "right",
+      "via": [[950, 368], [950, 538]]
+    },
+    {
+      "id": "pushMobileState",
+      "from": "streamBridge",
+      "to": "gatewayIngress",
+      "label": "增量推送",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "via": [[590, 455], [340, 455]]
+    },
+    {
+      "id": "readWorkspace",
+      "from": "fileTransfer",
+      "to": "durableState",
+      "label": "文件 I/O",
+      "fromSide": "bottom",
+      "toSide": "bottom",
+      "via": [[340, 650], [1090, 650]]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "请求路径",
+      "items": [
+        "App 经 WSS 或局域网接入",
+        "网关鉴权、分流并调用 Host"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "实时路径",
+      "items": [
+        "订阅 SessionEvent 与控制状态",
+        "按连接向 App 增量推送"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "安全与数据",
+      "items": [
+        "设备 Token 仅持久化摘要",
+        "附件与 Session 历史分层管理"
+      ]
+    }
+  ]
+}

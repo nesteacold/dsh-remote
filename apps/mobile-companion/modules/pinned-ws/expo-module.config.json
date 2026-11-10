@@ -1,0 +1,16 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["PinnedWsModule"],
+    "podspecPath": ["ios/PinnedWs.podspec"],
+    "swiftModuleName": ["PinnedWs"]
+  },
+  "android": {
+    "modules": ["expo.modules.pinnedws.PinnedWsModule"],
+    "publication": {
+      "groupId": "com.dshext.pinnedws",
+      "artifactId": "expo.modules.pinnedws",
+      "repository": "local-maven-repo"
+    }
+  }
+}

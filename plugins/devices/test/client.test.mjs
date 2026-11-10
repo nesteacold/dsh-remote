@@ -1,0 +1,611 @@
+// Client half: slot registration, same-origin-only fetches, vi/en labels, the
+// toggle's call sequence, pairing code + edit-permissions flow and the remote
+// session/approval UI. Loads lib/client.js in a vm with a fake __ModuleLoader__,
+// the way plugins/mobile-gateway/test/connection-choice-ui.test.cjs does.
+// React + react-test-renderer come from the gateway's node_modules (no install here).
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import vm from 'node:vm'
+import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
+
+import { check, finish } from './helpers.mjs'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+const require = createRequire(import.meta.url)
+const React = require('../../mobile-gateway/node_modules/react')
+const { create, act } = require('../../mobile-gateway/node_modules/react-test-renderer')
+globalThis.IS_REACT_ACT_ENVIRONMENT = true
+const source = fs.readFileSync(path.join(here, '../lib/client.js'), 'utf8')
+
+console.log('client')
+
+function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions } = {}) {
+  let api
+  const calls = []
+  const state = {
+    status: status ?? { remoteControl: { enabled: false, accepting: false }, lan: { listening: false, urls: [] } },
+    devices, remotes, pending: pending ?? [], pairing: null,
+  }
+  const fetch = async (url, options = {}) => {
+    const target = new URL(url)
+    const route = target.pathname + target.search
+    const body = options.body ? JSON.parse(options.body) : undefined
+    calls.push({ method: options.method ?? 'GET', route, body, origin: target.origin, credentials: options.credentials })
+    const reply = (data, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => data })
+    if (fail[route]) return reply({ message: fail[route] }, false)
+    if (route === '/mgw/status') return reply(state.status)
+    if (route === '/mgw/devices') return reply({ devices: state.devices })
+    if (route === '/mgw/remote-control') {
+      state.status = { ...state.status, remoteControl: { enabled: body.enabled, accepting: state.status.remoteControl.accepting },
+        lan: body.enabled ? { listening: true, urls: ['wss://192.168.1.20:3081/ws/mobile'] } : { listening: false, urls: [] } }
+      return reply(state.status)
+    }
+    if (route === '/mgw/gateway') { state.status.remoteControl.accepting = body.mode !== 'disabled'; return reply({ gatewayMode: body.mode }) }
+    if (route === '/mgw/connection') return reply({ pairingRoute: body.route })
+    if (route === '/mgw/pair' && body.mode === 'otp') return reply({ mode: 'otp', otp: '12345678', pairing: { expiresAt: Date.now() + 590_000, kind: body.kind, scopes: body.scopes }, addresses: ['10.0.0.5:3081'] })
+    if (route === '/mgw/pending') return reply({ pending: state.pending })
+    if (/^\/mgw\/pending\/[^/]+\/(approve|reject)$/.test(route)) { state.pending = []; return reply({ approved: true }) }
+    if (route === '/devices/pairings' && options.method === 'POST') { state.pairing = { id: 'p-1', state: 'connecting', address: body.address, verificationCode: null, error: null }; return reply({ pairing: state.pairing }, true) }
+    if (/^\/devices\/pairings\/p-1$/.test(route) && (options.method ?? 'GET') === 'GET') return reply({ pairing: state.pairing })
+    if (/^\/devices\/pairings\/p-1$/.test(route) && options.method === 'DELETE') { state.pairing = { ...state.pairing, state: 'cancelled' }; return reply({ pairing: state.pairing }) }
+    if (route === '/mgw/pair') return reply({ pairing: { expiresAt: Date.now() + 90_000, kind: body.kind, scopes: body.scopes }, pairingString: 'PAIRSTRING' + (body.scopes ? '-' + body.scopes.join('+') : ''), payload: {} })
+    if (/^\/mgw\/devices\/.+\/revoke$/.test(route)) return reply({ revoked: true })
+    if (route === '/devices/remotes' && (options.method ?? 'GET') === 'GET') return reply({ remotes: state.remotes })
+    if (route === '/devices/remotes' && options.method === 'POST') return reply({ remote: { id: 'r-new' } })
+    if (/\/sessions$/.test(route)) return reply({ sessions: sessions ?? [{ sessionId: 's1', projections: { values: { title: 'Fix the build' } } }], approvals: state.remotes[0]?.approvals ?? [] })
+    if (/\/history\?/.test(route)) return reply({ history: { kind: 'history', items: [{ seq: 1, role: 'user', text: 'hello remote' }] } })
+    if (/\/prompt$/.test(route)) return reply({ sent: { kind: 'sent' } })
+    if (/\/approval$/.test(route)) return reply({ receipt: { accepted: true } })
+    return reply({ message: 'not found' }, false)
+  }
+  const registered = []
+  const injects = []
+  const localeListeners = new Set()
+  let snapshot = { active: locale }
+  const styles = []
+  const intervals = new Map()
+  let sequence = 0
+  const window = {
+    __ModuleLoader__: { load: ({ id, factory }) => { api = { id, ...factory((name) => { assert.equal(name, 'react'); return React }) } } },
+    setInterval: (fn) => { intervals.set(++sequence, fn); return sequence },
+    clearInterval: (id) => intervals.delete(id),
+    setTimeout: (fn) => { fn(); return 0 },
+    confirm: () => true,
+  }
+  const clipboard = []
+  const document = { baseURI: 'http://127.0.0.1:3080/', head: { appendChild: (node) => styles.push(node) }, createElement: () => ({ remove() {} }) }
+  vm.runInNewContext(source, { window, document, fetch, URL, console, setTimeout, clearTimeout,
+    navigator: { language: locale, clipboard: { writeText: async (text) => { clipboard.push(text) } } } })
+  const disposers = []
+  api.apply({
+    locale: { getSnapshot: () => snapshot, subscribe: (listener) => { localeListeners.add(listener); return () => localeListeners.delete(listener) } },
+    effect(fn) { disposers.push(fn()) },
+    slots: { inject(slot, fn) { injects.push(slot); registered.push(fn()) }, register(meta, component) { return { meta, component } } },
+  })
+  return { api, calls, registered, injects, clipboard, state, intervals,
+    setLocale(active) { snapshot = { active }; for (const listener of localeListeners) listener() } }
+}
+
+// The contract's scope list and presets: client.js is a plain script and keeps a mirror,
+// so the tests compare it with packages/mobile-protocol and fail on drift.
+const { SCOPES: CONTRACT_SCOPES, SCOPE_PRESETS: CONTRACT_PRESETS, DESKTOP_ONLY_SCOPES } =
+  await import('../../../packages/mobile-protocol/src/index.mjs')
+// Order of the checkboxes in the UI (safe scopes first), as the contract lists the full desktop set.
+const ALL = ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote',
+  'files:write', 'settings:write', 'commands:execute', 'workspace:manage',
+  'credentials:write', 'plugins:manage', 'schedule:write', 'terminal']
+
+const text = (renderer) => JSON.stringify(renderer.toJSON())
+async function mount(element) {
+  let renderer
+  await act(async () => { renderer = create(element) })
+  return renderer
+}
+const flush = async () => { await act(async () => { await new Promise((resolve) => setImmediate(resolve)) }) }
+const find = (renderer, predicate) => renderer.root.findAll((node) => typeof node.type === 'string' && predicate(node))
+const button = (renderer, label) => find(renderer, (node) => node.type === 'button' && node.children.join('') === label)[0]
+const click = async (node) => { await act(async () => { await node.props.onClick({ preventDefault() {}, target: {} }) }) }
+
+await check('registers settings.section and settings.section.icon for the same id, order ~80, label "Devices"', () => {
+  const ui = load()
+  assert.equal(ui.api.id, '@dsh-ext/devices')
+  assert.deepEqual([...ui.api.inject], ['slots', 'locale'])
+  assert.deepEqual(ui.injects, ['settings.section', 'settings.section.icon'])
+  const [section, icon] = ui.registered
+  // JSON round trip: the objects were created inside the vm realm.
+  assert.deepEqual(JSON.parse(JSON.stringify(section.meta)), { name: 'settings.section', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
+  assert.deepEqual(JSON.parse(JSON.stringify(icon.meta)), { name: 'settings.section.icon', id: 'dsh-ext.devices', order: 80, label: 'Devices' })
+  assert.equal(typeof section.component, 'function')
+})
+
+await check('static: the only fetch is the same-origin request() helper; no external URLs, sockets or beacons', () => {
+  const fetches = [...source.matchAll(/\bfetch\s*\(([^)]*)\)/g)].map((match) => match[1])
+  assert.equal(fetches.length, 1)
+  assert.deepEqual([...source.matchAll(/['"`](https?:\/\/[^'"`\s]+)['"`]/g)].map((match) => match[1]), [])
+  assert.doesNotMatch(source, /XMLHttpRequest|sendBeacon|EventSource|new WebSocket|localStorage/)
+  const paths = [...source.matchAll(/\b(?:request|post)\(\s*[`'"](\/[^`'"$]*)/g)].map((match) => match[1])
+  for (const route of paths) assert.match(route, /^\/(mgw|devices)\//, route)
+  assert.ok(paths.length >= 8)
+})
+
+await check('labels follow the host locale: vi for vi*, en otherwise, and switch live', async () => {
+  const ui = load({ locale: 'vi' })
+  const page = await mount(React.createElement(ui.registered[0].component))
+  assert.match(text(page), /Thiết bị/)
+  assert.match(text(page), /Cho phép kết nối tới thiết bị này/)
+  await act(async () => { ui.setLocale('en') })
+  assert.match(text(page), /Allow connections to this device/)
+  assert.match(text(page), /Connect to other devices/)
+  assert.equal(ui.registered[0].meta.label, 'Thiết bị')
+  await act(async () => { ui.setLocale('de-DE') })
+  assert.match(text(page), /Devices/, 'unknown locales fall back to English')
+  // Every English key has a Vietnamese twin (and vice versa), so no label is silently English.
+  const { DICT } = ui.api.testing
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort())
+})
+
+await check('toggle on: remote-control, gateway (persistent), connection (lan); off: remote-control only', async () => {
+  const ui = load()
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const toggle = () => find(page, (node) => node.props.role === 'switch')[0]
+  assert.equal(toggle().props['aria-checked'], false)
+  assert.equal(button(page, 'Generate pairing code').props.disabled, true, 'pairing needs the switch on')
+  await click(toggle())
+  const posts = ui.calls.filter((call) => call.method === 'POST').map((call) => `${call.route} ${JSON.stringify(call.body)}`)
+  assert.deepEqual(posts, ['/mgw/remote-control {"enabled":true}', '/mgw/gateway {"mode":"persistent"}', '/mgw/connection {"route":"lan"}'])
+  await flush()
+  assert.equal(toggle().props['aria-checked'], true)
+  // LAN is on, Internet is disabled with a "later" note.
+  const checkboxes = find(page, (node) => node.type === 'input' && node.props.type === 'checkbox')
+  assert.deepEqual(checkboxes.map((node) => [node.props.checked, node.props.disabled]), [[true, true], [false, true]])
+  assert.match(text(page), /Later — not available yet/)
+  // The address chip comes from /mgw/status.
+  assert.match(text(page), /192\.168\.1\.20:3081/)
+  ui.calls.length = 0
+  await click(toggle())
+  assert.deepEqual(ui.calls.filter((call) => call.method === 'POST').map((call) => call.route), ['/mgw/remote-control'])
+  assert.deepEqual(ui.calls.find((call) => call.method === 'POST').body, { enabled: false })
+  page.unmount()
+})
+
+await check('every fetch is same-origin with credentials, and honours the document base', async () => {
+  const ui = load()
+  const page = await mount(React.createElement(ui.api.testing.DevicesPage))
+  await flush()
+  for (const call of ui.calls) {
+    assert.equal(call.origin, 'http://127.0.0.1:3080')
+    assert.equal(call.credentials, 'same-origin')
+  }
+  page.unmount()
+})
+
+await check('generate pairing code (Window 1): an 8-digit OTP grouped 4-4, a countdown, address chips; no pairing string', async () => {
+  const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://10.0.0.5:3081/ws/mobile'] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await click(button(page, 'Generate pairing code'))
+  const body = ui.calls.find((call) => call.route === '/mgw/pair').body
+  assert.equal(body.mode, 'otp'); assert.equal(body.kind, 'desktop')
+  assert.ok(body.scopes.includes('harness:remote'))
+  assert.match(text(page), /1234 5678/)
+  assert.doesNotMatch(text(page), /12345678/, 'only the grouped form is rendered')
+  assert.match(text(page), /Expires in 9:/)
+  const copies = find(page, (node) => node.type === 'button' && node.children.join('') === 'Copy')
+  assert.ok(copies.length >= 2, 'Copy for the code and for the address chip')
+  for (const copy of copies) await click(copy)
+  assert.ok(ui.clipboard.includes('12345678') && ui.clipboard.includes('10.0.0.5:3081'))
+  await click(find(page, (node) => node.type === 'button' && node.props['aria-label'] === 'Close')[0])
+  assert.doesNotMatch(text(page), /1234 5678/, 'closing the dialog drops the code from the page')
+  page.unmount()
+})
+
+await check('pending requests (Window 2): polled every 2 s; name, IP, editable scopes incl. harness:remote, big code; Approve sends the narrowed scopes; Reject', async () => {
+  const item = { id: 'req-1', name: 'Anh laptop', clientIp: '192.168.1.44', kind: 'desktop', createdAt: 1_700_000_000_000, verificationCode: '123456',
+    requestedScopes: ['sessions:read', 'prompt:send', 'harness:remote'] }
+  const ui = load({ pending: [item], status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const rendered = text(page)
+  for (const expected of ['Anh laptop', '192\\.168\\.1\\.44', '123 456', 'Use this host remotely']) assert.match(rendered, new RegExp(expected))
+  assert.ok([...ui.intervals.values()].length >= 2, 'a 2 s poll is registered next to the 3 s status refresh')
+  ui.calls.length = 0
+  for (const tick of [...ui.intervals.values()]) await act(async () => { await tick() })
+  assert.ok(ui.calls.some((call) => call.route === '/mgw/pending'), 'the poll hits /mgw/pending')
+  // ALL desktop scopes are listed (13); only those the device requested can be ticked.
+  const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
+  assert.equal(boxes().length, ALL.length)
+  // Approve defaults to Standard narrowed to the offer: the three requested standard scopes.
+  assert.deepEqual(boxes().filter((node) => node.props.checked).length, 3)
+  assert.deepEqual(boxes().map((node) => node.props.disabled), ALL.map((scope) => !item.requestedScopes.includes(scope)))
+  await act(async () => { boxes()[ALL.indexOf('prompt:send')].props.onChange({ target: { checked: false } }) })   // drop prompt:send
+  await click(button(page, 'Approve'))
+  const approve = ui.calls.find((call) => call.route === '/mgw/pending/req-1/approve')
+  assert.deepEqual(approve.body, { scopes: ['sessions:read', 'harness:remote'] })
+  assert.equal(approve.method, 'POST')
+  page.unmount()
+  const again = load({ pending: [item], status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } } })
+  const second = await mount(React.createElement(again.api.testing.AllowTab))
+  await flush()
+  await click(button(second, 'Reject'))
+  assert.deepEqual(again.calls.find((call) => call.route === '/mgw/pending/req-1/reject').body, {})
+  second.unmount()
+})
+await check('authorized devices: shows name/kind/scopes/last used/Connected here; Remove revokes; Edit re-pairs with chosen scopes', async () => {
+  const device = { id: 'dev-1', name: 'Work PC', displayName: 'Work PC', kind: 'desktop', scopes: ['sessions:read', 'prompt:send'], lastSeenAt: 1_700_000_000_000, online: true }
+  const ui = load({ devices: [device], status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const rendered = text(page)
+  for (const expected of ['Work PC', 'desktop', 'See sessions and history', 'Send prompts', 'Connected here', 'Last used']) assert.match(rendered, new RegExp(expected))
+  await click(button(page, 'Edit permissions'))
+  assert.match(text(page), /device must pair again/)
+  const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
+  assert.equal(boxes().length, ALL.length, 'every desktop scope is editable')
+  assert.deepEqual(boxes().filter((node) => node.props.checked).length, 2)
+  assert.equal(boxes()[ALL.indexOf('sessions:read')].props.checked, true)
+  assert.equal(boxes()[ALL.indexOf('prompt:send')].props.checked, true)
+  await act(async () => { boxes()[ALL.indexOf('approval:respond')].props.onChange({ target: { checked: true } }) })
+  await click(button(page, 'Generate new pairing code'))
+  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pair').body, { kind: 'desktop', scopes: ['sessions:read', 'prompt:send', 'approval:respond'] })
+  assert.match(text(page), /PAIRSTRING-sessions:read\+prompt:send\+approval:respond/)
+  await click(button(page, 'Remove access'))
+  assert.ok(ui.calls.some((call) => call.method === 'POST' && call.route === '/mgw/devices/dev-1/revoke'))
+  page.unmount()
+})
+
+await check('connect tab: Add device dialog (LAN | Internet disabled, Address, 8-digit code, Display name, Advanced link); remote list shows status', async () => {
+  const remotes = [{ id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'online', approvals: [] },
+    { id: 'r2', name: 'Old', address: '192.168.1.31:3081', status: 'revoked', approvals: [] }]
+  const ui = load({ remotes })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  assert.match(text(page), /Laptop/); assert.match(text(page), /Online/); assert.match(text(page), /Access revoked/)
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Add device')[0])
+  const internet = find(page, (node) => node.type === 'button' && /Internet/.test(node.children.join('')))[0]
+  assert.equal(internet.props.disabled, true, 'Internet stays disabled')
+  assert.match(text(page), /192\.168\.1\.9:41234/, 'Qoder placeholder')
+  const submitButton = () => find(page, (node) => node.type === 'button' && node.props.type === 'submit')[0]
+  assert.equal(submitButton().props.disabled, true)
+  const [address] = find(page, (node) => node.type === 'input' && node.props.placeholder === '192.168.1.9:41234')
+  const [code] = find(page, (node) => node.type === 'input' && node.props.placeholder === '1234 5678')
+  const [name] = find(page, (node) => node.type === 'input' && node.props['aria-label'] === 'Display name')
+  await act(async () => { address.props.onChange({ target: { value: ' 192.168.1.30:3081 ' } }) })
+  await act(async () => { code.props.onChange({ target: { value: '1234 567' } }) })
+  assert.equal(submitButton().props.disabled, true, '7 digits are not enough')
+  await act(async () => { code.props.onChange({ target: { value: '1234 5678' } }) })
+  await act(async () => { name.props.onChange({ target: { value: 'My PC' } }) })
+  assert.equal(submitButton().props.disabled, false)
+  const form = find(page, (node) => node.type === 'form')[0]
+  await act(async () => { await form.props.onSubmit({ preventDefault() {} }) })
+  assert.deepEqual(ui.calls.find((call) => call.method === 'POST' && call.route === '/devices/pairings').body,
+    { address: '192.168.1.30:3081', name: 'My PC', otp: '12345678' })
+  // Waiting screen: spinner until the Host answers with the verification code, then the code.
+  assert.match(text(page), /Waiting for approval on the host/)
+  ui.state.pairing = { id: 'p-1', state: 'pending', address: '192.168.1.30:3081', verificationCode: '123 456', error: null }
+  for (const tick of [...ui.intervals.values()]) await act(async () => { await tick() })
+  assert.match(text(page), /123 456/)
+  // Cancel is a DELETE on the session.
+  await click(button(page, 'Cancel'))
+  assert.ok(ui.calls.some((call) => call.method === 'DELETE' && call.route === '/devices/pairings/p-1'))
+  // Advanced: the pairing string replaces the code field.
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Add device')[0])
+  await click(button(page, 'Advanced: paste pairing string'))
+  assert.equal(find(page, (node) => node.type === 'textarea').length, 1)
+  assert.equal(find(page, (node) => node.type === 'input' && node.props.placeholder === '1234 5678').length, 0)
+  const opens = find(page, (node) => node.type === 'button' && node.children.join('') === 'Open')
+  assert.equal(opens[1].props.disabled, true, 'a revoked remote cannot be opened')
+  page.unmount()
+})
+await check('open a remote: sessions -> history -> send prompt -> approvals allow once / reject echo argsHash', async () => {
+  const approval = { rpcId: 'rpc-1', sessionId: 's1', approvalId: 'ap-1', toolName: 'bash', reason: 'run ls', argsHash: 'a'.repeat(64), argsPreview: '{"command":"ls"}' }
+  const noHash = { rpcId: 'rpc-2', sessionId: 's1', approvalId: 'ap-2', toolName: 'rm', argsHash: null, argsPreview: '' }
+  const remote = { id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'online', approvals: [approval, noHash] }
+  const ui = load({ remotes: [remote] })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  await click(button(page, 'Open'))
+  await flush()
+  assert.match(text(page), /Fix the build/)
+  assert.match(text(page), /bash/)
+  assert.match(text(page), /Decide on the other device/)
+  assert.equal(find(page, (node) => node.type === 'button' && node.children.join('') === 'Allow once').length, 1, 'no hash, no remote decision')
+  await click(button(page, 'Open'))                          // the session row's Open
+  await flush()
+  assert.match(text(page), /hello remote/)
+  const [prompt] = find(page, (node) => node.type === 'textarea')
+  await act(async () => { prompt.props.onChange({ target: { value: 'run the tests' } }) })
+  await click(button(page, 'Send'))
+  assert.deepEqual(ui.calls.find((call) => call.route.endsWith('/prompt')).body, { sessionId: 's1', text: 'run the tests' })
+  await click(button(page, 'Allow once'))
+  assert.deepEqual(ui.calls.find((call) => call.route.endsWith('/approval')).body,
+    { rpcId: 'rpc-1', sessionId: 's1', approvalId: 'ap-1', argsHash: 'a'.repeat(64), outcome: 'allowed-once' })
+  await click(button(page, 'Reject'))
+  assert.equal(ui.calls.filter((call) => call.route.endsWith('/approval')).at(-1).body.outcome, 'rejected')
+  assert.ok(!text(page).includes('"token"'))
+  page.unmount()
+})
+
+await check('a subagent row is opened with its parent address; an ordinary row carries neither field', async () => {
+  // DSH refuses a history read addressed as an ordinary session for a subagent child
+  // (`session/agent-busy`), so the row this view already lists must supply the parent
+  // — the request must not depend on the server-side fallback.
+  const sessions = [
+    { sessionId: 's1', projections: { values: { title: 'Ordinary' } } },
+    { sessionId: 'c1', origin: 'subagent', parentSessionId: 'p1', projections: { values: { title: 'Child work' } } },
+  ]
+  const ui = load({ remotes: [{ id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'online', approvals: [] }], sessions })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const opens = () => find(page, (node) => node.type === 'button' && node.children.join('') === 'Open')
+  const histories = () => ui.calls.filter((call) => /\/history\?/.test(call.route))
+  await click(opens()[0])
+  await flush()
+  await click(opens()[0])
+  await flush()
+  assert.equal(histories().at(-1).route, '/devices/remotes/r1/history?sessionId=s1', 'an ordinary row sends no parent fields')
+  await click(opens()[1])
+  await flush()
+  assert.equal(histories().at(-1).route,
+    '/devices/remotes/r1/history?sessionId=c1&parentSessionId=p1&subagentMode=unknown')
+  page.unmount()
+})
+
+await check('errors from the server are shown, not swallowed', async () => {
+  const ui = load({ fail: { '/devices/remotes': 'boom: pin mismatch' } })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  assert.match(text(page), /boom: pin mismatch/)
+  page.unmount()
+})
+
+const ONLINE = { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } }
+const checkboxes = (page) => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
+const ticked = (page) => checkboxes(page).map((node, index) => (node.props.checked ? ALL[index] : null)).filter(Boolean)
+
+await check('the UI scope list mirrors the contract: every desktop scope, presets equal SCOPE_PRESETS (drift fails here)', () => {
+  const ui = load()
+  const { ALL_SCOPES, SCOPE_PRESETS } = ui.api.testing
+  assert.deepEqual([...ALL_SCOPES].sort(), [...CONTRACT_SCOPES].sort(), 'client.js lists exactly the contract SCOPES')
+  assert.deepEqual([...ALL_SCOPES], ALL, 'checkbox order')
+  assert.deepEqual([...SCOPE_PRESETS.standard].sort(), [...CONTRACT_PRESETS.standard].sort())
+  assert.deepEqual([...SCOPE_PRESETS.full].sort(), [...CONTRACT_PRESETS.full].sort())
+  for (const scope of ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote', 'commands:execute',
+    'workspace:manage', 'settings:write', 'credentials:write', 'plugins:manage', 'schedule:write', 'terminal']) {
+    assert.ok(ALL_SCOPES.includes(scope), `${scope} is listed`)
+  }
+  for (const scope of DESKTOP_ONLY_SCOPES) assert.ok(ALL_SCOPES.includes(scope), `${scope} (desktop-only) is listed`)
+})
+
+await check('every scope has vi + en labels, every dangerous one a risk hint; vi and en stay twins', () => {
+  const ui = load()
+  const { DICT, ALL_SCOPES } = ui.api.testing
+  const dangerous = ['files:write', 'settings:write', 'commands:execute', 'workspace:manage', 'credentials:write',
+    'plugins:manage', 'schedule:write', 'terminal']
+  for (const lang of ['en', 'vi']) {
+    for (const scope of ALL_SCOPES) assert.ok(DICT[lang][`scope.${scope}`], `${lang} label for ${scope}`)
+    for (const scope of dangerous) assert.ok(DICT[lang][`risk.${scope}`], `${lang} risk hint for ${scope}`)
+    for (const key of ['presetStandard', 'presetFull', 'advancedLimits', 'limitsHelp', 'unlimited']) assert.ok(DICT[lang][key], `${lang} ${key}`)
+  }
+  assert.notEqual(DICT.vi['scope.terminal'], DICT.en['scope.terminal'])
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort())
+})
+
+await check('Approve: lists all scopes, defaults to Standard, risk hints show, presets set the list, narrowed grant is sent', async () => {
+  const item = { id: 'req-9', name: 'Dev box', clientIp: '10.0.0.8', kind: 'desktop', createdAt: 1_700_000_000_000, verificationCode: '654321',
+    requestedScopes: [...ALL] }
+  const ui = load({ pending: [item], status: ONLINE })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.equal(checkboxes(page).length, ALL.length)
+  assert.deepEqual(ticked(page), ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'], 'default = Standard')
+  const rendered = text(page)
+  assert.match(rendered, /Run slash commands/); assert.match(rendered, /Open a terminal/)
+  assert.match(rendered, /Full shell on this Host/, 'a risk hint is shown for terminal')
+  assert.match(rendered, /Can overwrite your API keys/)
+  // "Full control" ticks everything, "Standard" returns to the default set.
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Full control')[0])
+  assert.deepEqual(ticked(page), ALL)
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Standard')[0])
+  assert.deepEqual(ticked(page), ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'])
+  // Add one dangerous scope by hand and approve: exactly that list is sent.
+  await act(async () => { checkboxes(page)[ALL.indexOf('terminal')].props.onChange({ target: { checked: true } }) })
+  await click(button(page, 'Approve'))
+  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pending/req-9/approve').body.scopes,
+    ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote', 'terminal'])
+  page.unmount()
+  // vi labels + hints.
+  const vi = load({ locale: 'vi', pending: [item], status: ONLINE })
+  const viPage = await mount(React.createElement(vi.api.testing.AllowTab))
+  await flush()
+  assert.match(text(viPage), /Mở terminal/); assert.match(text(viPage), /Toàn quyền shell/)
+  assert.ok(find(viPage, (node) => node.type === 'button' && node.children.join('') === 'Toàn quyền').length >= 1)
+  viPage.unmount()
+})
+
+await check('Approve: a request that asked for less cannot be widened (extra scopes disabled; Full control cuts to the offer)', async () => {
+  const item = { id: 'req-3', name: 'Small', clientIp: '10.0.0.9', kind: 'desktop', createdAt: 1_700_000_000_000, verificationCode: '111222',
+    requestedScopes: ['sessions:read', 'harness:remote'] }
+  const ui = load({ pending: [item], status: ONLINE })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.deepEqual(ticked(page), ['sessions:read', 'harness:remote'], 'Standard narrowed to the offer')
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Full control')[0])
+  assert.deepEqual(ticked(page), ['sessions:read', 'harness:remote'], 'Full control cannot exceed the offer')
+  await click(button(page, 'Approve'))
+  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pending/req-3/approve').body, { scopes: ['sessions:read', 'harness:remote'] })
+  page.unmount()
+})
+
+await check('Edit permissions: all scopes with risk hints and both presets; Full control re-pairs with every scope', async () => {
+  const device = { id: 'dev-2', name: 'Box', displayName: 'Box', kind: 'desktop', scopes: ['sessions:read'], lastSeenAt: null, online: false }
+  const ui = load({ devices: [device], status: ONLINE })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await click(button(page, 'Edit permissions'))
+  assert.equal(checkboxes(page).length, ALL.length)
+  assert.deepEqual(ticked(page), ['sessions:read'])
+  assert.match(text(page), /Can install or enable code that runs on this Host/)
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Full control')[0])
+  assert.deepEqual(ticked(page), ALL)
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Standard')[0])
+  assert.deepEqual(ticked(page), ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'])
+  await click(find(page, (node) => node.type === 'button' && node.children.join('') === 'Full control')[0])
+  await click(button(page, 'Generate new pairing code'))
+  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pair').body, { kind: 'desktop', scopes: ALL })
+  page.unmount()
+})
+
+await check('OTP offer asks for every desktop scope (the Host picks at Approve)', async () => {
+  const ui = load({ status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://10.0.0.5:3081/ws/mobile'] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await click(button(page, 'Generate pairing code'))
+  assert.deepEqual(ui.calls.find((call) => call.route === '/mgw/pair').body.scopes, ALL)
+  page.unmount()
+})
+
+await check('Advanced (Allow tab): shows remoteBridgeLimits read-only, 0 = unlimited; never writes the limits', async () => {
+  const limits = { maxConnectionsPerDevice: 0, maxStreamsPerDevice: 32, maxInflightPerDevice: 0, callsPerSecond: 20, maxResultBytes: 0 }
+  const ui = load({ status: { ...ONLINE, remoteBridgeLimits: limits } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.match(text(page), /Advanced/)
+  assert.doesNotMatch(text(page), /Open streams per device/, 'collapsed until opened')
+  await click(find(page, (node) => node.type === 'button' && node.props['aria-expanded'] === false)[0])
+  const value = (key) => find(page, (node) => node.props['data-testid'] === `limit-${key}`)[0].children.join('')
+  assert.equal(value('maxConnectionsPerDevice'), '0 (unlimited)')
+  assert.equal(value('maxStreamsPerDevice'), '32')
+  assert.equal(value('callsPerSecond'), '20')
+  assert.equal(value('maxResultBytes'), '0 (unlimited)')
+  assert.match(text(page), /remoteBridgeLimits/, 'says where they are configured')
+  assert.match(text(page), /cannot be changed from this page/)
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'advanced-limits')[0].findAll((node) => node.type === 'input').length, 0, 'read-only: no inputs')
+  assert.equal(ui.calls.some((call) => call.method === 'POST' && /limit/i.test(call.route + JSON.stringify(call.body))), false)
+  page.unmount()
+  // A Host that reports nothing shows the defaults (unlimited).
+  const bare = load({ status: ONLINE })
+  const barePage = await mount(React.createElement(bare.api.testing.AllowTab))
+  await flush()
+  await click(find(barePage, (node) => node.type === 'button' && node.props['aria-expanded'] === false)[0])
+  assert.equal(find(barePage, (node) => node.props['data-testid'] === 'limit-callsPerSecond')[0].children.join(''), '0 (unlimited)')
+  barePage.unmount()
+})
+
+// T036: the listener's real bind (from /mgw/status, the poll AllowTab already runs).
+const PIN = Array.from({ length: 32 }, (_, index) => index.toString(16).padStart(2, '0')).join(':')
+const LAN_UP = { enabled: true, listening: true, host: '127.0.0.1', port: 3081, urls: ['wss://127.0.0.1:3081/ws/mobile'],
+  requireAuth: true, tls: true, certSha256: PIN, error: null }
+const byTestId = (page, id) => find(page, (node) => node.props['data-testid'] === id)
+
+await check('listening on: a loopback bind shows the real bind + pin and warns that no other machine can connect, naming where to change it', async () => {
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.1.2'], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const rendered = text(page)
+  const { DICT } = ui.api.testing
+  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://127.0.0.1:3081/ws/mobile', 'the URL the listener really serves')
+  assert.equal(byTestId(page, 'listener-state')[0].children.join(''), DICT.en.listenerUp)
+  assert.ok(rendered.includes(DICT.en.listeningOn))
+  assert.equal(byTestId(page, 'listener-loopback').length, 1, 'a loopback bind is called out')
+  // The warning says where the owner changes it and that a certificate is not needed.
+  assert.match(rendered, /Settings → Plugins/)
+  assert.match(rendered, /mobile-gateway row/)
+  assert.match(rendered, /lanHost/)
+  assert.match(rendered, /Tailscale/)
+  assert.match(rendered, /no new certificate/)
+  // The certificate pin is shown shortened; the full value stays on the element.
+  const [pin] = byTestId(page, 'listener-pin')
+  const shown = pin.children.join('')
+  assert.ok(shown.length < PIN.length, 'the pin is truncated')
+  assert.ok(shown.startsWith(PIN.slice(0, 17)) && shown.endsWith(PIN.slice(-11)), `truncated pin: ${shown}`)
+  assert.equal(pin.props.title, PIN, 'the full pin is still available (it is what a client pins)')
+  assert.equal(byTestId(page, 'listener-reachable').length, 0, 'no "reachable" note on loopback')
+  page.unmount()
+})
+
+await check('listening on: a non-loopback bind shows the address and, when it is a Tailscale address, says so', async () => {
+  const lan = { ...LAN_UP, host: '100.64.1.2', urls: ['wss://100.64.1.2:3081/ws/mobile'] }
+  const ui = load({ status: { ...ONLINE, lan, tailscale: { addresses: ['100.64.1.2'], urls: lan.urls } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const rendered = text(page)
+  const { DICT } = ui.api.testing
+  assert.equal(byTestId(page, 'listener-loopback').length, 0, 'no loopback warning off loopback')
+  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://100.64.1.2:3081/ws/mobile')
+  const [note] = byTestId(page, 'listener-reachable')
+  assert.ok(note, 'a neutral note replaces the warning')
+  assert.match(rendered, /100\.98\.172\.7/, 'the note names the host')
+  assert.ok(rendered.includes(DICT.en.reachableTitle))
+  assert.ok(rendered.includes(`${DICT.en.reachableNote} wss://100.64.1.2:3081/ws/mobile`))
+  assert.ok(rendered.includes(DICT.en.reachableTailscale), 'the bind host is a Tailscale address')
+  page.unmount()
+  // A bind that is neither loopback nor a local Tailscale address gets no Tailscale claim.
+  const other = load({ status: { ...ONLINE, lan, tailscale: { addresses: ['100.64.1.2'], urls: [] } } })
+  const otherPage = await mount(React.createElement(other.api.testing.AllowTab))
+  await flush()
+  assert.equal(byTestId(otherPage, 'listener-reachable').length, 1)
+  assert.equal(byTestId(otherPage, 'listener-tailscale').length, 0)
+  assert.ok(!text(otherPage).includes(other.api.testing.DICT.en.reachableTailscale))
+  otherPage.unmount()
+})
+
+await check('listening on: listener down shows the off state, the error verbatim, and no loopback warning', async () => {
+  const lan = { enabled: false, listening: false, host: '127.0.0.1', port: 3081, urls: [], requireAuth: true,
+    tls: false, certSha256: null, error: 'EADDRINUSE: 127.0.0.1:3081' }
+  const ui = load({ status: { ...ONLINE, lan, tailscale: { addresses: [], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  assert.equal(byTestId(page, 'listener-state')[0].children.join(''), DICT.en.listenerDown)
+  assert.equal(byTestId(page, 'listener-error')[0].children.join(''), 'EADDRINUSE: 127.0.0.1:3081', 'shown verbatim')
+  assert.equal(byTestId(page, 'listener-loopback').length, 0, 'a listener that is off cannot be unreachable')
+  assert.equal(byTestId(page, 'listener-reachable').length, 0)
+  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), '127.0.0.1:3081', 'host:port without a URL')
+  page.unmount()
+})
+
+await check('listening on: every new string exists in vi and en; vi/en key sets stay identical', async () => {
+  const keys = ['listeningOn', 'listenerUp', 'listenerDown', 'listenerUnknown', 'certPin', 'loopbackTitle',
+    'loopbackWarning', 'reachableTitle', 'reachableNote', 'reachableTailscale']
+  const states = [
+    { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.1.2'], urls: [] } },
+    { ...ONLINE, lan: { ...LAN_UP, host: '100.64.1.2', urls: ['wss://100.64.1.2:3081/ws/mobile'] }, tailscale: { addresses: ['100.64.1.2'], urls: [] } },
+    { remoteControl: { enabled: false, accepting: false } },
+  ]
+  for (const locale of ['en-US', 'vi']) {
+    const ui = load({ locale, status: states[0] })
+    const { DICT } = ui.api.testing
+    const lang = locale === 'vi' ? 'vi' : 'en'
+    const seen = new Set()
+    // One mount per state, collecting which new strings the page actually renders.
+    for (const status of states) {
+      ui.state.status = status
+      const page = await mount(React.createElement(ui.api.testing.AllowTab))
+      await flush()
+      const rendered = text(page)
+      for (const key of keys) if (rendered.includes(DICT[lang][key])) seen.add(key)
+      page.unmount()
+    }
+    assert.deepEqual([...seen].sort(), [...keys].sort(), `${locale} renders every new string`)
+  }
+  const ui = load()
+  const { DICT } = ui.api.testing
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+})
+
+await check('listening on: read-only — no write request and no input for this block', async () => {
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.1.2'], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.deepEqual([...new Set(ui.calls.map((call) => call.route))].sort(),
+    ['/mgw/devices', '/mgw/pending', '/mgw/status'], 'the block adds no request: it reuses the polls already on this tab')
+  assert.equal(ui.calls.some((call) => call.method !== 'GET'), false, 'no write, no dial')
+  const [card] = byTestId(page, 'listening-on')
+  assert.equal(card.findAll((node) => node.type === 'input' || node.type === 'button').length, 0, 'read-only: no controls')
+  page.unmount()
+})
+
+finish('client')

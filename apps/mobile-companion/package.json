@@ -1,0 +1,49 @@
+{
+  "name": "@dsh-ext/mobile-companion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH Companion — phone-side controller for a DSH Host (pairs, watches sessions, answers approvals).",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.9"
+  },
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "typecheck": "tsc --noEmit",
+    "check:core": "node --import tsx test/support/check-core-imports.ts",
+    "test": "node --import tsx --import ./test/support/resolve.ts --import ./test/support/stub-platform.ts --test \"test/*.test.ts\""
+  },
+  "dependencies": {
+    "@dsh-ext/mobile-protocol": "file:../../packages/mobile-protocol",
+    "@expo/metro-runtime": "58.0.17",
+    "@shopify/flash-list": "2.3.2",
+    "expo": "58.0.23",
+    "expo-camera": "58.0.14",
+    "expo-constants": "58.0.15",
+    "expo-crypto": "58.0.7",
+    "expo-linking": "58.0.16",
+    "expo-local-authentication": "58.0.2",
+    "expo-notifications": "58.1.8",
+    "expo-router": "58.0.30",
+    "expo-secure-store": "58.0.2",
+    "expo-status-bar": "58.0.4",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.1",
+    "react-native-safe-area-context": "5.11.1",
+    "react-native-screens": "4.30.1",
+    "react-native-web": "0.21.4"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/ws": "8.18.2",
+    "selfsigned": "5.5.0",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "ws": "8.22.2"
+  }
+}

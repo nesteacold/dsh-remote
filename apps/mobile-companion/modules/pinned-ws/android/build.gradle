@@ -1,0 +1,24 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'com.dshext.pinnedws'
+version = '0.1.0'
+
+android {
+  namespace "expo.modules.pinnedws"
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+    consumerProguardFiles "proguard-rules.pro"
+  }
+}
+
+dependencies {
+  // OkHttp `WebSocket` + TLS knobs. 4.9.2 is the version React Native 0.88.1 resolves
+  // (node_modules/react-native/gradle/libs.versions.toml: okhttp = "4.9.2"). `compileOnly`
+  // keeps the app's single runtime copy; the explicit version makes the module's compile
+  // classpath resolvable on its own instead of depending on app-level dependency order.
+  compileOnly "com.squareup.okhttp3:okhttp:4.9.2"
+}
