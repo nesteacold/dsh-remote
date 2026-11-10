@@ -300,6 +300,6 @@ chain building rather than by the pin.
 
 ## License
 
-MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) — this project forks the
+MIT. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md). This project forks the
 gateway from **Clarklevis1995** and adapts the carrier-wrapping approach from
-**liguobao/ds-harness-remote**, both MIT, and both worth thanking.
+**liguobao/ds-harness-remote**; both are MIT, and both are credited there.
