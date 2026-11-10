@@ -436,6 +436,115 @@ test('subagent rows nest under their parent inside the host group, an orphan sta
   page.unmount()
 })
 
+// One sentence used to cover three different truths (spec 008 P2b). Measured on the
+// owner's screen: a host group read "This host lists no workspace." while the host
+// itself had workspaces and merely no live link (`/mgw/status` said `devices: 0`), and
+// merged `workspace/follow` therefore delivered nothing. Each case says its own truth.
+const LOCAL_ONLY = {
+  items: [{ workspaceId: 'w-local', title: 'Local project', path: '/tmp/local', sessionIds: ['s-local'] }],
+  pinnedSessionIds: [], archivedSessionIds: [], phase: 'ready', state: 'live',
+}
+// Paired, but with no live link: absent from `routing.hosts`, present in the store.
+const PAIRED_OFFLINE = { ...REMOTE, id: 'r2', name: 'Sigma-DSH', address: '192.168.1.50:3081', status: 'offline' }
+// Every "this group is empty" line inside a group; workspace rows share the class.
+const notesIn = (group) => find(group, (node) => node.props.className === 'dshdev-side-ws').map((node) => node.children.join(''))
+
+test('an empty host group says why: no live link reads "not connected", never "lists no workspace"', async () => {
+  const ui = load({ routing: { ...ROUTING, hosts: [{ hostId: 'r1', hostName: 'Qoder-Sigma', online: true }] }, remotes: [REMOTE, PAIRED_OFFLINE] })
+  await flush()
+  const page = await mount(React.createElement(ui.winnerOf('sidebar.workspaces').component, sidebarProps()))
+  const { DICT } = ui.api.testing
+  const groups = byTestId(page, 'host-group')
+  assert.deepEqual(groups.map((node) => node.props['data-host']), ['local', 'r1', 'r2'], 'the paired host keeps its group while it is offline')
+  // The connected host with its workspace renders as before: one row, no empty line.
+  assert.equal(byTestId(groups[1], 'workspace-row').length, 1)
+  assert.equal(byTestId(groups[1], 'group-host-offline').length, 0)
+  const offline = groups[2]
+  assert.equal(notesIn(offline)[0], DICT.en.groupHostOffline)
+  assert.ok(!notesIn(offline).includes(DICT.en.groupNoWorkspaces), 'the old sentence is not shown for an offline host')
+  assert.match(DICT.en.groupHostOffline, /not connected/)
+  assert.match(DICT.en.groupHostOffline, /reconnects/, 'says the group fills once the link is back')
+  assert.equal(byTestId(offline, 'group-host-offline')[0].props.role, 'status', 'a transient state is a status, not an alert')
+  assert.equal(find(page, (node) => node.props.role === 'alert').length, 0, 'nothing blocking, no alert')
+  page.unmount()
+  // The other road there: routing itself reports the host as not online.
+  const down = load({ routing: { ...ROUTING, hosts: [{ hostId: 'r1', hostName: 'Sigma-DSH', online: false }] }, remotes: [{ ...REMOTE, status: 'offline' }] })
+  await flush()
+  const page2 = await mount(React.createElement(down.winnerOf('sidebar.workspaces').component,
+    sidebarProps({ useWorkspaces: (selector) => selector(LOCAL_ONLY) })))
+  assert.equal(notesIn(byTestId(page2, 'host-group')[1])[0], down.api.testing.DICT.en.groupHostOffline)
+  page2.unmount()
+})
+
+test('a host that refused the call shows the error code and scope instead of "lists no workspace"', async () => {
+  const refused = { code: 'auth/forbidden-scope', scope: 'harness:remote', at: 1 }
+  const ui = load({ routing: { ...ROUTING, hosts: [{ hostId: 'r1', hostName: 'Qoder-Sigma', online: true, error: refused }] } })
+  await flush()
+  const page = await mount(React.createElement(ui.winnerOf('sidebar.workspaces').component,
+    sidebarProps({ useWorkspaces: (selector) => selector(LOCAL_ONLY) })))
+  const { DICT } = ui.api.testing
+  const group = byTestId(page, 'host-group')[1]
+  assert.equal(notesIn(group)[0], `${DICT.en.groupHostRefused} — auth/forbidden-scope (harness:remote)`)
+  assert.ok(!notesIn(group).includes(DICT.en.groupNoWorkspaces))
+  assert.ok(!notesIn(group).includes(DICT.en.groupHostOffline))
+  assert.equal(byTestId(group, 'group-host-refused')[0].props.role, 'status')
+  assert.match(DICT.en.groupHostRefused, /refused/)
+  assert.match(DICT.vi.groupHostRefused, /từ chối/)
+  page.unmount()
+  // A recorded refusal without a scope must not print "undefined" or empty brackets.
+  const plain = load({ routing: { ...ROUTING, hosts: [{ hostId: 'r1', hostName: 'Qoder-Sigma', online: true, error: { code: 'remote/error', at: 2 } }] } })
+  await flush()
+  const page2 = await mount(React.createElement(plain.winnerOf('sidebar.workspaces').component,
+    sidebarProps({ useWorkspaces: (selector) => selector(LOCAL_ONLY) })))
+  const note = notesIn(byTestId(page2, 'host-group')[1])[0]
+  assert.equal(note, `${plain.api.testing.DICT.en.groupHostRefused} — remote/error`)
+  assert.doesNotMatch(note, /undefined|\(\)/)
+  page2.unmount()
+})
+
+test('a connected host that really has no workspace keeps the original sentence', async () => {
+  const ui = load()
+  await flush()
+  const page = await mount(React.createElement(ui.winnerOf('sidebar.workspaces').component,
+    sidebarProps({ useWorkspaces: (selector) => selector(LOCAL_ONLY) })))
+  const { DICT } = ui.api.testing
+  const group = byTestId(page, 'host-group')[1]
+  assert.equal(notesIn(group)[0], DICT.en.groupNoWorkspaces)
+  assert.equal(DICT.en.groupNoWorkspaces, 'This host lists no workspace.', 'the neutral sentence itself is unchanged')
+  assert.equal(byTestId(group, 'group-host-offline').length, 0)
+  assert.equal(byTestId(group, 'group-host-refused').length, 0)
+  page.unmount()
+})
+
+test('the empty-group wording exists in both dictionaries, vi renders it live, and the key sets stay twins', async () => {
+  const refused = { code: 'auth/forbidden-scope', scope: 'harness:remote', at: 1 }
+  const ui = load({
+    routing: { ...ROUTING, hosts: [
+      { hostId: 'r1', hostName: 'Qoder-Sigma', online: true, error: refused },
+      { hostId: 'r2', hostName: 'Sigma-DSH', online: false },
+    ] },
+    remotes: [REMOTE, PAIRED_OFFLINE],
+  })
+  await flush()
+  const page = await mount(React.createElement(ui.winnerOf('sidebar.workspaces').component,
+    sidebarProps({ useWorkspaces: (selector) => selector(LOCAL_ONLY) })))
+  const { DICT } = ui.api.testing
+  for (const lang of ['en', 'vi']) for (const key of ['groupHostOffline', 'groupHostRefused']) assert.ok(DICT[lang][key], `${lang} ${key} exists`)
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+  assert.notEqual(DICT.vi.groupHostOffline, DICT.en.groupHostOffline, 'the Vietnamese is written, not copied')
+  assert.notEqual(DICT.vi.groupHostRefused, DICT.en.groupHostRefused)
+  assert.match(DICT.vi.groupHostOffline, /chưa kết nối/)
+  assert.match(DICT.vi.groupHostOffline, /kết nối lại/)
+  assert.match(DICT.en.groupHostOffline, /reconnects/)
+  // The same tree speaks Vietnamese after a live language switch.
+  await act(async () => { ui.setLocale('vi') })
+  const groups = byTestId(page, 'host-group')
+  assert.equal(notesIn(groups[1])[0], `${DICT.vi.groupHostRefused} — auth/forbidden-scope (harness:remote)`)
+  assert.equal(notesIn(groups[2])[0], DICT.vi.groupHostOffline)
+  assert.doesNotMatch(notesIn(groups[2])[0], /not connected/, 'no English leaks back in')
+  page.unmount()
+})
+
 test('composer chip: only a tagged session shows it; host name + online dot; click toggles the popover', async () => {
   const local = load()
   await flush()

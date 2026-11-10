@@ -179,6 +179,9 @@ window.__ModuleLoader__.load({
         groupSearch: 'Search workspaces and sessions',
         groupNoMatches: 'Nothing matches.',
         groupNoWorkspaces: 'This host lists no workspace.',
+        // A group can be empty for three different reasons; say which one it is.
+        groupHostOffline: 'This host is not connected; its workspaces appear here once it reconnects.',
+        groupHostRefused: 'The host refused the last request, so it lists no workspace',
         newSession: 'New session',
         newSessionIn: 'New session in this host',
         newSessionNeedsWorkspace: 'No workspace on this host to start a session in.',
@@ -385,6 +388,8 @@ window.__ModuleLoader__.load({
         groupSearch: 'Tìm workspace và phiên',
         groupNoMatches: 'Không có kết quả.',
         groupNoWorkspaces: 'Host này không có workspace nào.',
+        groupHostOffline: 'Host này chưa kết nối. Workspace sẽ hiện ra khi kết nối lại.',
+        groupHostRefused: 'Host đã từ chối yêu cầu vừa rồi nên chưa hiện được workspace nào',
         newSession: 'Phiên mới',
         newSessionIn: 'Phiên mới trên host này',
         newSessionNeedsWorkspace: 'Host này chưa có workspace để mở phiên.',
@@ -1369,6 +1374,10 @@ window.__ModuleLoader__.load({
               // offline case the banner is for.
               hosts: (Array.isArray(routing.hosts) ? routing.hosts : []).map((host) => ({
                 hostId: String(host.hostId), hostName: String(host.hostName ?? host.hostId), online: host.online !== false,
+                // The host-router's last refusal for this host (`status().hosts[].error`);
+                // it only reports one when there is something to say, so a healthy host
+                // stays `null`.
+                error: host.error ?? null,
               })),
               routing,
               error: '',
@@ -1464,8 +1473,17 @@ window.__ModuleLoader__.load({
         }
       }
       const groups = [
-        { key: 'local', hostId: null, name: tr('groupLocal'), online: true },
-        ...props.hosts.hosts.map((host) => ({ key: `h:${host.hostId}`, hostId: host.hostId, name: host.hostName, online: host.online !== false })),
+        { key: 'local', hostId: null, name: tr('groupLocal'), online: true, error: null },
+        ...props.hosts.hosts.map((host) => ({ key: `h:${host.hostId}`, hostId: host.hostId, name: host.hostName, online: host.online !== false, error: host.error ?? null })),
+        // A paired host with no live link is absent from routing, and merged
+        // `workspace/follow` delivers nothing for it — so its group was the one that
+        // claimed "lists no workspace" while the host simply was not connected (spec
+        // 008 P2b, measured on the owner's screen: the host's own `/mgw/status` said
+        // `devices: 0`). Keep the group and let it say it is offline. A revoked
+        // pairing never reconnects, so it stays a Devices-page matter.
+        ...(props.hosts.remotes || [])
+          .filter((remote) => remote.status !== 'revoked' && !props.hosts.hosts.some((host) => host.hostId === remote.id))
+          .map((remote) => ({ key: `h:${remote.id}`, hostId: remote.id, name: remote.name || remote.id, online: remote.status === 'online', error: null })),
       ]
       const workspacesOf = (key) => items.filter((item) => {
         const tag = hostTagOf(item.workspaceId)
@@ -1494,6 +1512,21 @@ window.__ModuleLoader__.load({
         // A remote group has no workspace to create into until one is listed.
         if (!target && group.hostId) return
         call('startSession', target)
+      }
+      // An empty group used to say "lists no workspace" whatever the cause. Three
+      // different truths hide behind that: the host is connected and really has none,
+      // the host has no live link (so the merged lists deliver nothing), or the host
+      // refused the call. Name the one that applies, in the quiet style of the
+      // per-row refusal line.
+      const emptyNote = (group) => {
+        if (!group.online) {
+          return h('div', { className: 'dshdev-side-ws', 'data-testid': 'group-host-offline', role: 'status' }, tr('groupHostOffline'))
+        }
+        if (group.error) {
+          return h('div', { className: 'dshdev-side-ws', 'data-testid': 'group-host-refused', role: 'status' },
+            `${tr('groupHostRefused')} — ${group.error.code}${group.error.scope ? ` (${group.error.scope})` : ''}`)
+        }
+        return h('div', { className: 'dshdev-side-ws' }, tr('groupNoWorkspaces'))
       }
       const sessionRow = (id, summary, depth = 0) => {
         const status = statusOf(id)
@@ -1535,7 +1568,7 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', className: 'dshdev-side-new', 'data-testid': 'group-new-session',
                 title: group.hostId ? tr('newSessionIn') : tr('newSession'), 'aria-label': `${tr('newSession')}: ${group.name}`,
                 onClick: () => newSession(group) }, '+')),
-            entries.length === 0 ? h('div', { className: 'dshdev-side-ws' }, tr('groupNoWorkspaces')) : null,
+            entries.length === 0 ? emptyNote(group) : null,
             entries.map(({ workspace, rows }) => h('div', { key: workspace.workspaceId, 'data-testid': 'workspace-row' },
               h('div', { className: 'dshdev-side-ws' },
                 h('span', null, titleOf(workspace, workspace.workspaceId)),
