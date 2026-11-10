@@ -2582,6 +2582,10 @@ const NO_TEST_SEAMS = Object.freeze({ networkInterfaces: null, listenAliases: Ob
 // A frozen plain-data copy. The caller keeps ownership of its objects and may
 // change them freely: nothing it does after this point is read by a bind.
 function freezeSeamCopy(value, seen = new Set()) {
+  // A function is neither `null` nor `'object'`, so it would fall through the
+  // scalar branch below and survive by reference: reject it like a cycle rather
+  // than let the "plain-data copy" contract quietly not hold.
+  if (typeof value === 'function') throw new Error('mobile-gateway: a test seam must be plain data, not a function')
   if (value === null || typeof value !== 'object') return value
   if (seen.has(value)) throw new Error('mobile-gateway: a test seam must not contain a cycle')
   seen.add(value)
@@ -5990,7 +5994,8 @@ const plugin = {
 /**
  * Build a plugin instance whose listener seams are `seams` — tests only.
  *
- * The production export is created with NO_TEST_SEAMS and there is no module
+ * The production export is exported directly, not built with seams: its `apply()`
+ * only defaults the third parameter to NO_TEST_SEAMS, and there is no module
  * state for seams, so a second instance in the same process can never inherit
  * the first harness's interface table or aliases. Each call seals its own frozen
  * copy; changing the supplied objects afterwards changes nothing (Blocker,

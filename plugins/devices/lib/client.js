@@ -339,7 +339,7 @@ window.__ModuleLoader__.load({
         planTitle: 'Kế hoạch kết nối',
         planHelp: 'Gắn gateway của máy này vào một địa chỉ của chính nó. Tuỳ chọn Tailscale dùng địa chỉ tailnet của máy này, nên các thiết bị trong tailnet của bạn kết nối được.',
         planLanCaveat: 'LAN gắn vào địa chỉ riêng đầu tiên mà hệ điều hành báo cáo. Một adapter VPN hoặc mạng ảo có thể được chọn trước adapter LAN thật; nếu đó không phải địa chỉ bạn muốn, hãy dùng tuỳ chọn Tailscale hoặc đặt địa chỉ lắng nghe trong cấu hình gateway.',
-        planBound: 'Đang gắn vào',
+        planBound: 'Đang lắng nghe tại',
         planPrivateHint: 'Đây là địa chỉ riêng hoặc mạng ảo, không hẳn là LAN trong nhà bạn:',
         'plan.loopback': 'Chỉ máy này',
         'plan.lan': 'LAN',
