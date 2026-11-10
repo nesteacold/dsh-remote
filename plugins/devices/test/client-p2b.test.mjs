@@ -59,6 +59,23 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
     return reply({ message: 'not found' }, false)
   }
   const entries = []
+  // The shell's slot ledger, as rc.1's SlotCore.register implements it: a `single`
+  // slot refuses a second registration at an already-taken priority and accepts a
+  // lower one ("lowest renders"). `sidebar.workspaces` ships occupied by the stock
+  // browser (`tk`) at priority 0 — the collision that made spec 008 never render on
+  // a live Host while a permissive fake let it pass. Modelling the rule here is the
+  // point: a same-priority replacement must fail the suite, not a user's session.
+  const SLOT_KINDS = {
+    'sidebar.workspaces': 'single',
+    'settings.section': 'keyed',
+    'settings.section.icon': 'keyed',
+    'conversation.input.left': 'list',
+    'conversation.input.dock': 'list',
+    'conversation.input.right': 'list',
+  }
+  const occupants = new Map(Object.keys(SLOT_KINDS).map((slot) => [slot, []]))
+  // The stock sidebar browser, registered by the shell itself before any plugin runs.
+  occupants.get('sidebar.workspaces').push({ slot: 'sidebar.workspaces', meta: { name: 'sidebar.workspaces', priority: 0, registrant: 'tk' } })
   const disposers = []
   const intervals = new Map()
   let sequence = 0
@@ -113,15 +130,36 @@ function load({ locale = 'en-US', routing = ROUTING, remotes = [REMOTE], cached 
         return () => {
           const at = entries.indexOf(entry)
           if (at >= 0) entries.splice(at, 1)
+          const held = occupants.get(slot) ?? []
+          const seat = held.findIndex((occupant) => occupant.meta === entry.meta)
+          if (seat >= 0) held.splice(seat, 1)
         }
       },
-      register(meta, component) { return { meta, component } },
+      register(meta, component) {
+        const kind = SLOT_KINDS[meta.name]
+        if (!kind) throw new Error(`slot "${meta.name}" is not declared (a parent entry's children table must declare it)`)
+        const priority = meta.priority ?? 0
+        const sameSeat = (occupant) => (occupant.meta.priority ?? 0) === priority
+          && (kind === 'single' || occupant.meta.id === meta.id)
+        const taken = occupants.get(meta.name).find(sameSeat)
+        if (taken) {
+          const by = taken.meta.registrant !== undefined ? ` (registered by ${taken.meta.registrant})` : ''
+          const what = kind === 'single' ? 'a registration' : kind === 'keyed' ? `an entry for key "${meta.id}"` : `an entry with id "${meta.id}"`
+          throw new Error(`${kind} slot "${meta.name}" already has ${what} at priority ${priority}${by} — register at a different priority to shadow it (lowest renders)`)
+        }
+        occupants.get(meta.name).push({ slot: meta.name, meta, component })
+        return { meta, component }
+      },
     },
   }
   api.apply(ctx)
   const entryOf = (slot) => entries.find((entry) => entry.slot === slot)
+  // Which occupant actually renders: the lowest priority in the slot (the shell's
+  // rule), so a test can prove the replacement wins over the shipped one.
+  const winnerOf = (slot) => (occupants.get(slot) ?? []).reduce((best, occupant) =>
+    !best || (occupant.meta.priority ?? 0) < (best.meta.priority ?? 0) ? occupant : best, undefined)
   return {
-    api, calls, entries, entryOf, services, state, intervals, disposers,
+    api, calls, entries, entryOf, winnerOf, occupants, services, state, intervals, disposers,
     setLocale(active) { snapshot = { active }; for (const listener of localeListeners) listener() },
     setAnswer(value) { answers = value },
     confirmations: () => confirmations,
@@ -195,18 +233,26 @@ test('stock sidebar untouched without a remote: no replacement while routing is 
   }
 })
 
-test('with a connected host the grouped browser replaces sidebar.workspaces, and leaves again when the host drops', async () => {
+test('with a connected host the grouped browser shadows sidebar.workspaces at a lower priority than the shipped 0, and leaves again when the host drops', async () => {
   const ui = load()
   await flush()
   const entry = ui.entryOf('sidebar.workspaces')
   assert.ok(entry, 'the replacement took the slot')
   assert.equal(entry.meta.name, 'sidebar.workspaces')
+  // Measured on a live Host: the shipped browser `tk` holds this single slot at
+  // priority 0, and a second registration at 0 is refused — so the replacement must
+  // sit strictly below it, or the stock sidebar stays and the feature never renders.
+  const shippedSeat = ui.occupants.get('sidebar.workspaces').find((seat) => seat.meta.registrant === 'tk')
+  assert.equal(shippedSeat.meta.priority, 0, 'the stock browser still holds its seat')
+  assert.ok(entry.meta.priority < shippedSeat.meta.priority, `replacement priority ${entry.meta.priority} must be below the shipped 0`)
+  assert.equal(ui.winnerOf('sidebar.workspaces').meta, entry.meta, 'lowest priority renders: the replacement won the slot')
   assert.equal(ui.api.testing.remoteUI.getSnapshot().grouped, true)
   assert.equal(ui.api.testing.remoteUI.getSnapshot().hosts, 1)
   // The host drops: unregister, so the shipped browser renders again.
   ui.state.routing = { ...ROUTING, hosts: [] }
   await tick(ui)
   assert.equal(ui.entryOf('sidebar.workspaces'), undefined, 'no connected host → stock sidebar')
+  assert.equal(ui.winnerOf('sidebar.workspaces').meta.registrant, 'tk', 'the shipped browser is the only occupant again')
   assert.equal(ui.api.testing.remoteUI.getSnapshot().grouped, false)
 })
 
@@ -214,7 +260,9 @@ test('grouped rendering: "Local workspaces" first, then one group per host with 
   const ui = load()
   await flush()
   const props = sidebarProps()
-  const page = await mount(React.createElement(ui.entryOf('sidebar.workspaces').component, props))
+  // Render the occupant that actually wins the slot, not merely our registration:
+  // the priority check above is what makes that the grouped browser.
+  const page = await mount(React.createElement(ui.winnerOf('sidebar.workspaces').component, props))
   assert.ok(byTestId(page, 'grouped-sidebar').length, 'the grouped browser rendered')
   const groups = byTestId(page, 'host-group')
   assert.deepEqual(groups.map((node) => node.props['data-host']), ['local', 'r1'], 'local group first, then the host')
@@ -460,6 +508,7 @@ test('an error in the replacement unregisters it (stock fallback) and the Device
   assert.ok(entry)
   entry.meta.inject().onError('grouped sidebar blew up')
   assert.equal(ui.entryOf('sidebar.workspaces'), undefined, 'the slot is released at once')
+  assert.equal(ui.winnerOf('sidebar.workspaces').meta.registrant, 'tk', 'the shipped browser renders again')
   const status = ui.api.testing.remoteUI.getSnapshot()
   assert.equal(status.grouped, false)
   assert.equal(status.reason, 'grouped sidebar blew up')

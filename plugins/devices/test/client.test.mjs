@@ -83,6 +83,21 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     return reply({ message: 'not found' }, false)
   }
   const registered = []
+  // The shell's slot ledger, as rc.1's SlotCore.register implements it: a `single`
+  // slot refuses a second registration at an already-taken priority and accepts a
+  // lower one ("lowest renders"). `sidebar.workspaces` ships occupied by the stock
+  // browser (`tk`) at priority 0; client-p2b.test.mjs is where that slot is exercised,
+  // but the rule lives here too so no fake in this package can pass a collision.
+  const SLOT_KINDS = {
+    'sidebar.workspaces': 'single',
+    'settings.section': 'keyed',
+    'settings.section.icon': 'keyed',
+    'conversation.input.left': 'list',
+    'conversation.input.dock': 'list',
+    'conversation.input.right': 'list',
+  }
+  const occupants = new Map(Object.keys(SLOT_KINDS).map((slot) => [slot, []]))
+  occupants.get('sidebar.workspaces').push({ meta: { name: 'sidebar.workspaces', priority: 0, registrant: 'tk' } })
   const injects = []
   const localeListeners = new Set()
   let snapshot = { active: locale }
@@ -104,7 +119,23 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
   api.apply({
     locale: { getSnapshot: () => snapshot, subscribe: (listener) => { localeListeners.add(listener); return () => localeListeners.delete(listener) } },
     effect(fn) { disposers.push(fn()) },
-    slots: { inject(slot, fn) { injects.push(slot); registered.push(fn()) }, register(meta, component) { return { meta, component } } },
+    slots: {
+      inject(slot, fn) { injects.push(slot); registered.push(fn()) },
+      register(meta, component) {
+        const kind = SLOT_KINDS[meta.name]
+        if (!kind) throw new Error(`slot "${meta.name}" is not declared (a parent entry's children table must declare it)`)
+        const priority = meta.priority ?? 0
+        const taken = occupants.get(meta.name).find((occupant) => (occupant.meta.priority ?? 0) === priority
+          && (kind === 'single' || occupant.meta.id === meta.id))
+        if (taken) {
+          const by = taken.meta.registrant !== undefined ? ` (registered by ${taken.meta.registrant})` : ''
+          const what = kind === 'single' ? 'a registration' : kind === 'keyed' ? `an entry for key "${meta.id}"` : `an entry with id "${meta.id}"`
+          throw new Error(`${kind} slot "${meta.name}" already has ${what} at priority ${priority}${by} — register at a different priority to shadow it (lowest renders)`)
+        }
+        occupants.get(meta.name).push({ meta })
+        return { meta, component }
+      },
+    },
   })
   return { api, calls, registered, injects, clipboard, state, intervals,
     setLocale(active) { snapshot = { active }; for (const listener of localeListeners) listener() } }

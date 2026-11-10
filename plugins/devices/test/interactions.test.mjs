@@ -5,9 +5,11 @@
 // card-shape cases use no socket: the local carrier is a fake `typertGateway` with
 // the rc.1 signatures and each remote is a stub connection (an EventEmitter, like
 // `RemoteConnection`), so every assertion is about what the controller's own UI
-// sees and about what actually crosses the wire to a remote Host. The last case
-// runs the REAL plugins/mobile-gateway in-process (as test/e2e.test.mjs does) so a
-// question answer is measured end to end over the pinned WSS + the bridge.
+// sees and about what actually crosses the wire to a remote Host. The last two
+// cases run the REAL plugins/mobile-gateway in-process (as test/e2e.test.mjs
+// does): a question is withheld from a paired device — it is the owner's alone on
+// this channel — and an approval still reaches that device and is applied over
+// the pinned WSS + the bridge.
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -537,21 +539,30 @@ test('the Local $events frames pass through unchanged and unknown cards are igno
   }
 })
 
-// -- the same question path over the REAL gateway ---------------------------
+// -- what a paired device may and may not receive over the REAL gateway -----
 //
-// The cases above use a stub remote, so the bridge's own authorization and wire
-// shape of `userQuestions/answer` were only simulated. This one runs the real
-// `plugins/mobile-gateway` in-process (as test/e2e.test.mjs does): the card is
-// pushed by the gateway, the answer crosses the pinned WSS into the bridge, and the
-// Host's own `userQuestions/answer` RPC carries it with `{agentId, callId, answer}`.
+// The cases above use a stub remote, so the gateway's own authorization was only
+// simulated. These two run the real `plugins/mobile-gateway` in-process (as
+// test/e2e.test.mjs does) for the two interactions a device can meet on this
+// channel:
+//  - a QUESTION is the owner's alone: `question-answer`/`question-cancel` are
+//    ADMIN_ONLY and the protocol gives a question no scope, so NO device
+//    principal is pushed a card or a replay, whatever scopes its record holds
+//    (the gateway logs `question card withheld: … reason=admin-only`). A paired
+//    device's own path to the same question is the remote bridge's `$events`
+//    stream plus `userQuestions/answer`, which is not this channel;
+//  - an APPROVAL is the device's (`approval:respond`): its card still reaches the
+//    device over the pinned WSS and the decision still applies on the Host.
+// The `$events` question path cannot be driven from a real gateway — the gateway
+// never sends a device a question card, so there is no card for the router to
+// bind. That path therefore stays covered by the stub-remote cases above (and by
+// the gateway's own tests); here the question is measured as withheld.
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** The Host behind the real gateway: a question service that reports true/false. */
+/** The Host behind the real gateway: it can answer `userQuestions/answer`. */
 function fakeHost() {
   const calls = []
-  /** Verdicts the Host will answer with, in order (rc.1: true = applied). */
-  const verdicts = []
   const gateway = {
     async invoke(request) {
       // 36d9: a device only receives cards for sessions the Host lists to it.
@@ -567,7 +578,9 @@ function fakeHost() {
     },
     async dispatchRpc(endpoint, payload, signal, peer) {
       calls.push({ endpoint, args: clone(payload?.args), peer })
-      if (endpoint === 'userQuestions/answer') return { ok: true, value: verdicts.shift() ?? false }
+      // Not continuable: a question this Host would refuse to apply. What the case
+      // below measures is that a device frame cannot reach this service at all.
+      if (endpoint === 'userQuestions/answer') return { ok: true, value: false }
       if (endpoint === 'session/list') return { ok: true, value: { items: [{ sessionId: 's1' }] } }
       return { ok: true, value: null }
     },
@@ -576,7 +589,7 @@ function fakeHost() {
         async return() { return { done: true, value: undefined } } }) }
     },
   }
-  return { gateway, calls, verdicts }
+  return { gateway, calls }
 }
 
 /** The real gateway over the pinned TLS listener, with the Host above behind it. */
@@ -625,7 +638,7 @@ async function startRealGateway(t) {
   })
   const base = `http://127.0.0.1:${port}`
   const api = {
-    base, listeners, calls: host.calls, verdicts: host.verdicts,
+    base, listeners, calls: host.calls,
     async post(route, body) {
       const response = await fetch(`${base}/mgw/${route}`, { method: 'POST',
         headers: { 'Content-Type': 'application/json', Origin: base }, body: JSON.stringify(body ?? {}) })
@@ -651,27 +664,19 @@ async function startRealGateway(t) {
   throw new Error('gateway TLS listener did not become ready')
 }
 
-/** Push one question through the gateway's own `user-questions/request` listener. */
-function askOnHost(gateway, callId, questions) {
-  const controller = new AbortController()
-  const pending = gateway.listeners['user-questions/request']({
-    agent: { id: 's1' }, questions, wait: { callId }, signal: controller.signal,
-  }, () => undefined)
-  return { controller, pending }
-}
-
-test('real gateway: the native answer is applied over userQuestions/answer (true, false, pending after)', async (t) => {
-  const gateway = await startRealGateway(t)
-  const clientDeviceId = 'deskq-real-0000-4000-8000-000000000q01'
-  const questions = [{ id: 'q1', header: 'Pick one', options: [{ label: 'A' }, { label: 'B' }], multiSelect: false }]
-  const created = await gateway.post('pair', {
-    kind: 'desktop', scopes: ['sessions:read', 'approval:respond', 'harness:remote'], publicUrl: gateway.lanUrl,
-  })
+/**
+ * Pair a desktop device over the real gateway and connect it, exactly as the
+ * plugin does (one-time code + pinned socket), then wait for the Host's session
+ * list: the interaction gate only lets a card through for a session this device
+ * was shown, and that refresh runs right after the plugin is applied.
+ */
+async function pairRealDevice(gateway, t, clientDeviceId, scopes) {
+  const created = await gateway.post('pair', { kind: 'desktop', scopes, publicUrl: gateway.lanUrl })
   assert.equal(created.status, 201, JSON.stringify(created.data))
   const payload = created.data.payload
   const paired = await claimPairing({ url: gateway.lanUrl, payload, clientDeviceId, deviceName: 'e2e controller' })
   assert.equal(paired.device.kind, 'desktop')
-  // The device's own pinned connection, exactly what the plugin stores per remote.
+  assert.deepEqual([...paired.device.scopes].sort(), [...scopes].sort())
   const connection = new RemoteConnection({
     remote: { id: HOST, publicUrl: gateway.lanUrl, certSha256: payload.certSha256, clientDeviceId },
     readToken: () => paired.token,
@@ -679,66 +684,210 @@ test('real gateway: the native answer is applied over userQuestions/answer (true
   })
   t.after(() => { try { connection.ws?.terminate() } catch { /* already gone */ } })
   await connection.connect()
-  // The card gate needs the session in this device's visible set (the Host list).
   await delay(400)
+  return { connection, device: paired.device }
+}
 
-  const harness = createHarness({ remotes: [{ hostId: HOST, hostName: 'Host B', connection }] })
-  const { control, iterator } = await openEvents(harness)
-  const answers = [{ id: 'q1', selected: ['B'] }]
+/** The Host publishes the tool call that binds an approval's `argsHash`. */
+function publishToolCall(gateway, callId, rawArguments) {
+  gateway.listeners['session/event']({ id: 's1' }, { type: 'tool/call', seq: 1, time: 1,
+    data: { turn: 1, step: 0, callId, name: 'bash', arguments: rawArguments } })
+}
+
+/**
+ * Push one approval through the gateway's own `approval/request` listener. The
+ * desktop `next` never settles: only this device can decide, so the promise the
+ * listener returns is the Host's own outcome.
+ */
+function askApprovalOnHost(gateway, callId) {
+  const controller = new AbortController()
+  const pending = gateway.listeners['approval/request']({
+    agent: { id: 's1' }, toolName: 'bash', callId, reason: 'needs a shell', signal: controller.signal,
+  }, () => new Promise(() => {}))
+  return { controller, pending }
+}
+
+/** Push one question through the gateway's own `user-questions/request` listener. */
+function askOnHost(gateway, callId, questions) {
+  const controller = new AbortController()
+  const pending = gateway.listeners['user-questions/request']({
+    agent: { id: 's1' }, questions, wait: { callId }, signal: controller.signal,
+  }, () => new Promise(() => {}))
+  return { controller, pending }
+}
+
+/**
+ * Whether a frame arrived within `ms`. Never rejects: a frame that lands after the
+ * bound would otherwise surface as an unhandled rejection from the losing branch.
+ */
+function arrivesWithin(iterator, ms) {
+  let frame
+  const watched = iterator.next().then((entry) => {
+    if (!entry.done) frame = entry.value
+    return frame !== undefined
+  })
+  return Promise.race([watched, delay(ms).then(() => false)]).then((arrived) => ({ arrived, frame }))
+}
+
+// The gateway's audit trail is its own log (lib/logging.mjs: one line to stdout and
+// one to a temp file). `apply()` takes no logger to inject, so the file is the only
+// thing a test can read — and it is the line the Host actually recorded.
+const GATEWAY_LOG = path.join(os.tmpdir(), 'mobile-gateway.log')
+
+function gatewayLogSize() {
+  try { return fs.statSync(GATEWAY_LOG).size } catch { return 0 }
+}
+
+/** The lines the gateway appended to its log since `offset`. */
+function gatewayLogSince(offset) {
   try {
-    // (1) The Host applies the answer (`true`): the receipt says accepted and the
-    // card is no longer addressable, so a repeat cannot reach the Host again.
-    gateway.verdicts.push(true)
-    const first = askOnHost(gateway, 'call-77', questions)
-    const card = (await nextFrame(iterator, 'question card over the wire')).value
-    // The card was minted by the real gateway (its rpcId is a fresh UUID), so the
-    // event id is checked as "this host's namespace", which is what the UI routes by.
-    assert.equal(card.type, 'waterfall')
-    assert.equal(card.event, 'user-questions/request')
-    assert.ok(card.eventId.startsWith(namespaceId(HOST, '')), `eventId must be namespaced (${card.eventId})`)
-    assert.equal(card.agentId, namespaceId(HOST, 's1'))
-    assert.deepEqual(card.request, { questions })
-    const applied = await harness.gateway.dispatchRpc('$events/result',
-      answer(card.eventId, { answers }), undefined, {})
-    assert.equal(applied.ok, true, JSON.stringify(applied))
-    assert.deepEqual(applied.value, { kind: 'question-response', rpcId: card.eventId,
-      sessionId: namespaceId(HOST, 's1'), action: 'answer', accepted: true })
-    const hostAnswers = gateway.calls.filter((call) => call.endpoint === 'userQuestions/answer')
-    assert.equal(hostAnswers.length, 1)
-    // rc.1 shape, measured on the real bridge: agentId (the session), the card's
-    // tool-call id and the answer batch. A namespaced id never crosses the wire.
-    assert.deepEqual(hostAnswers[0].args, { agentId: 's1', callId: 'call-77', answer: { answers } })
-    assert.deepEqual([...hostIdsIn(hostAnswers[0].args)], [])
-    // Answered → no longer pending: a repeat is refused here and sends nothing.
-    const repeat = await harness.gateway.dispatchRpc('$events/result',
-      answer(card.eventId, { answers }), undefined, {})
-    assert.equal(repeat.ok, false)
-    assert.equal(repeat.error.code, 'remote/approval-unbound')
-    assert.equal(gateway.calls.filter((call) => call.endpoint === 'userQuestions/answer').length, 1)
-    first.controller.abort()
-    await first.pending.catch(() => undefined)
+    const size = fs.statSync(GATEWAY_LOG).size
+    if (size <= offset) return []
+    const buffer = Buffer.alloc(size - offset)
+    const fd = fs.openSync(GATEWAY_LOG, 'r')
+    try { fs.readSync(fd, buffer, 0, buffer.length, offset) } finally { fs.closeSync(fd) }
+    return buffer.toString('utf8').split('\n').filter((line) => line !== '')
+  } catch { return [] }
+}
 
-    // (2) The Host reports `false` (the question is no longer continuable): the
-    // receipt says so and the card STAYS addressable, so the next attempt is sent.
-    gateway.verdicts.push(false)
-    const second = askOnHost(gateway, 'call-78', questions)
-    const stale = (await nextFrame(iterator, 'second question card')).value
-    const refused = await harness.gateway.dispatchRpc('$events/result',
-      answer(stale.eventId, { answers }), undefined, {})
-    assert.equal(refused.ok, true, JSON.stringify(refused))
-    assert.equal(refused.value.accepted, false)
-    assert.equal(refused.value.reason, 'not-accepted')
-    assert.equal((await harness.gateway.dispatchRpc('$events/result',
-      answer(stale.eventId, { answers }), undefined, {})).value.accepted, false, 'a not-accepted card stays pending')
-    const all = gateway.calls.filter((call) => call.endpoint === 'userQuestions/answer')
-    assert.equal(all.length, 3, 'the third attempt was forwarded again (the card was never dropped)')
-    assert.equal(all[1].args.callId, 'call-78')
-    assert.equal(all[2].args.callId, 'call-78')
-    second.controller.abort()
-    await second.pending.catch(() => undefined)
+test('real gateway: a question card is withheld from a paired device, and question-answer stays refused', async (t) => {
+  const gateway = await startRealGateway(t)
+  // Every scope a question could ask for, plus the one the bridge needs: the device
+  // is fully authorized — and a question is still not its to receive.
+  const paired = await pairRealDevice(gateway, t, 'deskq-real-0000-4000-8000-000000000q01',
+    ['sessions:read', 'approval:respond', 'harness:remote'])
+  const harness = createHarness({ remotes: [{ hostId: HOST, hostName: 'Host B', connection: paired.connection }] })
+  const { control, iterator } = await openEvents(harness)
+  // The device socket itself, read directly: the UI-facing `$events` check below
+  // must not be the only witness of what crossed the wire.
+  const wire = []
+  paired.connection.ws.on('message', (data) => { try { wire.push(JSON.parse(data.toString())) } catch { /* ignore */ } })
+  const logOffset = gatewayLogSize()
+  const questions = [{ id: 'q1', header: 'Deploy target?',
+    options: [{ label: 'staging-eu' }, { label: 'prod-us' }], multiSelect: false }]
+  // The desktop never answers, so the question stays pending on the Host: only a
+  // (forbidden) device frame could settle it.
+  const question = askOnHost(gateway, 'call-77', questions)
+  let settled = false
+  void question.pending.then(() => { settled = true }, () => { settled = true })
+  try {
+    // (1) The invariant, positively asserted: this device holds approval:respond +
+    // sessions:read + harness:remote and session `s1` is in its visible set (that
+    // is what the approval case below relies on), yet no question card appears —
+    // neither on the device socket nor in the native `$events` stream.
+    const quiet = await arrivesWithin(iterator, 2000)
+    assert.equal(quiet.arrived, false,
+      `a device must never be pushed a question card (got ${JSON.stringify(quiet.frame)})`)
+    assert.equal(wire.filter((frame) => frame.kind === 'question-requested').length, 0,
+      'a question card never crosses the wire to a device')
+
+    // (2) The withholding is audited, with ids only — never the question text.
+    const logged = gatewayLogSince(logOffset)
+    assert.ok(logged.some((line) => line.includes('question requested:') && line.includes('session=s1')),
+      `the Host question was registered (${JSON.stringify(logged.slice(-6))})`)
+    const withheld = logged.filter((line) => line.includes('question card withheld:')
+      && line.includes(`device=${paired.device.id}`))
+    assert.ok(withheld.length >= 1, `the withholding is logged (${JSON.stringify(logged.slice(-6))})`)
+    for (const line of withheld) {
+      assert.match(line, /question card withheld: device=\S+ session=s1 reason=admin-only$/)
+    }
+    for (const secret of ['Deploy target?', 'staging-eu', 'prod-us']) {
+      assert.equal(logged.some((line) => line.includes(secret)), false,
+        `the audit carries no question text (${secret})`)
+    }
+
+    // (2b) The positive control on the same socket and session: an approval card
+    // DOES arrive, so the silence above is the question type — not a device that
+    // cannot receive interaction frames at all.
+    publishToolCall(gateway, 'call-88', '{"command":"ls"}')
+    const control2 = askApprovalOnHost(gateway, 'call-88')
+    let approvals = 0
+    for (let attempt = 0; attempt < 100 && approvals === 0; attempt += 1) {
+      approvals = wire.filter((frame) => frame.kind === 'approval-requested').length
+      if (approvals === 0) await delay(20)
+    }
+    assert.equal(approvals, 1, 'an approval for the same session still reaches this device')
+    control2.controller.abort()
+    await control2.pending.catch(() => undefined)
+
+    // (3) The admin-only surface stays out of reach: a device's `question-answer`
+    // is refused before any handler runs, so the Host's question service is never
+    // driven through it — and the Host question is still pending afterwards.
+    const refusal = await paired.connection.request({
+      type: 'question-answer', rpcId: 'q-device', sessionId: 's1',
+      answers: [{ id: 'q1', selected: ['staging-eu'] }],
+    })
+    assert.equal(refusal.kind, 'error')
+    assert.equal(refusal.code, 'op/forbidden')
+    assert.equal(refusal.requestType, 'question-answer')
+    assert.equal(typeof refusal.requestId, 'string', 'the refusal echoes the request id')
+    assert.ok(gatewayLogSince(logOffset).some((line) => line.includes('op forbidden for device token: type=question-answer')),
+      `the refusal is audited (${JSON.stringify(gatewayLogSince(logOffset).slice(-6))})`)
+    await delay(100)
+    assert.equal(settled, false, 'the Host question was not completed through the refused frame')
+    assert.equal(gateway.calls.filter((call) => call.endpoint === 'userQuestions/answer').length, 0,
+      'the Host question service was never called')
   } finally {
+    question.controller.abort()
+    await question.pending.catch(() => undefined)
     control.abort()
     await iterator.return()
-    try { connection.ws?.terminate() } catch { /* already gone */ }
+    try { paired.connection.ws?.terminate() } catch { /* already gone */ }
+  }
+})
+
+test('real gateway: an approval card still reaches the device and is applied over $events/result, once', async (t) => {
+  const gateway = await startRealGateway(t)
+  const paired = await pairRealDevice(gateway, t, 'deskq-real-0000-4000-8000-000000000q02',
+    ['sessions:read', 'approval:respond', 'harness:remote'])
+  const harness = createHarness({ remotes: [{ hostId: HOST, hostName: 'Host B', connection: paired.connection }] })
+  const { control, iterator } = await openEvents(harness)
+  const wire = []
+  paired.connection.ws.on('message', (data) => { try { wire.push(JSON.parse(data.toString())) } catch { /* ignore */ } })
+  // Without the tool call there is no content binding: the request would be
+  // desktop-only (`argsHash: null`) and never offered to a device.
+  publishToolCall(gateway, 'call-88', '{"command":"ls"}')
+  const approval = askApprovalOnHost(gateway, 'call-88')
+  try {
+    // The card the real gateway minted (its rpcId/approvalId are fresh UUIDs), so
+    // the ids are checked as "this host's namespace", which is what the UI routes by.
+    const card = (await nextFrame(iterator, 'approval card over the wire')).value
+    assert.equal(card.type, 'waterfall')
+    assert.equal(card.event, 'approval/request')
+    assert.ok(card.eventId.startsWith(namespaceId(HOST, '')), `eventId must be namespaced (${card.eventId})`)
+    assert.equal(card.agentId, namespaceId(HOST, 's1'))
+    assert.equal(card.request.toolName, 'bash')
+    assert.equal(card.request.callId, 'call-88')
+    assert.equal(card.request.reason, 'needs a shell')
+    assert.equal(card.request.argsPreview, '{"command":"ls"}')
+    assert.equal(Object.hasOwn(card.request, 'agent'), false, 'the waterfall request carries no agent')
+    assert.equal(Object.hasOwn(card.request, 'signal'), false, 'the waterfall request carries no signal')
+    assert.equal(wire.filter((frame) => frame.kind === 'approval-requested').length, 1,
+      'the card crossed the pinned WSS to the device')
+
+    // The decision travels through the router's card binding and the bridge's
+    // hash-bound `$events/result`, and applies on the Host (the Host's own promise
+    // resolves with the outcome).
+    const decided = await harness.gateway.dispatchRpc('$events/result',
+      answer(card.eventId, 'allowed-once'), undefined, {})
+    assert.equal(decided.ok, true, JSON.stringify(decided))
+    assert.deepEqual(decided.value, { accepted: true, outcome: 'allowed-once' })
+    assert.equal(await approval.pending, 'allowed-once', 'the Host applied the decision')
+    assert.equal(wire.filter((frame) => frame.kind === 'remote-result').length, 1)
+
+    // At most once: the card is no longer addressable, nothing crosses the wire
+    // again, and the Host outcome cannot be restated.
+    const repeat = await harness.gateway.dispatchRpc('$events/result',
+      answer(card.eventId, 'rejected'), undefined, {})
+    assert.equal(repeat.ok, false)
+    assert.equal(repeat.error.code, 'remote/approval-unbound')
+    assert.equal(wire.filter((frame) => frame.kind === 'remote-result').length, 1, 'nothing was sent twice')
+    assert.equal(await approval.pending, 'allowed-once')
+  } finally {
+    approval.controller.abort()
+    await approval.pending.catch(() => undefined)
+    control.abort()
+    await iterator.return()
+    try { paired.connection.ws?.terminate() } catch { /* already gone */ }
   }
 })

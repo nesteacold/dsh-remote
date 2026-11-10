@@ -84,10 +84,54 @@ for (const pkg of ['plugins/mobile-gateway', 'plugins/devices']) {
 
 for (const test of missingTests) console.log(`MISSING TEST  ${test}`)
 
-const failed = broken.length + missingTests.length
+// -- forbidden strings -------------------------------------------------------
+// A local, git-ignored list of values that must never be published: real
+// addresses, device and machine names. The check exists because the scrub has
+// missed a copy more than once — a plain replacement does not touch the
+// backslash-escaped form a regex literal uses, and re-copying a file from the
+// development tree silently puts the real values back.
+const FORBIDDEN_FILE = join(ROOT, '.publish-forbidden')
+const leaks = []
+
+function walkAll(dir, found = []) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === 'node_modules' || entry.name === '.git') continue
+    const path = join(dir, entry.name)
+    if (entry.isDirectory()) walkAll(path, found)
+    else found.push(path)
+  }
+  return found
+}
+
+if (existsSync(FORBIDDEN_FILE)) {
+  const tokens = readFileSync(FORBIDDEN_FILE, 'utf8')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'))
+  const haystack = walkAll(ROOT).filter((file) => file !== FORBIDDEN_FILE)
+  for (const token of tokens) {
+    // Both the literal value and its regex-escaped spelling.
+    const needles = [token, token.replace(/\./g, '\\.')].map((needle) => needle.toLowerCase())
+    for (const file of haystack) {
+      const text = readFileSync(file, 'utf8').toLowerCase()
+      for (const needle of needles) {
+        if (text.includes(needle)) leaks.push({ file, token })
+      }
+    }
+  }
+  for (const { file, token } of leaks) {
+    // The token itself is not echoed: this output ends up in logs and issues.
+    console.log(`FORBIDDEN STRING  ${file.slice(ROOT.length + 1)}  (entry ${tokens.indexOf(token) + 1} of ${FORBIDDEN_FILE.split(/[\\/]/).pop()})`)
+  }
+} else {
+  console.log(`note: no ${FORBIDDEN_FILE.split(/[\\/]/).pop()} here, skipping the forbidden-string check`)
+}
+
+const failed = broken.length + missingTests.length + leaks.length
 console.log(
   `\nrelative imports resolved: ${checked - broken.length}/${checked}` +
   `\ntest files named by npm test: ${missingTests.length} missing` +
+  `\nforbidden strings found: ${leaks.length}` +
   `\n${failed === 0 ? 'OK - this tree is complete' : `INCOMPLETE - ${failed} problem(s)`}`,
 )
 process.exit(failed === 0 ? 0 : 1)

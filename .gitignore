@@ -63,3 +63,6 @@ Thumbs.db
 # local tooling
 .wiki-cache/
 .dsh-wiki/
+# Local list of strings that must never reach this repo (real addresses, device
+# and machine names). Read by tools/verify-publish.mjs; deliberately not committed.
+.publish-forbidden

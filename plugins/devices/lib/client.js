@@ -1718,6 +1718,13 @@ window.__ModuleLoader__.load({
           try {
             sidebarEntry = ctx.slots.inject('sidebar.workspaces', () => ctx.slots.register({
               name: 'sidebar.workspaces',
+              // `sidebar.workspaces` is a single slot and the shipped browser already
+              // occupies it at priority 0 (default). Measured on a live Host: a second
+              // registration at 0 is refused outright ("already has a registration at
+              // priority 0 (registered by tk) — register at a different priority to
+              // shadow it (lowest renders)"), which made this feature never render.
+              // -1 shadows the stock browser; the slot's own rule says lowest renders.
+              priority: -1,
               inject: () => ({
                 openSession: nav.openSession, startSession: nav.startSession,
                 pinSession: nav.pinSession, unpinSession: nav.unpinSession,
