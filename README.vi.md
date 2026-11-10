@@ -225,11 +225,26 @@ có rào thì đặt riêng cho từng Host; mặc định không có.
 
 ## Muốn máy khác vào được
 
-Mặc định gateway bind `127.0.0.1`, nên cài xong thì chỉ máy đó dùng được. Đây là
-cố ý — nhưng cũng là chỗ đầu tiên làm người ta tắc, nên trang Devices giờ nói
-thẳng ra và chỉ luôn chỗ đổi.
+Mặc định gateway bind `127.0.0.1`, nên cài xong thì chỉ máy đó dùng được. Cố ý
+như vậy, và cũng chính là chỗ đầu tiên làm người ta tắc, nên trang Devices nói
+thẳng ra và cho đổi ngay tại đó.
 
-Muốn dùng từ máy khác thì đặt địa chỉ lắng nghe trong config của gateway:
+Vào Settings → Devices, chọn **Connection plan**. Có ba lựa chọn:
+
+- **Loopback** — chỉ máy này. Mặc định.
+- **LAN** — địa chỉ riêng đầu tiên mà hệ điều hành báo cáo. Không hẳn là mạng
+  trong nhà: máy nào có VPN hay adapter WireGuard/Docker thì adapter đó có thể
+  được báo trước, nên trang hiện đúng địa chỉ nó đã gắn vào và nói rõ khi đó
+  không phải LAN thường.
+- **Tailscale** — địa chỉ Tailscale của máy này, nếu có. Cái này nên dùng: máy
+  của bạn vào được, người ngoài không thấy, không phải đụng vào router. Đổi xong
+  trang hiện luôn URL `wss://` để nhập vào app.
+
+Chọn cái nào thì trang cũng hiện đúng địa chỉ mà listener đã nhận, và lựa chọn
+được nhớ qua lần khởi động sau, miễn máy vẫn còn địa chỉ đó. Chưa chọn thì chưa
+mở thêm gì — mặc định vẫn là loopback.
+
+Không muốn bấm trong app thì đặt thẳng trong config, kết quả y như vậy:
 
 ```yaml
 - id: mobile-gateway
@@ -240,16 +255,19 @@ Muốn dùng từ máy khác thì đặt địa chỉ lắng nghe trong config c
     lanPort: 30081
 ```
 
-Địa chỉ Tailscale là lựa chọn gọn hơn: máy của bạn vào được, người ngoài không
-thấy, không phải đụng vào router.
+Port `30081` bận thì listener tự nhảy sang port trống kế tiếp và ghi rõ trong
+log. Trang cũng cảnh báo nếu port rơi vào dải port động của hệ điều hành, vì ở
+đó một kết nối ra ngoài có thể giành mất port bất cứ lúc nào.
 
 **Đổi địa chỉ không cần tạo lại chứng chỉ.** Client ghim hash của chứng chỉ và
-không so tên miền, nên SAN trong chứng chỉ cũ không ảnh hưởng gì.
+không so tên miền, nên SAN trong chứng chỉ cũ không ảnh hưởng gì. Đổi địa chỉ
+làm listener rớt ra một nhịp, và nó không cắt kết nối đang mở — đây là chuyện
+dời chỗ, không phải công tắc ngắt. Muốn ngắt thì tắt gateway.
 
 ## Khi có trục trặc
 
-**Nó báo "chỉ máy này kết nối được"** — gateway đang bind loopback. Đặt `lanHost`
-như trên rồi nạp lại plugin.
+**Nó báo "chỉ máy này kết nối được"** — gateway đang bind loopback. Vào trang
+Devices chọn Connection plan, hoặc đặt `lanHost` như trên rồi nạp lại plugin.
 
 **Sửa code mà không thấy gì đổi** — tắt/bật plugin trong Settings → Plugins, hoặc
 restart DSH. Chỉ sửa file là chưa đủ.
@@ -278,7 +296,7 @@ package đó; hiện plugin đang mượn bản trong `plugins/mobile-gateway`.
 ## Test
 
 ```bash
-cd plugins/devices && npm test                 # 15 nhóm, có gateway thật chạy trong tiến trình
+cd plugins/devices && npm test                 # 14 nhóm, có gateway thật chạy trong tiến trình
 cd plugins/mobile-gateway && node --test --test-isolation=none test/remote-bridge.test.mjs
 cd apps/mobile-companion && npm test
 ```

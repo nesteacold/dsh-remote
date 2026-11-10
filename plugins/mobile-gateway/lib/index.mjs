@@ -2284,6 +2284,47 @@ function privateLanAddresses() {
   return physical.length ? physical : fallback
 }
 
+// The listen targets the Devices page may pick (POST /mgw/listen).
+const LISTEN_TARGETS = ['loopback', 'lan', 'tailscale']
+
+/**
+ * Resolve a Devices-page listen target to the one address the TLS listener
+ * should bind, or `null` when this machine has no address for it. The interface
+ * table is a parameter, not a lookup: the status report and the bind must agree
+ * on which addresses exist, and a test injects its own table.
+ * @param {string} target one of LISTEN_TARGETS
+ * @param {object} interfaces an `os.networkInterfaces()` shaped table
+ * @returns {string|null} the address to bind
+ */
+function resolveListenHost(target, interfaces) {
+  if (target === 'loopback') return '127.0.0.1'
+  if (target === 'tailscale') {
+    // Reuse the detection the status reports, so a bound address always appears
+    // in `status.tailscale.addresses`. IPv4 first: the companion reaches the
+    // tailnet over IPv4, and the helper already sorts 100.64/10 ahead of fd7a:.
+    const { addresses } = tailscaleInterfaceStatus({ listening: false, host: '', port: 0, wsPath: '' }, interfaces)
+    return addresses.find((address) => net.isIP(address) === 4) ?? addresses[0] ?? null
+  }
+  if (target !== 'lan') return null
+  // Interface order is the preference order — that is the order Node reports, so
+  // it is the order this machine's routes are likely to prefer. A Tailscale
+  // address is not a LAN address (it has its own target), and a link-local
+  // 169.254 address only answers when nothing routable exists.
+  const linkLocal = []
+  for (const records of Object.values(interfaces || {})) {
+    for (const record of records || []) {
+      if (!record || record.internal || record.family !== 'IPv4' || net.isIP(record.address) !== 4) continue
+      if (!isPrivateNetworkHostname(record.address) || isTailscaleIp(record.address)) continue
+      if (record.address.startsWith('169.254.')) {
+        if (!linkLocal.includes(record.address)) linkLocal.push(record.address)
+        continue
+      }
+      return record.address
+    }
+  }
+  return linkLocal[0] ?? null
+}
+
 function lanWebSocketUrls(options, wsPath, boundPort) {
   if (!options.lanEnabled) return []
   const advertised = typeof options.lanAdvertiseHost === 'string' ? options.lanAdvertiseHost.trim() : ''
@@ -2328,6 +2369,28 @@ function isLoopbackListenHost(host) {
   return LOOPBACK_LISTEN_HOSTS.has(String(host ?? '').toLowerCase())
 }
 
+// An unspecified address is never a listen address: binding it opens every
+// adapter at once, which is the opposite of "nothing listens beyond 127.0.0.1
+// unless the owner enables it" (A4).
+const UNSPECIFIED_LISTEN_HOSTS = new Set(['0.0.0.0', '::'])
+
+/**
+ * The ONE rule for an address this plugin may bind or keep: loopback, or a
+ * private LAN/Tailscale address. The route, the start-up re-adoption of the
+ * saved choice, and a test-only bind alias all use it (Should-fix 4, review
+ * 2026-11-10). Start-up used to accept any IP literal, so an owned PUBLIC
+ * address was re-adopted on the next start even though this route would never
+ * have chosen it.
+ * @param {unknown} host the candidate listen host
+ * @returns {boolean} true only for loopback and private LAN/Tailscale addresses
+ */
+function isBindableListenHost(host) {
+  if (typeof host !== 'string') return false
+  const value = host.trim().replace(/^\[|\]$/g, '')
+  if (!value || UNSPECIFIED_LISTEN_HOSTS.has(value.toLowerCase())) return false
+  return isLoopbackListenHost(value) || isPrivateNetworkHostname(value)
+}
+
 function badRequest(message) {
   const error = new Error(message)
   error.status = 400
@@ -2370,6 +2433,52 @@ function isSameOrigin(req) {
     return new URL(origin).host === req.headers.host
   } catch (error) {
     return false
+  }
+}
+
+// The authorities a loopback management request may name. The list is closed on
+// purpose: exactly `127.0.0.1`, `localhost` and `[::1]`, each with an optional
+// port. Deliberately NOT accepted, although a resolver may treat them as local:
+// the trailing-dot `localhost.`, any other 127/8 address (`127.0.0.2`), the
+// abbreviated `127.1`, and the IPv4-mapped `::ffff:127.0.0.1`. A suffix or
+// loopback-range test would take all of them, so there is none here.
+const TRUSTED_LOCAL_AUTHORITY = /^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$/i
+
+/**
+ * DNS-rebinding guard for the write that moves a remote surface (Blocker 1,
+ * review 2026-11-10). `isSameOrigin` above compares two caller-supplied headers,
+ * so a page served from `attacker.example` that resolves to 127.0.0.1 reaches
+ * this listener with `Host`/`Origin` that agree with each other and passes it —
+ * and a missing Origin is allowed outright. Requiring a Host header that names
+ * THIS machine's loopback authority, plus an Origin that matches it exactly over
+ * http(s), leaves no name under an attacker's control able to reach this route.
+ *
+ * The canonical accepted authorities are exactly `127.0.0.1`, `localhost` and
+ * `[::1]`, each with an optional port (see TRUSTED_LOCAL_AUTHORITY above).
+ * `localhost.`, other 127/8 addresses, `127.1` and `::ffff:127.0.0.1` are refused
+ * on purpose; do not widen this into a permissive suffix check.
+ * @param {object} req the management request
+ * @throws {Error} 403 when the Host/Origin pair is not this machine's loopback
+ */
+function assertTrustedLocalAuthority(req) {
+  const host = typeof req.headers.host === 'string' ? req.headers.host.trim() : ''
+  if (!TRUSTED_LOCAL_AUTHORITY.test(host)) {
+    const error = new Error('listen address changes require a Host header naming this machine (127.0.0.1, localhost or [::1])')
+    error.status = 403
+    error.code = 'forbidden'
+    throw error
+  }
+  const origin = req.headers.origin
+  if (origin === undefined) return
+  let url = null
+  try { url = new URL(String(origin)) } catch { url = null }
+  // `URL.host` keeps the port: the same loopback name on another port is still
+  // a different (cross-origin) caller.
+  if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:') || url.host !== host) {
+    const error = new Error('listen address changes require an Origin that matches the Host header over http(s)')
+    error.status = 403
+    error.code = 'forbidden'
+    throw error
   }
 }
 
@@ -2440,6 +2549,77 @@ function resolveHostGateway(ctx) {
   return undefined
 }
 
+/**
+ * Test seams: the interface table and the bind aliases a test harness injects.
+ *
+ * They are NOT plugin configuration (Blocker 2, review 2026-11-10): `apply()`
+ * spreads the profile config into `options`, so a config key named
+ * `testListenAliases` used to become one — a measured
+ * `{ '127.0.0.1': '0.0.0.0' }` bound the wildcard while the status still said
+ * 127.0.0.1. Only `createMobileGatewayPlugin()` below accepts seams; a config
+ * file, the bundle and the schema cannot reach it.
+ *
+ * There is no module state either (Blocker, round 2, review 2026-11-10): the old
+ * `configureTestSeams()` kept the caller's objects by reference and `apply()`
+ * only shallow-snapshotted them, so a second instance in the same process
+ * inherited the previous harness's seams and an alias validated as loopback
+ * could be mutated to `0.0.0.0` afterwards and bind the wildcard with no
+ * revalidation. A seam value is now copied into fresh frozen plain data per
+ * instance, and the alias `bindHost()` really uses is checked again at bind time.
+ *
+ *  - `networkInterfaces`: the `os.networkInterfaces()` shaped table the `lan` and
+ *    `tailscale` targets resolve against, so a test does not depend on this
+ *    machine's adapters (the status reports the same table).
+ *  - `listenAliases`: `{ '<resolved host>': '<address the OS can bind>' }`. A test
+ *    cannot add an adapter and `listen()` refuses a foreign address with
+ *    EADDRNOTAVAIL, so the logical host keeps its name in the status while the
+ *    socket binds the aliased one. A target must itself be a bindable listen
+ *    address, so an alias can never map a loopback bind onto 0.0.0.0, :: or a
+ *    public address.
+ */
+const NO_TEST_SEAMS = Object.freeze({ networkInterfaces: null, listenAliases: Object.freeze({}) })
+
+// A frozen plain-data copy. The caller keeps ownership of its objects and may
+// change them freely: nothing it does after this point is read by a bind.
+function freezeSeamCopy(value, seen = new Set()) {
+  if (value === null || typeof value !== 'object') return value
+  if (seen.has(value)) throw new Error('mobile-gateway: a test seam must not contain a cycle')
+  seen.add(value)
+  const copy = Array.isArray(value) ? [] : {}
+  for (const key of Object.keys(value)) {
+    // `defineProperty` rather than assignment, so a `__proto__` key from a caller
+    // stays a plain key and cannot re-parent the copy.
+    Object.defineProperty(copy, key, { value: freezeSeamCopy(value[key], seen), enumerable: true, writable: true, configurable: true })
+  }
+  seen.delete(value)
+  return Object.freeze(copy)
+}
+
+/**
+ * Seal a seam object into this instance's own frozen, validated copy.
+ * @param {object|undefined} seams the harness's seam object, or nothing
+ * @returns {{networkInterfaces: object|null, listenAliases: object}} frozen data
+ * @throws {Error} when an alias names an address this plugin must not bind
+ */
+function sealTestSeams(seams) {
+  if (!seams || typeof seams !== 'object' || seams === NO_TEST_SEAMS) return NO_TEST_SEAMS
+  const networkInterfaces = seams.networkInterfaces && typeof seams.networkInterfaces === 'object'
+    ? freezeSeamCopy(seams.networkInterfaces)
+    : null
+  const listenAliases = seams.listenAliases && typeof seams.listenAliases === 'object'
+    ? freezeSeamCopy(seams.listenAliases)
+    : Object.freeze({})
+  // A bind alias is a seam, not a permission: it may only point at an address
+  // this plugin would bind itself, so it can never turn a loopback bind into a
+  // wildcard or a public one. Validated here AND again at bind time.
+  for (const [from, to] of Object.entries(listenAliases)) {
+    if (typeof to !== 'string' || !isBindableListenHost(to)) {
+      throw new Error(`mobile-gateway: test listen alias ${from} -> ${String(to)} must be a loopback or private address`)
+    }
+  }
+  return Object.freeze({ networkInterfaces, listenAliases })
+}
+
 const plugin = {
   name: 'mobile-gateway',
   Config,
@@ -2457,7 +2637,10 @@ const plugin = {
   remoteControlEnabled: resolveRemoteControl,
   admitMessage,
   handleQuery,
-  async apply(ctx, config) {
+  // `testSeams` is the test-only third argument (Blocker, round 2): production
+  // Cordis calls `apply(ctx, config)` and gets NO_TEST_SEAMS, while
+  // `createMobileGatewayPlugin()` passes this instance's sealed copy.
+  async apply(ctx, config, testSeams = NO_TEST_SEAMS) {
     const webServer = ctx.webServer
     if (typeof ctx.connection?.createPeer !== 'function') {
       throw new Error('mobile-gateway requires DSH 0.2.1-rc.2 or later with Connection.createPeer')
@@ -2524,10 +2707,22 @@ const plugin = {
       lanAdvertiseHost: '',
       ...(config || {}),
     }
+    // Blocker 2 (review 2026-11-10): `...(config || {})` spreads the profile
+    // config, so a config key named after a test seam used to BECOME one. Seams
+    // arrive only as the `apply()` argument, are sealed into this instance's own
+    // frozen copy, and deleting the keys keeps them out of `options` for every
+    // later reader too.
+    delete options.testNetworkInterfaces
+    delete options.testListenAliases
+    const testSeamsInForce = sealTestSeams(testSeams)
     // Contract §2: a programmatic caller reaches apply() without the schema, so
     // the resolved TTL is clamped here too; `/mgw/status` and the registry then
     // agree on the value that is actually in force.
     options.pairingTtlMs = clampPairingTtlMs(options.pairingTtlMs)
+    // One interface table for the whole plugin run: the listen targets, the
+    // status report and the saved-address check must all agree on what this
+    // machine has. A sealed test table replaces the real one.
+    const interfaces = () => testSeamsInForce.networkInterfaces || os.networkInterfaces()
     const wsPath = options.path
     if (typeof wsPath !== 'string' || !wsPath.startsWith('/') || wsPath.endsWith('/') || wsPath.includes('?') || wsPath.includes('#')) {
       throw new Error('mobile-gateway: path must be an absolute pathname without a trailing slash, query, or fragment')
@@ -2569,6 +2764,26 @@ const plugin = {
     }
     const configuredEndpoints = normalizeEndpoints(options.endpoints)
     const gatewayState = createGatewayState(options.gatewayStateFile || `${deviceFile}.gateway.json`)
+    // A listen address picked on the Devices page outlives the process, exactly
+    // like the saved gateway mode; the configured `lanHost` is the fallback.
+    // A stale pick is dropped instead of leaving the TLS listener without an
+    // address to bind — a laptop that moved networks no longer owns it, and
+    // binding it would fail with EADDRNOTAVAIL on every start.
+    //
+    // The address rule is the route's own (Should-fix 4): an owned PUBLIC or
+    // unspecified address is not re-adopted, because this route would never
+    // choose one and the status would then advertise a surface the owner cannot
+    // get back to from the Devices page.
+    const savedListenHost = gatewayState.listenHost
+    if (savedListenHost) {
+      const owned = isLoopbackListenHost(savedListenHost)
+        || Object.values(interfaces()).some((records) => (records || []).some((record) => record && record.address === savedListenHost))
+      if (owned && isBindableListenHost(savedListenHost)) {
+        options.lanHost = savedListenHost
+      } else {
+        log(`saved listen address ${savedListenHost} is not a loopback/private address this machine owns; keeping ${options.lanHost}`)
+      }
+    }
     let transportSettings = normalizeTransportConfig({ ...TRANSPORT_DEFAULTS, ...options.webrtc, ...gatewayState.webrtc,
       ...(gatewayState.webrtc?.stunServers !== undefined ? { stunServers: managedStunServers(gatewayState.webrtc.stunServers) } : {}),
     })
@@ -2819,6 +3034,16 @@ const plugin = {
     let lanListening = false
     let lanListenError = null
     let lanBoundPort = options.lanPort
+    // Blocker 3 (review 2026-11-10): listener changes are serialized and every
+    // listener carries a generation. Two overlapping POST /mgw/listen requests
+    // used to close each other's listener and both report success, because both
+    // waited on the same shared `lanListening` flag and an event from a
+    // superseded listener still mutated it. A generation settle is now the only
+    // thing a rebind waits on.
+    let lanGeneration = 0
+    let lanSettle = null
+    let lanLane = Promise.resolve()
+    const LAN_SETTLE_TIMEOUT_MS = 5_000
     // T017: the TLS listener is re-created when the certificate rotates; sockets
     // belonging to a retired listener are terminated so every client re-pins.
     const tlsSockets = new Set()
@@ -2827,6 +3052,10 @@ const plugin = {
     let rtc = null
     // Assigned once the listener factory below is defined (T014 reuses it).
     let openLanListener = () => {}
+    // Same reason: POST /mgw/listen closes the listener and re-opens it on
+    // another address through the factory, so the slot exists before the route
+    // can be reached (a route must never touch a TDZ binding).
+    let rebindLanListener = async () => { throw new Error('listener factory is not ready') }
     let wedgeTimer = null
     // Sockets targeted by the kill switch, kept until they really close (T014).
     const closingSockets = new Set()
@@ -2876,9 +3105,38 @@ const plugin = {
       wedgeTimer.unref?.()
     }
 
+    // A listener attempt's own settlement: the listener in force is
+    // `lanSettle`, closing it settles it as superseded, and a waiter only ever
+    // observes the generation it asked for.
+    const beginLanAttempt = () => {
+      lanGeneration += 1
+      let resolve
+      const promise = new Promise((done) => { resolve = done })
+      const settle = { generation: lanGeneration, promise, resolve, settled: false }
+      lanSettle = settle
+      return settle
+    }
+
+    const settleLanAttempt = (settle, outcome) => {
+      if (!settle || settle.settled) return
+      settle.settled = true
+      settle.resolve(outcome)
+    }
+
+    // Cancel a pending rebind/rollback without a replacement listener: disposal
+    // and the owner switch both mean "the surface is gone", never "it failed".
+    const abortLanAttempts = () => {
+      lanGeneration += 1
+      settleLanAttempt(lanSettle, { ok: false, aborted: true })
+      lanSettle = null
+    }
+
     // Close the plugin-owned TLS listener. The DSH web server route stays
     // registered (it is loopback and gated by the switch itself).
     const closeRemoteListeners = () => {
+      // Whatever was waiting on this listener can never be settled by it any
+      // more, so the attempt is superseded before the socket goes away.
+      abortLanAttempts()
       if (!lanServer) return
       const listener = lanServer
       lanServer = null
@@ -2886,6 +3144,38 @@ const plugin = {
       try { listener.close() } catch (error) {
         log(`TLS listener close failed: ${error && error.message ? error.message : String(error)}`)
       }
+    }
+
+    // Wait for exactly one attempt. `null` means the attempt was superseded
+    // (disposal, the owner switch, or a later listener change), so the caller
+    // must not roll back over a listener that is no longer its own.
+    const awaitLanSettled = async (settle) => {
+      if (!settle) return null
+      let timer
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ ok: false, timedOut: true }), LAN_SETTLE_TIMEOUT_MS)
+        timer.unref?.()
+      })
+      const outcome = await Promise.race([settle.promise, timeout])
+      clearTimeout(timer)
+      if (settle.generation !== lanGeneration) return null
+      return outcome
+    }
+
+    // Listener-changing operations run one at a time: a second POST /mgw/listen
+    // waits for the first one and then applies (see PROTOCOL.md §15), so no
+    // request ever closes the listener another request is using.
+    const inLanLane = (operation) => {
+      const run = lanLane.then(operation, operation)
+      lanLane = run.then(() => {}, () => {})
+      return run
+    }
+
+    const listenAbortedError = () => {
+      const error = new Error('the listen change was cancelled: the mobile gateway is disabled or stopping')
+      error.status = 409
+      error.code = 'listen/aborted'
+      return error
     }
 
     const setGatewayMode = (mode, reason, persist = true) => {
@@ -3527,7 +3817,9 @@ const plugin = {
               pairingRoute,
               p2pUrl: gatewayState.p2pUrl,
               tailscaleUrl: gatewayState.tailscaleUrl,
-              tailscale: tailscaleInterfaceStatus({ listening: lanListening, host: options.lanHost, port: lanBoundPort, wsPath }),
+              // The same table the listen targets bind against, so an address
+              // reported here is exactly the one POST /mgw/listen can apply.
+              tailscale: tailscaleInterfaceStatus({ listening: lanListening, host: options.lanHost, port: lanBoundPort, wsPath }, interfaces()),
               lan: {
                 enabled: options.lanEnabled === true,
                 listening: lanListening,
@@ -3663,6 +3955,82 @@ const plugin = {
             rtc.configure(transportSettings)
             log(`connection preference saved: route=${pairingRoute}; existing connections retained`)
             sendJson(res, 200, { pairingRoute, p2pUrl: gatewayState.p2pUrl, tailscaleUrl: gatewayState.tailscaleUrl, webrtc: rtc.snapshot() })
+          } else if (req.method === 'POST' && p === '/mgw/listen') {
+            // The Devices page binds the plugin-owned TLS listener to this
+            // machine's LAN or Tailscale address instead of a static config
+            // value. Loopback and same-origin are enforced above for every /mgw
+            // write; the loopback check is repeated because this route moves a
+            // remote surface, and the Host/Origin pair is checked as well: the
+            // shared same-origin check above compares two caller-supplied
+            // headers, which DNS rebinding satisfies (Blocker 1). Nothing about
+            // the surface itself changes: the same
+            // `https.createServer(tlsServerOptions(...))` template, the same
+            // upgrade handler, private-source check, pin and "authentication
+            // forced" — only the address it binds moves (the certificate is NOT
+            // rotated, so every paired phone keeps its pin).
+            if (!isLoopback(req)) {
+              sendJson(res, 403, { error: 'forbidden', message: 'listen address changes are loopback-only' })
+              return
+            }
+            assertTrustedLocalAuthority(req)
+            const body = await readBody(req)
+            if (!LISTEN_TARGETS.includes(body.target))
+              throw badRequest(`target must be one of ${LISTEN_TARGETS.join(', ')}`)
+            // Nothing can be re-bound while no listener may exist: "loopback by
+            // default" is the owner's decision (A4), so this route never turns
+            // the remote surface on by itself.
+            if (options.lanEnabled !== true) {
+              const error = new Error('enable LAN access (lanEnabled) before choosing a listen address')
+              error.status = 409
+              error.code = 'lan/disabled'
+              throw error
+            }
+            if (!gatewayEnabled) {
+              const error = new Error('enable the mobile gateway before choosing a listen address')
+              error.status = 409
+              error.code = 'lan/disabled'
+              throw error
+            }
+            const table = interfaces()
+            const host = resolveListenHost(body.target, table)
+            if (!host) {
+              const error = new Error(body.target === 'tailscale'
+                ? 'no Tailscale address was detected on this machine'
+                : 'no private LAN address was detected on this machine')
+              error.status = 409
+              error.code = body.target === 'tailscale' ? 'tailscale/not-detected' : 'lan/not-detected'
+              throw error
+            }
+            // The same ONE rule start-up re-adopts a saved choice with
+            // (Should-fix 4): a malformed interface table cannot smuggle an
+            // unspecified or public listen address in either.
+            if (!isBindableListenHost(host))
+              throw badRequest('listen address must be loopback or a private LAN/Tailscale address')
+            // The choice is persisted inside the lane, right after the
+            // generation that confirmed the bind, so the saved address is always
+            // the one the winning listener sits on (Blocker 3).
+            const applied = await rebindLanListener(host)
+            log(`TLS listener bound to ${applied.applied}:${applied.port}${wsPath} on request`)
+            // The answer describes THIS request's listener, captured inside the
+            // lane: a queued request may already have moved the live one, and the
+            // reply must not report somebody else's state (Blocker 3).
+            sendJson(res, 200, {
+              applied: applied.applied,
+              port: applied.port,
+              persists: applied.persists,
+              lan: {
+                enabled: options.lanEnabled === true,
+                listening: applied.listening,
+                host: applied.applied,
+                port: applied.port,
+                urls: applied.urls,
+                requireAuth: true,
+                tls: applied.listening,
+                certSha256: tlsIdentity?.fingerprint256 ?? null,
+                error: null,
+              },
+              tailscale: tailscaleInterfaceStatus({ listening: applied.listening, host: applied.applied, port: applied.port, wsPath }, table),
+            })
           } else if (req.method === 'POST' && p === '/mgw/tls/regenerate') {
             // T016 (R1): the certificate is replaced only by this explicit owner
             // action. Every paired phone pins the old fingerprint, so they all
@@ -3672,30 +4040,35 @@ const plugin = {
               return
             }
             if (!remoteControlEnabled()) throw remoteDisabledError('enable remote control before rotating the certificate')
-            const wasListening = lanListening
-            closeRemoteListeners()
-            for (const socket of tlsSockets) {
-              try { socket.destroy() } catch { /* already gone */ }
-            }
-            tlsSockets.clear()
-            for (const client of [...clients]) client.close(CLOSE_REVOKED, 'gateway certificate regenerated')
-            tlsIdentity = await loadOrCreateTlsIdentity({
-              directory: tlsDirectory,
-              advertised: tlsAdvertisedHosts(options, wsPath),
-              regenerate: true,
-              log,
-            })
-            openLanListener()
-            for (let attempt = 0; attempt < 100 && !lanListening; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10))
-            log(`TLS certificate regenerated: certSha256=${tlsIdentity.fingerprint256}`)
-            sendJson(res, 200, {
-              regenerated: true,
-              fingerprint256: tlsIdentity.fingerprint256,
-              notAfter: tlsIdentity.notAfter,
-              sans: tlsIdentity.sans,
-              wasListening,
-              listening: lanListening,
-              rePairRequired: true,
+            // Also a listener-changing operation, so it takes the same lane as
+            // POST /mgw/listen: a rotation must never close the listener a
+            // rebind is waiting on (Blocker 3).
+            await inLanLane(async () => {
+              const wasListening = lanListening
+              closeRemoteListeners()
+              for (const socket of tlsSockets) {
+                try { socket.destroy() } catch { /* already gone */ }
+              }
+              tlsSockets.clear()
+              for (const client of [...clients]) client.close(CLOSE_REVOKED, 'gateway certificate regenerated')
+              tlsIdentity = await loadOrCreateTlsIdentity({
+                directory: tlsDirectory,
+                advertised: tlsAdvertisedHosts(options, wsPath),
+                regenerate: true,
+                log,
+              })
+              openLanListener()
+              for (let attempt = 0; attempt < 100 && !lanListening; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10))
+              log(`TLS certificate regenerated: certSha256=${tlsIdentity.fingerprint256}`)
+              sendJson(res, 200, {
+                regenerated: true,
+                fingerprint256: tlsIdentity.fingerprint256,
+                notAfter: tlsIdentity.notAfter,
+                sans: tlsIdentity.sans,
+                wasListening,
+                listening: lanListening,
+                rePairRequired: true,
+              })
             })
           } else if (req.method === 'GET' && p === '/mgw/devices') {
             sendJson(res, 200, { devices: registry.list() })
@@ -4909,14 +5282,52 @@ const plugin = {
     // loopback DSH route above keeps the admin UI and local clients working.
     // When the owner enables LAN access it is opened only while the switch is
     // on, and it serves nothing but the pinned mobile WebSocket over TLS.
-    // T014: the same factory re-opens it after a switch-off/on cycle.
-    const listenHost = () => options.lanHost
+    // T014: the same factory re-opens it after a switch-off/on cycle, and
+    // POST /mgw/listen moves it to another local address through it.
+    // The listen host is `options.lanHost` (mutated by a rebind); what the socket
+    // really binds is `bindHost()`. The two differ only in a test, where a target
+    // address this machine does not own is aliased onto one it does — `listen()`
+    // refuses a foreign address with EADDRNOTAVAIL, and the status and advertised
+    // URLs keep naming the logical host either way.
+    const bindHost = () => {
+      const aliases = testSeamsInForce.listenAliases
+      // Own key only: a `lanHost` that happens to spell an Object.prototype
+      // member must never resolve to something inherited.
+      if (!Object.hasOwn(aliases, options.lanHost)) return options.lanHost
+      const target = aliases[options.lanHost]
+      // Re-checked at the bind, not only when the seam was sealed: the rule is
+      // the security property, so a value that no longer passes is refused the
+      // same way a bad real bind is — the attempt fails and nothing is bound.
+      if (typeof target !== 'string' || !isBindableListenHost(target)) {
+        throw new Error(`mobile-gateway: test listen alias ${options.lanHost} -> ${String(target)} must be a loopback or private address`)
+      }
+      return target
+    }
     openLanListener = () => {
-      if (options.lanEnabled !== true || gatewayEnabled !== true || lanServer) return
+      if (options.lanEnabled !== true || gatewayEnabled !== true || lanServer) return null
+      // Resolved and validated once, synchronously before this attempt binds, so
+      // the alias that really reaches `listen()` passed the rule just now and
+      // not merely when the seam was sealed (Blocker, round 2). A refused alias
+      // fails the attempt and binds nothing, exactly like a real bind the OS
+      // would refuse; the busy-port retry below reuses the same address.
+      let bindAddress
+      try {
+        bindAddress = bindHost()
+      } catch (error) {
+        lanListening = false
+        lanListenError = error && error.message ? error.message : String(error)
+        log(`TLS listener failed: ${lanListenError}`)
+        const refused = beginLanAttempt()
+        settleLanAttempt(refused, { ok: false, error: lanListenError })
+        return refused
+      }
       const listener = https.createServer(tlsServerOptions(tlsIdentity), (req, res) => {
         // No management surface, no WebUI, no pairing endpoint on the TLS port.
         sendJson(res, 404, { error: 'not-found' })
       })
+      // The generation this listener belongs to: only its own events may settle
+      // it, and a rebind waits on exactly this attempt (Blocker 3).
+      const attempt = beginLanAttempt()
       lanServer = listener
       listener.on('connection', (socket) => {
         tlsSockets.add(socket)
@@ -4945,23 +5356,128 @@ const plugin = {
         // different certificate cannot be redeemed here.
         handleMobileUpgrade(req, socket, head, { lan: true, port: lanBoundPort, tls: true, certSha256: tlsIdentity.fingerprint256 })
       })
+      // A busy port must not be fatal: with a configured non-zero port the
+      // listener shifts forward one port at a time (at most LAN_PORT_ATTEMPTS
+      // ports) so one takeover cannot leave the gateway without its listener.
+      // `0` still means "let the OS pick" and never shifts; any other listen
+      // error (EACCES, EADDRNOTAVAIL, …) keeps the old give-up behaviour.
+      const LAN_PORT_ATTEMPTS = 10
+      const configuredPort = lanBoundPort
+      // A shift must stay inside the 16-bit port range: `listen(65536)` throws
+      // RangeError synchronously, which would escape this event handler.
+      const lastAttemptPort = Math.min(configuredPort + LAN_PORT_ATTEMPTS - 1, 65_535)
+      let attemptPort = configuredPort
       listener.on('error', (error) => {
+        // An event from a listener a later attempt already replaced must not
+        // touch the flags (or the settle) of the attempt in force (Blocker 3).
+        if (attempt.generation !== lanGeneration) return
+        // A retry after dispose (teardown closes `lanServer` without clearing
+        // it) would bring the port back up and keep it: never shift then.
+        const exhausted = error && error.code === 'EADDRINUSE' && configuredPort !== 0
+          && listener === lanServer && !lanListening && !disposed
+        if (exhausted && attemptPort < lastAttemptPort) {
+          const busyPort = attemptPort
+          attemptPort += 1
+          log(`TLS listener port ${busyPort} is busy; trying ${attemptPort}`)
+          // Node drops the handle of a failed bind, so the SAME server can
+          // listen again: the upgrade handler, the TLS options and the
+          // `lanServer` teardown reference keep pointing at the listener that
+          // really binds, and no superseded server keeps a port.
+          listener.listen(attemptPort, bindAddress)
+          return
+        }
         lanListening = false
-        lanListenError = error && error.message ? error.message : String(error)
+        // Name the whole range that was tried, not just the last port.
+        lanListenError = exhausted
+          ? `EADDRINUSE: ports ${configuredPort}-${lastAttemptPort} are all in use`
+          : error && error.message ? error.message : String(error)
         log(`TLS listener failed: ${lanListenError}`)
+        settleLanAttempt(attempt, { ok: false, error: lanListenError })
       })
-      listener.listen(lanBoundPort, listenHost(), () => {
-        if (lanServer !== listener) return
+      listener.on('listening', () => {
+        if (attempt.generation !== lanGeneration) return
         lanListening = true
         lanListenError = null
         const address = listener.address()
         if (address && typeof address === 'object') lanBoundPort = address.port
         const urls = lanWebSocketUrls(options, wsPath, lanBoundPort)
+        const shiftNote = configuredPort !== 0 && lanBoundPort !== configuredPort ? `; configured ${configuredPort} was busy` : ''
         // The certificate covers the hostnames a phone may dial; a rotation
         // widens the SAN list only for a later explicit regeneration.
-        log(`TLS listener ready: ${options.lanHost}:${lanBoundPort}${wsPath}${urls.length ? ` (${urls.join(', ')})` : ''}; certSha256=${tlsIdentity.fingerprint256}; authentication forced`)
+        log(`TLS listener ready: ${options.lanHost}:${lanBoundPort}${wsPath}${urls.length ? ` (${urls.join(', ')})` : ''}${shiftNote}; certSha256=${tlsIdentity.fingerprint256}; authentication forced`)
+        settleLanAttempt(attempt, { ok: true })
       })
+      listener.listen(configuredPort, bindAddress)
+      return attempt
     }
+    // POST /mgw/listen: move the listener to another local address. The close and
+    // re-open go through the SAME factory, so the retry loop (a busy port shifts
+    // forward) and every security property of the listener apply unchanged.
+    //
+    // Serialized (Blocker 3): a second request waits here for the first one and
+    // then applies, so exactly one listener exists at a time, rollback never
+    // closes somebody else's listener, and the saved address is the one the
+    // winning generation confirmed.
+    //
+    // Two honest limits of a rebind (Should-fix 6, also stated in PROTOCOL.md §15):
+    // 1. there IS a deaf interval — the old socket closes before the new bind, so
+    //    for up to `LAN_SETTLE_TIMEOUT_MS` nothing answers on either address;
+    // 2. `server.close()` does not terminate upgraded WebSockets, so connections
+    //    already upgraded on the OLD address survive the move — they are not
+    //    severed (that is the kill switch's job), while the new address accepts
+    //    new ones.
+    rebindLanListener = (host) => inLanLane(async () => {
+      if (disposed || options.lanEnabled !== true || gatewayEnabled !== true) throw listenAbortedError()
+      const previousHost = options.lanHost
+      // Rollback restores the port too: the failed attempt may have been asked
+      // for another one, and the previous port is the one phones already know.
+      const previousPort = lanBoundPort
+      closeRemoteListeners()
+      options.lanHost = host
+      // A previous failure must not fail the new attempt before it started.
+      lanListenError = null
+      const attempt = openLanListener()
+      const outcome = await awaitLanSettled(attempt)
+      // Superseded (disposal, the owner switch, a later change): this request no
+      // longer owns the listener and must not roll anything back.
+      if (outcome === null) throw listenAbortedError()
+      if (outcome.ok) {
+        // Persisted only after the bind the winning generation confirmed, so an
+        // address this process could not bind never comes back on the next
+        // start. A failed write leaves the address in force for this run and
+        // reports `persists:false`.
+        let persists = false
+        try {
+          gatewayState.setListenHost(host)
+          persists = true
+        } catch (error) {
+          log(`listen address ${host} was not persisted: ${error.message}`)
+        }
+        return {
+          applied: host,
+          port: lanBoundPort,
+          persists,
+          listening: true,
+          // Captured here, inside the lane: the advertised URLs belong to the
+          // listener this generation confirmed, not to a later one.
+          urls: lanWebSocketUrls(options, wsPath, lanBoundPort),
+        }
+      }
+      const failure = outcome.error || lanListenError || 'the TLS listener did not come up'
+      // A failed rebind must not leave the gateway without a listener: go back to
+      // the address AND port it was reachable on before, so a phone that already
+      // knows that endpoint keeps working.
+      closeRemoteListeners()
+      options.lanHost = previousHost
+      lanBoundPort = previousPort
+      lanListenError = null
+      const rollback = openLanListener()
+      const rolled = await awaitLanSettled(rollback)
+      if (rolled === null) throw listenAbortedError()
+      throw new Error(rolled.ok
+        ? `the listener could not be rebound to ${host} (${failure}); it is back on ${previousHost}`
+        : `the listener could not be rebound to ${host} (${failure}) and did not come back on ${previousHost} (${rolled.error || lanListenError || 'no listener'})`)
+    })
     openLanListener()
 
     const disposeEvents = ctx.on('session/event', (session, event) => {
@@ -5412,6 +5928,10 @@ const plugin = {
       // looks alive and register a card, a broadcast or a waiter after teardown.
       // Cancelling the joins also drops their timers, so nothing keeps running.
       disposed = true
+      // Blocker 3: a rebind or rollback parked on a listener must not outlive
+      // the plugin — it is superseded here and answers 409 instead of touching a
+      // listener that teardown is about to close.
+      abortLanAttempts()
       cancelVisibleRefresh()
       for (const cancel of [...joinCancellers]) cancel()
       joinCancellers.clear()
@@ -5467,5 +5987,21 @@ const plugin = {
   },
 }
 
-export { Config, admitMessage, handleQuery, isLoopbackListenHost }
+/**
+ * Build a plugin instance whose listener seams are `seams` — tests only.
+ *
+ * The production export is created with NO_TEST_SEAMS and there is no module
+ * state for seams, so a second instance in the same process can never inherit
+ * the first harness's interface table or aliases. Each call seals its own frozen
+ * copy; changing the supplied objects afterwards changes nothing (Blocker,
+ * round 2, review 2026-11-10).
+ * @param {object} [seams] `{ networkInterfaces, listenAliases }`, or nothing
+ * @returns {object} a plugin with the same `Config`/`inject`/`apply` surface
+ */
+function createMobileGatewayPlugin(seams) {
+  const sealedSeams = sealTestSeams(seams)
+  return { ...plugin, apply: (ctx, config) => plugin.apply(ctx, config, sealedSeams) }
+}
+
+export { Config, admitMessage, createMobileGatewayPlugin, handleQuery, isLoopbackListenHost }
 export default plugin

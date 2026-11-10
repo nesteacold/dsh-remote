@@ -21,22 +21,44 @@ const source = fs.readFileSync(path.join(here, '../lib/client.js'), 'utf8')
 
 console.log('client')
 
-function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions } = {}) {
+function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure } = {}) {
   let api
   const calls = []
   const state = {
     status: status ?? { remoteControl: { enabled: false, accepting: false }, lan: { listening: false, urls: [] } },
     devices, remotes, pending: pending ?? [], pairing: null,
+    // POST /mgw/listen: one queued failure, and an optional gate a test holds to
+    // observe the in-flight state before the rebind answers.
+    listenFailure: listenFailure ?? null, listenGate: null,
   }
   const fetch = async (url, options = {}) => {
     const target = new URL(url)
     const route = target.pathname + target.search
     const body = options.body ? JSON.parse(options.body) : undefined
     calls.push({ method: options.method ?? 'GET', route, body, origin: target.origin, credentials: options.credentials })
-    const reply = (data, ok = true) => ({ ok, status: ok ? 200 : 400, json: async () => data })
+    const reply = (data, ok = true, status = ok ? 200 : 400) => ({ ok, status, json: async () => data })
     if (fail[route]) return reply({ message: fail[route] }, false)
     if (route === '/mgw/status') return reply(state.status)
     if (route === '/mgw/devices') return reply({ devices: state.devices })
+    // The connection plan: rebind the listener, and move the status the next poll
+    // reads too — otherwise a test could pass on a bind the gateway never applied.
+    if (route === '/mgw/listen' && options.method === 'POST') {
+      if (state.listenGate) await state.listenGate
+      if (state.listenFailure) {
+        const failure = state.listenFailure
+        state.listenFailure = null
+        return reply(failure.body, false, failure.status)
+      }
+      const known = (state.status && state.status.tailscale && state.status.tailscale.addresses) || []
+      const host = body.target === 'loopback' ? '127.0.0.1' : body.target === 'tailscale' ? known[0] : '192.168.1.20'
+      if (!host) return reply({ error: `${body.target}/not-detected`, message: 'No address on this machine.' }, false, 409)
+      const port = 30081
+      const urls = [`wss://${host}:${port}/ws/mobile`]
+      const lan = { ...(state.status && state.status.lan), enabled: true, listening: true, host, port, urls, error: null }
+      const tailscale = { ...(state.status && state.status.tailscale), urls: body.target === 'tailscale' ? urls : [] }
+      state.status = { ...state.status, lan, tailscale }
+      return reply({ applied: host, port, lan, tailscale })
+    }
     if (route === '/mgw/remote-control') {
       state.status = { ...state.status, remoteControl: { enabled: body.enabled, accepting: state.status.remoteControl.accepting },
         lan: body.enabled ? { listening: true, urls: ['wss://192.168.1.20:3081/ws/mobile'] } : { listening: false, urls: [] } }
@@ -499,6 +521,8 @@ const PIN = Array.from({ length: 32 }, (_, index) => index.toString(16).padStart
 const LAN_UP = { enabled: true, listening: true, host: '127.0.0.1', port: 3081, urls: ['wss://127.0.0.1:3081/ws/mobile'],
   requireAuth: true, tls: true, certSha256: PIN, error: null }
 const byTestId = (page, id) => find(page, (node) => node.props['data-testid'] === id)
+// Text of one subtree only (the port-risk note must be read apart from the raw error row).
+const flatText = (node) => (typeof node === 'string' ? node : (node.children || []).map(flatText).join(' '))
 
 await check('listening on: a loopback bind shows the real bind + pin and warns that no other machine can connect, naming where to change it', async () => {
   const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.1.2'], urls: [] } } })
@@ -537,7 +561,7 @@ await check('listening on: a non-loopback bind shows the address and, when it is
   assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://100.64.1.2:3081/ws/mobile')
   const [note] = byTestId(page, 'listener-reachable')
   assert.ok(note, 'a neutral note replaces the warning')
-  assert.match(rendered, /100\.98\.172\.7/, 'the note names the host')
+  assert.match(rendered, /100\.64\.1\.2/, 'the note names the host')
   assert.ok(rendered.includes(DICT.en.reachableTitle))
   assert.ok(rendered.includes(`${DICT.en.reachableNote} wss://100.64.1.2:3081/ws/mobile`))
   assert.ok(rendered.includes(DICT.en.reachableTailscale), 'the bind host is a Tailscale address')
@@ -565,6 +589,109 @@ await check('listening on: listener down shows the off state, the error verbatim
   assert.equal(byTestId(page, 'listener-reachable').length, 0)
   assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), '127.0.0.1:3081', 'host:port without a URL')
   page.unmount()
+})
+
+// Port risk: a listener inside the OS dynamic range can lose its port to an
+// outgoing connection's source port, so the card explains it — and stays quiet
+// in the safe band. Ports here come from /mgw/status, the poll AllowTab runs.
+const riskLan = (port) => ({ enabled: true, listening: true, host: '192.168.1.20', port,
+  urls: [`wss://192.168.1.20:${port}/ws/mobile`], requireAuth: true, tls: true, certSha256: null, error: null })
+const BUSY_LAN = { enabled: false, listening: false, host: '127.0.0.1', port: 30081, urls: [], requireAuth: true,
+  tls: false, certSha256: null, error: 'EADDRINUSE: 127.0.0.1:30081' }
+
+await check('listening on: a safe-band port (30081) says nothing about port risk', async () => {
+  const ui = load({ status: { ...ONLINE, lan: riskLan(30081), tailscale: { addresses: [], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.equal(byTestId(page, 'listener-port-risk').length, 0, 'no row when there is nothing to say')
+  const rendered = text(page)
+  assert.ok(!rendered.includes(ui.api.testing.DICT.en.portRiskTitle))
+  assert.ok(!rendered.includes(ui.api.testing.DICT.en.portRiskSafeBand))
+  page.unmount()
+})
+
+await check('listening on: a port in the measured retuned range (3081) gets the note, naming the safe band and the automatic next port', async () => {
+  const ui = load({ status: { ...ONLINE, lan: riskLan(3081), tailscale: { addresses: [], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  const [note] = byTestId(page, 'listener-port-risk')
+  assert.ok(note, 'the note is rendered')
+  const rendered = flatText(note)
+  assert.ok(rendered.includes(DICT.en.portRiskTitle), 'says the OS can take the port')
+  assert.ok(rendered.includes(DICT.en.portRiskBody), 'says the bind can fail at a random moment')
+  assert.ok(rendered.includes(DICT.en.portRiskSafeBand), 'names the safe band')
+  assert.match(rendered, /20000-39999/)
+  assert.ok(rendered.includes(DICT.en.portRiskAuto), 'says the gateway moves to the next free port')
+  page.unmount()
+})
+
+await check('listening on: a port in the Windows default dynamic range (50000) gets the note too', async () => {
+  const ui = load({ status: { ...ONLINE, lan: riskLan(50000), tailscale: { addresses: [], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  const [note] = byTestId(page, 'listener-port-risk')
+  assert.ok(note, 'the note is rendered')
+  assert.ok(flatText(note).includes(DICT.en.portRiskTitle))
+  assert.equal(byTestId(page, 'listener-port-risk').length, 1, 'one note, not one per row')
+  page.unmount()
+})
+
+await check('listening on port risk: both dynamic ranges are inclusive at their edges — 15000 and 49152 warn, 15001 and 49151 stay quiet', async () => {
+  // 1024-15000 is the measured range on the machine this was built for; 49152-65535
+  // is the Windows default. The edge ports are what an off-by-one would get wrong.
+  for (const [port, risky] of [[15000, true], [15001, false], [49152, true], [49151, false]]) {
+    const ui = load({ status: { ...ONLINE, lan: riskLan(port), tailscale: { addresses: [], urls: [] } } })
+    const page = await mount(React.createElement(ui.api.testing.AllowTab))
+    await flush()
+    assert.equal(byTestId(page, 'listener-port-risk').length, risky ? 1 : 0,
+      `port ${port} ${risky ? 'is inside a dynamic range and warns' : 'is outside both ranges and stays quiet'}`)
+    page.unmount()
+  }
+})
+
+await check('listening on: a busy port keeps the error verbatim while the note explains the cause instead of repeating it', async () => {
+  const ui = load({ status: { ...ONLINE, lan: BUSY_LAN, tailscale: { addresses: [], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  assert.equal(byTestId(page, 'listener-error')[0].children.join(''), 'EADDRINUSE: 127.0.0.1:30081', 'shown verbatim')
+  const [note] = byTestId(page, 'listener-port-risk')
+  assert.ok(note, 'a busy port is explained')
+  const rendered = flatText(note)
+  assert.ok(rendered.includes(DICT.en.portBusyTitle), 'names the busy port')
+  assert.ok(rendered.includes(DICT.en.portBusyBody), 'explains the cause')
+  assert.match(rendered, /busy port/i)
+  assert.ok(!rendered.includes('EADDRINUSE'), 'explains the cause, does not repeat the raw text')
+  page.unmount()
+})
+
+await check('listening on port risk: every new string exists in vi and en; vi/en key sets stay identical', async () => {
+  const keys = ['portRiskTitle', 'portRiskBody', 'portRiskSafeBand', 'portRiskAuto', 'portBusyTitle', 'portBusyBody']
+  const states = [
+    { ...ONLINE, lan: riskLan(3081), tailscale: { addresses: [], urls: [] } },
+    { ...ONLINE, lan: BUSY_LAN, tailscale: { addresses: [], urls: [] } },
+  ]
+  for (const locale of ['en-US', 'vi']) {
+    const ui = load({ locale, status: states[0] })
+    const { DICT } = ui.api.testing
+    const lang = locale === 'vi' ? 'vi' : 'en'
+    const seen = new Set()
+    // One mount per state, collecting which of the new strings the page renders.
+    for (const status of states) {
+      ui.state.status = status
+      const page = await mount(React.createElement(ui.api.testing.AllowTab))
+      await flush()
+      const rendered = text(page)
+      for (const key of keys) if (rendered.includes(DICT[lang][key])) seen.add(key)
+      page.unmount()
+    }
+    assert.deepEqual([...seen].sort(), [...keys].sort(), `${locale} renders every new string`)
+  }
+  const ui = load()
+  const { DICT } = ui.api.testing
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
 })
 
 await check('listening on: every new string exists in vi and en; vi/en key sets stay identical', async () => {
@@ -605,6 +732,206 @@ await check('listening on: read-only — no write request and no input for this 
   assert.equal(ui.calls.some((call) => call.method !== 'GET'), false, 'no write, no dial')
   const [card] = byTestId(page, 'listening-on')
   assert.equal(card.findAll((node) => node.type === 'input' || node.type === 'button').length, 0, 'read-only: no controls')
+  page.unmount()
+})
+
+// Connection plan (POST /mgw/listen): the one writer on the Allow tab. It binds
+// the listener to one of this machine's own addresses, so the address and URLs the
+// Listening on card shows must follow the response instead of a config edit.
+const PLAN_LAN = { ...LAN_UP, host: '100.64.0.7', urls: ['wss://100.64.0.7:3081/ws/mobile'] }
+const planSelect = (page) => byTestId(page, 'plan-select')[0]
+const planOption = (page, label) => find(page, (node) => node.type === 'option' && node.children.join('') === label)[0]
+const LISTEN = (ui) => ui.calls.filter((call) => call.route === '/mgw/listen')
+
+await check('connection plan: the current plan is derived from status — loopback, a 100.64 Tailscale address, a private LAN address', async () => {
+  const cases = [
+    ['loopback', LAN_UP, { addresses: ['100.64.0.7'], urls: [] }],
+    ['tailscale', PLAN_LAN, { addresses: ['100.64.0.7'], urls: [] }],
+    ['lan', { ...LAN_UP, host: '192.168.1.20', urls: ['wss://192.168.1.20:3081/ws/mobile'] }, { addresses: ['100.64.0.7'], urls: [] }],
+    // The 100.64.0.0/10 range is enough on its own, even when the gateway listed no address.
+    ['tailscale', { ...LAN_UP, host: '100.100.1.9', urls: [] }, { addresses: [], urls: [] }],
+  ]
+  for (const [expected, lan, tailscale] of cases) {
+    const ui = load({ status: { ...ONLINE, lan, tailscale } })
+    const page = await mount(React.createElement(ui.api.testing.AllowTab))
+    await flush()
+    assert.equal(planSelect(page).props.value, expected, `${lan.host} is the ${expected} plan`)
+    assert.equal(planSelect(page).props.disabled, false, 'a known plan is selectable')
+    page.unmount()
+  }
+})
+
+await check('connection plan: choosing Tailscale sends exactly one POST /mgw/listen { target: "tailscale" } and the card shows the returned URL + address', async () => {
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.equal(planSelect(page).props.value, 'loopback')
+  ui.calls.length = 0
+  await act(async () => { await planSelect(page).props.onChange({ target: { value: 'tailscale' } }) })
+  const listens = LISTEN(ui)
+  assert.equal(listens.length, 1, 'exactly one rebind')
+  assert.equal(listens[0].method, 'POST')
+  assert.deepEqual(listens[0].body, { target: 'tailscale' })
+  assert.equal(planSelect(page).props.value, 'tailscale', 'the select follows the applied plan')
+  // The point of the feature: the Tailscale address is visible after the mapping.
+  const urls = flatText(byTestId(page, 'plan-tailscale-urls')[0])
+  assert.match(urls, /wss:\/\/100\.64\.0\.7:30081\/ws\/mobile/)
+  assert.equal(byTestId(page, 'plan-tailscale-addresses')[0].children.join(''), '100.64.0.7', 'the plain address is secondary text')
+  // The read-only card below is updated from the response, not from the next poll.
+  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://100.64.0.7:30081/ws/mobile')
+  assert.equal(byTestId(page, 'listener-reachable').length, 1, 'a Tailscale bind is called reachable')
+  assert.equal(byTestId(page, 'listener-pin')[0].props.title, PIN, 'the pin still comes from status after the rebind')
+  page.unmount()
+})
+
+await check('connection plan: without a detected Tailscale interface the option is disabled and says why', async () => {
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: [], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  assert.equal(planOption(page, 'Tailscale private network').props.disabled, true)
+  assert.equal(planOption(page, 'LAN').props.disabled, false)
+  assert.ok(text(page).includes(ui.api.testing.DICT.en.planTailscaleUnavailable), 'the reason is shown')
+  assert.equal(byTestId(page, 'plan-tailscale-unavailable').length, 1)
+  page.unmount()
+})
+
+await check('connection plan: a 409 tailscale/not-detected shows the message, puts the select back on the real plan, and fires no retry', async () => {
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } },
+    listenFailure: { status: 409, body: { error: 'tailscale/not-detected', message: 'No Tailscale interface address on this machine.' } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await act(async () => { await planSelect(page).props.onChange({ target: { value: 'tailscale' } }) })
+  assert.equal(byTestId(page, 'plan-error')[0].children.join(''), 'No Tailscale interface address on this machine.')
+  assert.match(text(page), /No Tailscale interface address on this machine\./)
+  assert.equal(planSelect(page).props.value, 'loopback', 'back on the plan status reports')
+  assert.equal(planSelect(page).props.disabled, false, 'the owner can try another plan')
+  await flush()
+  assert.equal(LISTEN(ui).length, 1, 'the fallback fires no second rebind')
+  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://127.0.0.1:3081/ws/mobile', 'the bind did not move')
+  page.unmount()
+})
+
+await check('connection plan: two rapid selections cannot put two rebinds in flight', async () => {
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  let release
+  ui.state.listenGate = new Promise((resolve) => { release = resolve })
+  await act(async () => {
+    planSelect(page).props.onChange({ target: { value: 'tailscale' } })
+    planSelect(page).props.onChange({ target: { value: 'lan' } })
+  })
+  assert.equal(LISTEN(ui).length, 1, 'the second selection is ignored while busy')
+  assert.equal(LISTEN(ui)[0].body.target, 'tailscale')
+  assert.equal(planSelect(page).props.disabled, true, 'the select is locked while applying')
+  assert.ok(text(page).includes(ui.api.testing.DICT.en.planApplying), 'the applying hint shows')
+  await act(async () => { release(); await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(planSelect(page).props.value, 'tailscale')
+  assert.equal(planSelect(page).props.disabled, false)
+  page.unmount()
+})
+
+await check('connection plan: the LAN option is honest — it names the first private address the OS reports and shows the address it actually bound', async () => {
+  // The gateway's `lan` target is the first private IPv4 the OS reports in Node's
+  // interface order; on the machine this was built for that is a WireGuard adapter
+  // (10.8.0.1), not the household LAN. The control must say so and show the bind.
+  const privateLan = { ...LAN_UP, host: '10.8.0.1', urls: ['wss://10.8.0.1:3081/ws/mobile'] }
+  const ui = load({ status: { ...ONLINE, lan: privateLan, tailscale: { addresses: [], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  const planCard = flatText(byTestId(page, 'connection-plan')[0])
+  // The distinguishing phrases, not the whole sentence, so the copy can be edited.
+  assert.match(planCard, /first private address the operating system reports/)
+  assert.match(planCard, /VPN or virtual adapter/)
+  assert.match(planCard, /Tailscale option or set the listen address in the gateway config/)
+  // The exact bind sits next to the plan control, not only in the card below.
+  assert.match(flatText(byTestId(page, 'plan-bound')[0]), /wss:\/\/10\.8\.0\.1:3081\/ws\/mobile/)
+  // A private/virtual address is named as what happened, quietly (no alert styling).
+  const hint = byTestId(page, 'plan-private-hint')[0]
+  assert.match(flatText(hint), /private or virtual address/i)
+  assert.match(flatText(hint), /10\.8\.0\.1/)
+  assert.equal(hint.props.role, undefined, 'a non-fatal condition, not an alert')
+  assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://10.8.0.1:3081/ws/mobile',
+    'the card below agrees with the plan card')
+  page.unmount()
+  // A loopback bind says nothing extra: there is no private-address hint to give.
+  const loopback = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: [], urls: [] } } })
+  const loopbackPage = await mount(React.createElement(loopback.api.testing.AllowTab))
+  await flush()
+  assert.equal(byTestId(loopbackPage, 'plan-private-hint').length, 0, 'quiet when there is nothing to say')
+  assert.match(flatText(byTestId(loopbackPage, 'plan-bound')[0]), /wss:\/\/127\.0\.0\.1:3081\/ws\/mobile/)
+  loopbackPage.unmount()
+})
+
+await check('connection plan: the LAN consent strings exist in vi and en, render in both, and vi/en key sets stay identical', async () => {
+  const keys = ['planLanCaveat', 'planBound', 'planPrivateHint']
+  const privateLan = { ...LAN_UP, host: '10.8.0.1', urls: ['wss://10.8.0.1:3081/ws/mobile'] }
+  for (const locale of ['en-US', 'vi']) {
+    const ui = load({ locale, status: { ...ONLINE, lan: privateLan, tailscale: { addresses: [], urls: [] } } })
+    const { DICT } = ui.api.testing
+    const lang = locale === 'vi' ? 'vi' : 'en'
+    const page = await mount(React.createElement(ui.api.testing.AllowTab))
+    await flush()
+    const rendered = flatText(byTestId(page, 'connection-plan')[0])
+    for (const key of keys) {
+      assert.ok(DICT[lang][key], `${lang} ${key} exists`)
+      assert.ok(rendered.includes(DICT[lang][key]), `${locale} renders ${key}`)
+    }
+    page.unmount()
+  }
+  const { DICT } = load().api.testing
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+})
+
+await check('connection plan: every new string exists in vi and en (identical key sets); the block adds one POST /mgw/listen and nothing else', async () => {
+  const keys = ['planTitle', 'planHelp', 'plan.loopback', 'plan.lan', 'plan.tailscale', 'planApplying',
+    'planUnknown', 'planTailscaleUnavailable']
+  const ui0 = load()
+  for (const lang of ['en', 'vi']) for (const key of keys) assert.ok(ui0.api.testing.DICT[lang][key], `${lang} ${key}`)
+  assert.deepEqual(Object.keys(ui0.api.testing.DICT.vi).sort(), Object.keys(ui0.api.testing.DICT.en).sort(), 'vi and en stay twins')
+  for (const locale of ['en-US', 'vi']) {
+    const ui = load({ locale, status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
+    const { DICT } = ui.api.testing
+    const lang = locale === 'vi' ? 'vi' : 'en'
+    const seen = new Set()
+    const collect = (page) => {
+      const rendered = text(page)
+      for (const key of keys) if (rendered.includes(DICT[lang][key])) seen.add(key)
+    }
+    const page = await mount(React.createElement(ui.api.testing.AllowTab))
+    await flush()
+    collect(page)
+    // In flight: the "applying" hint. The request is held open so it renders.
+    let release
+    ui.state.listenGate = new Promise((resolve) => { release = resolve })
+    await act(async () => { planSelect(page).props.onChange({ target: { value: 'tailscale' } }) })
+    collect(page)
+    await act(async () => { release(); await new Promise((resolve) => setImmediate(resolve)) })
+    page.unmount()
+    // No status from the gateway: the plan is unknown and the select is disabled.
+    const bare = load({ locale })
+    bare.state.status = null
+    const barePage = await mount(React.createElement(bare.api.testing.AllowTab))
+    await flush()
+    assert.equal(byTestId(barePage, 'plan-select')[0].props.disabled, true, 'no status, no plan')
+    collect(barePage)
+    barePage.unmount()
+    // No Tailscale interface: the third option is off, with the reason.
+    const off = load({ locale, status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: [], urls: [] } } })
+    const offPage = await mount(React.createElement(off.api.testing.AllowTab))
+    await flush()
+    collect(offPage)
+    offPage.unmount()
+    const missing = keys.filter((key) => !seen.has(key))
+    assert.ok(missing.length === 0, `${locale} does not render: ${missing.join(', ')}`)
+  }
+  // This block is the only writer: the tab's polls stay GETs plus the single listen POST.
+  const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
+  const page = await mount(React.createElement(ui.api.testing.AllowTab))
+  await flush()
+  await act(async () => { await planSelect(page).props.onChange({ target: { value: 'tailscale' } }) })
+  assert.deepEqual([...new Set(ui.calls.map((call) => `${call.method} ${call.route}`))].sort(),
+    ['GET /mgw/devices', 'GET /mgw/pending', 'GET /mgw/status', 'POST /mgw/listen'])
   page.unmount()
 })
 

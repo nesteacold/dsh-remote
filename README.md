@@ -233,11 +233,27 @@ Host if you want a guard rail; they are not there by default.
 ## Reachable from another machine
 
 The gateway binds `127.0.0.1` out of the box, so a fresh install can only be
-used by the machine it runs on. That is intentional — but it is also the first
-thing that stops people, so the Devices page now says it out loud and tells you
-where the setting lives.
+used by the machine it runs on. That is intentional, and it is also the first
+thing that stops people, so the Devices page says it out loud and lets you fix
+it from there.
 
-To use it from elsewhere, set the listen address in the gateway config:
+Open Settings → Devices and pick a **Connection plan**:
+
+- **Loopback** — only this machine. The default.
+- **LAN** — the first private address the operating system reports. Not
+  necessarily your home network: on a machine with a VPN or a WireGuard/Docker
+  adapter, that adapter can be reported first, so the page shows the address it
+  actually bound and says so when it is not a plain household LAN.
+- **Tailscale** — this machine's Tailscale address, if one is detected. This is
+  the one to use: reachable from your own devices, invisible to everyone else,
+  and no router configuration. The page shows the `wss://` URL to paste into the
+  app once the switch is done.
+
+Whichever you pick, the page shows the address the listener really took, and the
+choice is remembered across restarts as long as the machine still owns that
+address. Picking nothing exposes nothing — the default stays loopback.
+
+If you would rather pin it in the profile, one config block does the same:
 
 ```yaml
 - id: mobile-gateway
@@ -248,17 +264,22 @@ To use it from elsewhere, set the listen address in the gateway config:
     lanPort: 30081
 ```
 
-A Tailscale address is the better default: reachable from your own devices,
-invisible to everyone else, and no router configuration.
+If `30081` is already taken, the listener moves to the next free port by itself
+and says so in the log. The page also warns when the port sits inside the
+operating system's dynamic range, where an outbound connection can take it at
+any moment.
 
 **The certificate does not need to be regenerated when the address changes.**
 The client pins the leaf hash and never compares hostnames, so the SANs of the
-existing certificate are irrelevant.
+existing certificate are irrelevant. Switching does drop the listener for a
+moment and does not cut off a connection that is already open — it is a move,
+not a kill switch. Turning the gateway off is the kill switch.
 
 ## Troubleshooting
 
-**"Only this machine can connect"** — the gateway is bound to loopback. Set
-`lanHost` as above and reload the plugin.
+**"Only this machine can connect"** — the gateway is bound to loopback. Pick a
+Connection plan on the Devices page, or set `lanHost` as above and reload the
+plugin.
 
 **My change to the plugin did nothing** — toggle the plugin in Settings →
 Plugins, or restart DSH. A file edit alone is not enough.
@@ -289,7 +310,7 @@ when both are present.
 ## Tests
 
 ```bash
-cd plugins/devices && npm test                 # 15 suites, includes a real in-process gateway
+cd plugins/devices && npm test                 # 14 suites, includes a real in-process gateway
 cd plugins/mobile-gateway && node --test --test-isolation=none test/remote-bridge.test.mjs
 cd apps/mobile-companion && npm test
 ```

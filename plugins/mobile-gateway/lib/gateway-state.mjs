@@ -22,6 +22,14 @@ export function createGatewayState(file) {
     if (value.webrtc !== undefined) normalizeTransportConfig(value.webrtc)
     if (value.tailscaleUrl !== undefined && typeof value.tailscaleUrl !== 'string') throw new Error('invalid Tailscale address')
     if (value.p2pUrl !== undefined && typeof value.p2pUrl !== 'string') throw new Error('invalid P2P address')
+    // Optional, so `version` stays 1: a file written before the Devices page could
+    // pick a listen address still validates, and a file carrying one stays
+    // readable by the older shape. The address itself is validated by the caller
+    // (the same loopback/private/IP rule the config enforces).
+    if (value.listenHost !== undefined
+      && (typeof value.listenHost !== 'string' || value.listenHost === '' || value.listenHost.length > 255)) {
+      throw new Error('invalid listen host')
+    }
     return value
   }
   const read = () => validate(JSON.parse(fs.readFileSync(file, 'utf8')))
@@ -60,6 +68,16 @@ export function createGatewayState(file) {
     get webrtc() { return state.webrtc },
     get p2pUrl() { return state.p2pUrl || '' },
     get tailscaleUrl() { return state.tailscaleUrl || '' },
+    // The listen address the owner picked on the Devices page (POST /mgw/listen).
+    // Empty means "no choice was made": the configured `lanHost` stays in force.
+    get listenHost() { return state.listenHost || '' },
+    setListenHost(host) {
+      if (typeof host !== 'string' || host === '' || host.length > 255) throw new TypeError('invalid listen host')
+      const next = { ...state, listenHost: host }
+      validate(next)
+      write(next)
+      state = next
+    },
     setConnection(route, webrtc, p2pUrl = state.p2pUrl || '', tailscaleUrl = state.tailscaleUrl || '') {
       if (!PAIRING_ROUTES.includes(route)) throw new TypeError('invalid pairing route')
       const next = { ...state, pairingRoute: route, webrtc: normalizeTransportConfig(webrtc), p2pUrl, tailscaleUrl }

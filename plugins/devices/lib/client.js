@@ -123,6 +123,27 @@ window.__ModuleLoader__.load({
         reachableTitle: 'Reachable from other machines',
         reachableNote: 'This Host accepts connections at',
         reachableTailscale: 'That is one of this machine\'s Tailscale addresses, so other devices on your tailnet can connect.',
+        // --- spec 008: a listener port the OS dynamic range can hand to an outbound connection ---
+        portRiskTitle: 'This port can be taken by the operating system',
+        portRiskBody: 'The operating system can hand this port to an outgoing connection, so the listener may fail to bind at a random moment.',
+        portRiskSafeBand: 'Ports 20000-39999 sit outside the dynamic range and are the safe band.',
+        portRiskAuto: 'The gateway now moves to the next free port by itself when the bind fails, so this is not fatal.',
+        portBusyTitle: 'The port is already taken',
+        portBusyBody: 'Another program holds this port, or an outgoing connection already took the same port from the operating system dynamic range. That busy port is why the listener cannot bind.',
+        // --- spec 008: the connection plan — bind the listener to one of this machine's own addresses ---
+        planTitle: 'Connection plan',
+        planHelp: 'Bind this machine\'s gateway to one of its own addresses. The Tailscale option uses this machine\'s tailnet address, so the devices on your tailnet can connect.',
+        // The LAN option is the first private address the OS reports, in Node's
+        // interface order — a VPN or virtual adapter can win over the physical LAN.
+        planLanCaveat: 'LAN binds the first private address the operating system reports. A VPN or virtual adapter may be chosen before the physical LAN adapter; if that is not the address you want, use the Tailscale option or set the listen address in the gateway config.',
+        planBound: 'Bound to',
+        planPrivateHint: 'This is a private or virtual address, not necessarily your home LAN:',
+        'plan.loopback': 'This machine only',
+        'plan.lan': 'LAN',
+        'plan.tailscale': 'Tailscale private network',
+        planApplying: 'Applying…',
+        planUnknown: 'Unknown — the gateway reports no address',
+        planTailscaleUnavailable: 'No Tailscale interface detected on this machine.',
         otpTitle: 'Pairing code',
         otpHelp: 'Type this code on the other device together with this address. It works once, for 10 minutes, and you will still have to approve the request here.',
         otpNew: 'Generate pairing code',
@@ -307,6 +328,25 @@ window.__ModuleLoader__.load({
         reachableTitle: 'Máy khác có thể kết nối',
         reachableNote: 'Host này nhận kết nối tại',
         reachableTailscale: 'Đây là một địa chỉ Tailscale của máy này, nên các thiết bị khác trong tailnet của bạn kết nối được.',
+        // --- spec 008: cổng mà dải động của hệ điều hành có thể cấp cho kết nối đi ra ---
+        portRiskTitle: 'Cổng này có thể bị hệ điều hành lấy mất',
+        portRiskBody: 'Hệ điều hành có thể cấp cổng này cho một kết nối đi ra, nên listener có thể không bind được vào một lúc ngẫu nhiên.',
+        portRiskSafeBand: 'Cổng 20000-39999 nằm ngoài dải động và là dải an toàn.',
+        portRiskAuto: 'Gateway giờ tự chuyển sang cổng trống kế tiếp khi bind thất bại, nên đây không phải lỗi nghiêm trọng.',
+        portBusyTitle: 'Cổng đã bị chiếm',
+        portBusyBody: 'Một chương trình khác đang giữ cổng này, hoặc một kết nối đi ra đã lấy đúng cổng đó từ dải động của hệ điều hành. Cổng bị chiếm là lý do listener không bind được.',
+        // --- spec 008: kế hoạch kết nối — gắn listener vào một địa chỉ của chính máy này ---
+        planTitle: 'Kế hoạch kết nối',
+        planHelp: 'Gắn gateway của máy này vào một địa chỉ của chính nó. Tuỳ chọn Tailscale dùng địa chỉ tailnet của máy này, nên các thiết bị trong tailnet của bạn kết nối được.',
+        planLanCaveat: 'LAN gắn vào địa chỉ riêng đầu tiên mà hệ điều hành báo cáo. Một adapter VPN hoặc mạng ảo có thể được chọn trước adapter LAN thật; nếu đó không phải địa chỉ bạn muốn, hãy dùng tuỳ chọn Tailscale hoặc đặt địa chỉ lắng nghe trong cấu hình gateway.',
+        planBound: 'Đang gắn vào',
+        planPrivateHint: 'Đây là địa chỉ riêng hoặc mạng ảo, không hẳn là LAN trong nhà bạn:',
+        'plan.loopback': 'Chỉ máy này',
+        'plan.lan': 'LAN',
+        'plan.tailscale': 'Mạng riêng Tailscale',
+        planApplying: 'Đang áp dụng…',
+        planUnknown: 'Chưa rõ — gateway chưa báo địa chỉ',
+        planTailscaleUnavailable: 'Không phát hiện giao diện Tailscale trên máy này.',
         otpTitle: 'Mã ghép đôi',
         otpHelp: 'Nhập mã này trên thiết bị kia cùng với địa chỉ này. Chỉ dùng một lần, trong 10 phút, và bạn vẫn phải phê duyệt yêu cầu tại đây.',
         otpNew: 'Tạo mã ghép đôi',
@@ -694,6 +734,106 @@ window.__ModuleLoader__.load({
       const full = String(value || '')
       return full.length <= 29 ? full : `${full.slice(0, 17)}…${full.slice(-11)}`
     }
+    // A listener inside the OS dynamic (ephemeral) port range competes with the
+    // source port of an outbound connection, so its bind can fail at a random
+    // moment. The boundaries are the measured range on the machine this was built
+    // for (1024-15000 inclusive) and the Windows default (49152-65535 inclusive),
+    // not a universal guarantee — 15001-49151 stays quiet because neither range
+    // covers it.
+    const RISKY_PORT_BELOW = 15000
+    const RISKY_PORT_ABOVE = 49152
+    const isRiskyListenerPort = (port) => Number.isInteger(port) && port > 0 &&
+      (port <= RISKY_PORT_BELOW || port >= RISKY_PORT_ABOVE)
+
+    // The three plans this build can really apply, and the only targets
+    // POST /mgw/listen accepts. Cloudflare/P2P are hard-disabled in this fork, so
+    // they are not offered: a dead option in a dropdown is a lie.
+    const PLAN_TARGETS = ['loopback', 'lan', 'tailscale']
+    // Tailscale hands out 100.64.0.0/10 (CGNAT); IPv6 tailnet addresses only ever
+    // come from `tailscale.addresses`, which the gateway itself detected.
+    const TAILSCALE_IPV4 = /^100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$/
+    const isTailscaleHost = (host, addresses) => {
+      const value = String(host || '').replace(/^\[|\]$/g, '')
+      if (!value) return false
+      if (TAILSCALE_IPV4.test(value)) return true
+      return (addresses || []).some((address) => String(address).replace(/^\[|\]$/g, '') === value)
+    }
+    // The current plan is DERIVED from status, never remembered: the select must
+    // not be able to show a plan the listener is not on. '' = status says nothing,
+    // which disables the control instead of guessing.
+    const planOf = (status) => {
+      const host = status && status.lan && typeof status.lan.host === 'string' ? status.lan.host : ''
+      if (!host) return ''
+      if (isLoopbackHost(host)) return 'loopback'
+      return isTailscaleHost(host, status.tailscale && status.tailscale.addresses) ? 'tailscale' : 'lan'
+    }
+
+    // The connection plan used to be static plugin config (`lanHost`), which meant
+    // editing config and restarting to reach this machine over Tailscale. This is
+    // the one write on the tab: POST /mgw/listen rebinds the live listener.
+    function ConnectionPlan({ status, onApplied }) {
+      useLang()
+      const [applying, setApplying] = React.useState('')
+      const [error, setError] = React.useState('')
+      // A ref, not `applying`: two selections in the same tick would both read the
+      // old state and fire two rebinds, so the guard has to be synchronous.
+      const inFlight = React.useRef(false)
+      const addresses = (status && status.tailscale && status.tailscale.addresses) || []
+      const urls = (status && status.tailscale && status.tailscale.urls) || []
+      const plan = planOf(status)
+      const tailscaleOff = addresses.length === 0
+      // The bind the listener is really on, stated next to the control that chose it:
+      // the owner should see "here is what you got", not find it in the card below.
+      // `status.lan` moves on apply (onApplied) and on every poll, so both paths show it.
+      const lan = (status && status.lan) || {}
+      const boundHost = typeof lan.host === 'string' ? lan.host : ''
+      const bound = listenerBind(lan)
+      const privateHost = boundHost && !isLoopbackHost(boundHost) &&
+        !isTailscaleHost(boundHost, addresses)
+      const choose = async (target) => {
+        if (inFlight.current || !plan || !target) return
+        inFlight.current = true
+        setApplying(target); setError('')
+        try {
+          const data = await post('/mgw/listen', { target })
+          // The response carries the new bind, so the card below is already right
+          // (address, URLs, pin) before the next status poll.
+          if (onApplied) onApplied(data)
+        } catch (cause) {
+          // Nothing local moves on failure: the select falls back to the plan status reports.
+          setError(cause.message)
+        } finally { inFlight.current = false; setApplying('') }
+      }
+      return h('div', { className: 'dshdev-card', 'data-testid': 'connection-plan' },
+        h('h3', null, tr('planTitle')),
+        h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('planHelp')),
+        h('div', { className: 'dshdev-row' },
+          h('select', {
+            className: 'dshdev-input', style: { maxWidth: 260 }, 'data-testid': 'plan-select',
+            'aria-label': tr('planTitle'), value: applying || plan, disabled: !plan || !!applying,
+            onChange: (event) => choose(event.target.value),
+          },
+            plan ? null : h('option', { value: '' }, tr('planUnknown')),
+            PLAN_TARGETS.map((target) => h('option', {
+              key: target, value: target, disabled: target === 'tailscale' && tailscaleOff,
+            }, tr(`plan.${target}`)))),
+          applying ? h('span', { className: 'dshdev-muted', 'data-testid': 'plan-applying' }, tr('planApplying')) : null),
+        // Honest consent: what "LAN" means here, and the address it actually produced.
+        h('div', { className: 'dshdev-muted', style: { marginTop: 6 }, 'data-testid': 'plan-lan-caveat' }, tr('planLanCaveat')),
+        bound ? h('div', { className: 'dshdev-row', style: { marginTop: 6 }, 'data-testid': 'plan-bound' },
+          h('span', { className: 'dshdev-muted' }, tr('planBound')),
+          h('code', { className: 'dshdev-chip' }, bound)) : null,
+        privateHost ? h('div', { className: 'dshdev-muted', 'data-testid': 'plan-private-hint' },
+          `${tr('planPrivateHint')} ${boundHost}`) : null,
+        // The point of the feature: the Tailscale address the gateway is now on.
+        urls.length > 0 ? h('div', { className: 'dshdev-row', style: { marginTop: 8 }, 'data-testid': 'plan-tailscale-urls' },
+          h('span', { className: 'dshdev-muted' }, tr('address')),
+          urls.map((url) => h('code', { key: String(url), className: 'dshdev-chip' }, String(url)))) : null,
+        addresses.length > 0 ? h('div', { className: 'dshdev-muted', 'data-testid': 'plan-tailscale-addresses' },
+          addresses.map(String).join(' · ')) : null,
+        tailscaleOff ? h('div', { className: 'dshdev-muted', 'data-testid': 'plan-tailscale-unavailable' }, tr('planTailscaleUnavailable')) : null,
+        error ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'plan-error' }, error) : null)
+    }
 
     function ListeningOn({ lan, tailscale }) {
       useLang()
@@ -703,6 +843,17 @@ window.__ModuleLoader__.load({
       const up = info.enabled !== false && info.listening === true
       const loopback = up && isLoopbackHost(host)
       const tailscaleAddresses = (tailscale && tailscale.addresses) || []
+      // A port the OS may already have handed out, or a bind that failed on a busy
+      // one (EADDRINUSE), gets one plain explanation; a quiet port gets no row.
+      const port = Number.isInteger(info.port) && info.port > 0 ? info.port : null
+      const portRisk = isRiskyListenerPort(port)
+      const portBusy = !up && /EADDRINUSE/.test(String(info.error || ''))
+      const riskNote = portRisk || portBusy ? h('div', { className: 'dshdev-banner', 'data-testid': 'listener-port-risk' },
+        h('div', null,
+          h('strong', null, tr(portBusy ? 'portBusyTitle' : 'portRiskTitle')),
+          h('div', null, tr(portBusy ? 'portBusyBody' : 'portRiskBody')),
+          portRisk ? h('div', null, tr('portRiskSafeBand')) : null,
+          h('div', null, tr('portRiskAuto')))) : null
       return h('div', { className: 'dshdev-card', 'data-testid': 'listening-on' },
         h('div', { className: 'dshdev-row' },
           h('h3', { className: 'dshdev-grow', style: { margin: 0 } }, tr('listeningOn')),
@@ -710,6 +861,7 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dshdev-row', style: { marginTop: 6 } },
           h('code', { className: 'dshdev-chip', 'data-testid': 'listener-bind' }, bind || tr('listenerUnknown'))),
         info.error ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'listener-error' }, String(info.error)) : null,
+        riskNote,
         info.certSha256 ? h('div', { className: 'dshdev-row', style: { marginTop: 6 } },
           h('span', { className: 'dshdev-muted' }, tr('certPin')),
           h('code', { className: 'dshdev-muted', 'data-testid': 'listener-pin', title: String(info.certSha256) }, shortenHash(info.certSha256))) : null,
@@ -798,6 +950,15 @@ window.__ModuleLoader__.load({
         try { await post(`/mgw/devices/${encodeURIComponent(device.id)}/revoke`); await refresh() } catch (cause) { setError(cause.message) }
       }
 
+      // /mgw/listen answers with the bind it applied, so the card below is correct
+      // at once instead of waiting up to 3 s for the next status poll.
+      const applyPlan = (next) => setStatus((prev) => {
+        const merged = { ...(prev || {}) }
+        if (next && next.lan) merged.lan = next.lan
+        if (next && next.tailscale) merged.tailscale = next.tailscale
+        return merged
+      })
+
       const addresses = (status && status.lan && status.lan.listening ? status.lan.urls || [] : [])
         .map((url) => { try { return new URL(url).host } catch { return '' } }).filter(Boolean)
 
@@ -852,6 +1013,7 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy, onClick: () => generate(editing.scopes) }, tr('editSave')),
             h('button', { type: 'button', className: 'dshdev-btn', onClick: () => setEditing(null) }, tr('cancel')))) : null,
         pairing && editing ? h(PairingBox, { pairing }) : null,
+        h(ConnectionPlan, { status, onApplied: applyPlan }),
         h(ListeningOn, { lan: status && status.lan, tailscale: status && status.tailscale }),
         h(AdvancedLimits, { limits: status && status.remoteBridgeLimits }))
     }

@@ -1245,6 +1245,7 @@ DSH Web 的“深度求索中，用时 22 秒 ···”是客户端文案，不�
 - `/ws/mobile` 的移动网关默认关闭；本机 WebUI 手动开启后，若 5 分钟内没有设备成功连接会自动关闭
 - 网关开启后仍要求已配对设备凭证；不要把 `requireAuth` 设为 `false` 后暴露到网络
 - `/mgw/*` 是配对/吊销管理面，默认只允许本机访问；公网代理只应转发 `/ws/mobile`
+- `POST /mgw/listen` 由 Devices 页切换插件 TLS 监听地址：写操作除了本机来源和同源之外，还要求 `Host` 为本机回环地址（`127.0.0.1`、`localhost`、`[::1]`，可带端口），`Origin` 存在时必须与其 `Host` 一致且为 `http`/`https`，否则返回 `403`。重新绑定会短暂中断该监听器（旧 socket 先关闭再绑定新地址），并且不会切断已升级的 WebSocket 连接：旧地址上的设备会继续存活，直到自行断开或网关关闭。并发的两个调用会排队依次生效。只有在绑定成功且已持久化之后，`status.lan.host` 才等于已保存的 `listenHost`；若绑定成功但写入网关状态文件失败，应答为 `persists: false`，新地址在当前进程中继续生效（`status.lan.host`、运行时 `lanHost` 选项和公告的 `wss://` 地址都已指向新地址），而已保存的 `listenHost` 仍是旧值，重新启动后监听器会回到那个旧地址。
 - `/mgw/public-setup` 已移除：网关不再注册该路由（`GET` 与 `POST` 均返回 `404`），也不再连接 root Helper 的 Unix Socket（`HELPER_SOCKET`），因此没有任何一键公网配置能力。`bin/setup-ip.mjs` 仍随包发布，但除 `--help` 外一律以 `1` 退出，不经 root、包管理器、文件或云元数据步骤
 - DSH HTTP Server 本身没有 TLS、认证或 Origin policy；公网必须使用 TLS 反向代理和 `wss://`
 - 长期 token 只保存在 iOS Keychain；服务端磁盘仅保存摘要
