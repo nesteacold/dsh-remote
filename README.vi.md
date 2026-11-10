@@ -301,6 +301,20 @@ cd plugins/mobile-gateway && node --test --test-isolation=none test/remote-bridg
 cd apps/mobile-companion && npm test
 ```
 
+`--test-isolation=none` không phải tuỳ chọn trên Windows: chế độ isolation mặc
+định ở đó chết với `EPERM`.
+
+Trước khi tin cây này đủ, kiểm tra:
+
+```bash
+node tools/verify-publish.mjs
+```
+
+Nó resolve mọi import tương đối trong các package được publish và kiểm tra từng
+file test mà `npm test` nhắc tới có tồn tại. Script này có vì repo từng publish
+thiếu sáu module phía Host chưa bao giờ được commit ở upstream: phần client cài
+bình thường, còn gateway thì không khởi động được.
+
 Phần ghép đôi có test hồi quy cố tình dùng chứng chỉ do một CA mà client không hề
 nhận — nên test sẽ fail trên bất kỳ runtime nào quyết định tin cậy bằng cách xây
 chuỗi thay vì bằng mã ghim.

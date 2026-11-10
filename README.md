@@ -315,6 +315,20 @@ cd plugins/mobile-gateway && node --test --test-isolation=none test/remote-bridg
 cd apps/mobile-companion && npm test
 ```
 
+`--test-isolation=none` is not optional on Windows: the default isolation fails
+with `EPERM` there.
+
+Before trusting this tree, check that it is complete:
+
+```bash
+node tools/verify-publish.mjs
+```
+
+It resolves every relative import in the shipped packages and checks that each
+test file named by `npm test` exists. It exists because this repo once shipped
+without six Host-side modules that had never been committed upstream, which made
+the gateway impossible to start while the client half installed fine.
+
 The pairing code has a regression test that seeds a leaf issued by a CA the
 client never receives, so the test fails on any runtime that decides trust by
 chain building rather than by the pin.
