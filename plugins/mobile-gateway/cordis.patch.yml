@@ -62,4 +62,4 @@
 # a non-insert patch assigns the target's whole `config`, so the gateway would
 # override DSH's `openAt: never` default for every profile that installs it.
 # Enabling the full-text session index is the owner's own patch-layer choice;
-# see README.md ("Optional: Full-Text Session Search").
+# see the repository README ("Optional: Full-Text Session Search").

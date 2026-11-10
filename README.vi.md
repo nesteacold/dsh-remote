@@ -42,6 +42,11 @@ Mặc định mọi thứ chỉ nghe trên loopback. Bạn chưa bật thì máy
 |---|---|
 | `plugins/devices/` | `@dsh-ext/devices` — trang Devices, client ghim chứng chỉ, phần nối vào sidebar và khung chat |
 | `plugins/mobile-gateway/` | `@dsh-ext/mobile-gateway` — gateway phía Host: TLS listener, ghép đôi, sổ thiết bị, cầu nối remote |
+
+Gateway là bản fork đã gia cố của một dự án upstream, và ở đây nó **không kèm giao
+diện riêng**: toàn bộ route quản lý của nó do trang Devices điều khiển. App mobile
+của upstream — lý do ban đầu gateway này ra đời — nằm ở repo riêng của họ; phần ghi
+công ở [NOTICE](NOTICE.md) được giữ nguyên văn vì code upstream là MIT.
 | `packages/mobile-protocol/` | `@dsh-ext/mobile-protocol` — hợp đồng wire dùng chung |
 | `apps/mobile-companion/` | `@dsh-ext/mobile-companion` — app điện thoại (React Native + Expo) |
 | `specs/` | ghi chép thiết kế và task của các phần trên |

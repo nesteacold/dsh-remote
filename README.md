@@ -44,6 +44,12 @@ machine until you say so.
 |---|---|
 | `plugins/devices/` | `@dsh-ext/devices` — the Devices page, the outbound pinned client, the sidebar/conversation integration |
 | `plugins/mobile-gateway/` | `@dsh-ext/mobile-gateway` — the Host-side gateway: TLS listener, pairing, device registry, remote bridge |
+
+The gateway is a hardened fork of an upstream project and ships **no interface of
+its own** here: its management routes are driven by the Devices page. The
+upstream mobile client, which this gateway was originally written for, lives in
+its own repository — see [NOTICE](NOTICE.md) for the attribution, which is kept
+verbatim because the code is MIT-licensed upstream.
 | `packages/mobile-protocol/` | `@dsh-ext/mobile-protocol` — the wire contract both sides share |
 | `apps/mobile-companion/` | `@dsh-ext/mobile-companion` — the phone app (React Native + Expo) |
 | `specs/` | the design and task records for the pieces above |

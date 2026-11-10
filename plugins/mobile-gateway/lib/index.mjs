@@ -3815,7 +3815,7 @@ const plugin = {
               platform: process.platform,
               // T031 (FR-011/R9): the tunnel wiring is removed from this file and
               // lib/cloudflare-tunnel.mjs refuses at call time. The shape stays
-              // because lib/client.js reads it for the connection plan.
+              // because the Devices page reads it for the connection plan.
               cloudflare: { supported: false, enabled: false, mode: null, state: 'disabled', publicReady: false, publicUrl: null, hardDisabled: true },
               webrtc: rtc.snapshot(),
               pairingRoute,
