@@ -90,8 +90,8 @@ your sidebar.
 sequenceDiagram
     autonumber
     participant You
-    participant Host as Remote DSH Host<br/>(gateway on :3081)
-    participant Local as This DSH<br/>(Devices page)
+    participant Host as Remote DSH Host<br/>gateway :3081
+    participant Local as This DSH<br/>Devices page
 
     You->>Host: Settings → Devices → "Pair a device"
     Host-->>You: 8-digit code (valid 10 min)
@@ -118,7 +118,7 @@ This is the same thing from the other side, and it is how the phone app works.
 sequenceDiagram
     autonumber
     participant Guest as Other machine / phone
-    participant You as This DSH (Host)
+    participant You as This DSH Host
 
     You->>You: Settings → Devices → Show a pairing code
     You-->>Guest: read the 8 digits out loud, or scan
@@ -142,7 +142,7 @@ and gets the same scope model.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Phone as Phone (Expo app)
+    participant Phone as Phone<br/>Expo app
     participant Host as DSH Host
 
     Host->>Phone: 8-digit code (shown in Devices)

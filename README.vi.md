@@ -86,8 +86,8 @@ Máy kia chạy DSH. Ghép đôi một lần, phiên của nó hiện trong side
 sequenceDiagram
     autonumber
     participant Ban as Bạn
-    participant Host as DSH Host (máy kia)<br/>gateway :3081
-    participant Local as DSH này<br/>(trang Devices)
+    participant Host as DSH Host máy kia<br/>gateway :3081
+    participant Local as DSH này<br/>trang Devices
 
     Ban->>Host: Settings → Devices → "Pair a device"
     Host-->>Ban: mã 8 số (hiệu lực 10 phút)
@@ -114,7 +114,7 @@ Cùng việc đó nhìn từ phía bên kia — và đây là cách app điện 
 sequenceDiagram
     autonumber
     participant Khach as Máy khác / điện thoại
-    participant Ban as DSH này (Host)
+    participant Ban as DSH này Host
 
     Ban->>Ban: Settings → Devices → hiện mã ghép đôi
     Ban-->>Khach: đọc 8 số, hoặc quét mã
@@ -137,7 +137,7 @@ và dùng đúng mô hình quyền đó.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant Phone as Điện thoại (Expo)
+    participant Phone as Điện thoại<br/>Expo
     participant Host as DSH Host
 
     Host->>Phone: mã 8 số (hiện trong Devices)
