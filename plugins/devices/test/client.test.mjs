@@ -30,6 +30,9 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     // POST /mgw/listen: one queued failure, and an optional gate a test holds to
     // observe the in-flight state before the rebind answers.
     listenFailure: listenFailure ?? null, listenGate: null,
+    // POST /devices/remotes/:id/connect: same two levers, so a test can see the row
+    // while the dial is in flight and the reason the route answers with.
+    connectGate: null, connectFailure: null,
   }
   const fetch = async (url, options = {}) => {
     const target = new URL(url)
@@ -76,6 +79,16 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     if (/^\/mgw\/devices\/.+\/revoke$/.test(route)) return reply({ revoked: true })
     if (route === '/devices/remotes' && (options.method ?? 'GET') === 'GET') return reply({ remotes: state.remotes })
     if (route === '/devices/remotes' && options.method === 'POST') return reply({ remote: { id: 'r-new' } })
+    if (/^\/devices\/remotes\/[^/]+\/connect$/.test(route) && options.method === 'POST') {
+      if (state.connectGate) await state.connectGate
+      if (state.connectFailure) {
+        const failure = state.connectFailure
+        state.connectFailure = null
+        return reply(failure.body, false, failure.status)
+      }
+      const id = route.split('/')[3]
+      return reply({ remote: state.remotes.find((entry) => entry.id === id) ?? null, state: 'online' })
+    }
     if (/\/sessions$/.test(route)) return reply({ sessions: sessions ?? [{ sessionId: 's1', projections: { values: { title: 'Fix the build' } } }], approvals: state.remotes[0]?.approvals ?? [] })
     if (/\/history\?/.test(route)) return reply({ history: { kind: 'history', items: [{ seq: 1, role: 'user', text: 'hello remote' }] } })
     if (/\/prompt$/.test(route)) return reply({ sent: { kind: 'sent' } })
@@ -486,6 +499,76 @@ await check('a per-host refusal is shown on the remote row; the log line stays t
   assert.match(text(page), /auth\/forbidden-scope/)
   assert.match(text(page), /harness:remote/)
   assert.ok(text(page).includes(ui.api.testing.DICT.en.hostRefused))
+  page.unmount()
+})
+
+await check('connect tab: a remote row can Reconnect without opening a session — one POST, the in-flight label, then the list re-reads; a revoked row has no button', async () => {
+  // The chip's Reconnect only exists inside an open remote session, and Open reached the
+  // host only as a side effect of the detail view; the row is the one-click path a user
+  // has while the link is down.
+  const remotes = [
+    { id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'offline', approvals: [] },
+    { id: 'r2', name: 'Old', address: '192.168.1.31:3081', status: 'revoked', approvals: [] },
+  ]
+  const ui = load({ remotes })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  const reconnects = () => find(page, (node) => node.type === 'button' && node.props['data-testid'] === 'remote-reconnect')
+  const posts = () => ui.calls.filter((call) => call.method === 'POST' && call.route === '/devices/remotes/r1/connect')
+  assert.equal(reconnects().length, 1, 'one Reconnect: the row that is not revoked')
+  assert.equal(reconnects()[0].children.join(''), DICT.en.reconnect, 'the existing label, not a new string')
+  assert.equal(find(page, (node) => node.type === 'button' && node.children.join('') === DICT.en.reconnect).length, 1,
+    'this view shows that label once, not once per row')
+  assert.equal(reconnects()[0].props.disabled, false)
+  assert.equal(ui.calls.filter((call) => /\/sessions$/.test(call.route)).length, 0, 'no session was opened to reach it')
+  const intervalsBefore = ui.intervals.size
+  let release
+  ui.state.connectGate = new Promise((resolve) => { release = resolve })
+  await act(async () => { reconnects()[0].props.onClick({ preventDefault() {}, target: {} }) })
+  assert.equal(posts().length, 1, 'one click, one POST')
+  assert.deepEqual(posts()[0].body, {})
+  assert.equal(reconnects()[0].children.join(''), DICT.en.reconnecting, 'the row says it is dialling')
+  assert.equal(reconnects()[0].props.disabled, true, 'and cannot be pressed again while in flight')
+  // The Host now reports the link up: the tab's own refresh (not an added poll) shows it.
+  ui.state.remotes = remotes.map((remote) => (remote.id === 'r1' ? { ...remote, status: 'online' } : remote))
+  ui.calls.length = 0
+  await act(async () => { release(); await new Promise((resolve) => setImmediate(resolve)) })
+  assert.match(text(page), /Online/, 'the row re-read its state after the dial')
+  assert.equal(ui.calls.filter((call) => call.route === '/devices/remotes').length, 1, 'the list this tab already polls, once')
+  assert.equal(ui.intervals.size, intervalsBefore, 'no poll was added')
+  assert.equal(reconnects()[0].children.join(''), DICT.en.reconnect, 'the label is back once it settles')
+  page.unmount()
+})
+
+await check('connect tab: a failed Reconnect keeps the route\'s reason on that row (message or code), never a console line', async () => {
+  const ui = load({ remotes: [{ id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'offline', approvals: [] }] })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const reconnects = () => find(page, (node) => node.type === 'button' && node.props['data-testid'] === 'remote-reconnect')
+  const shown = () => find(page, (node) => node.props['data-testid'] === 'remote-reconnect-error')
+  ui.state.connectFailure = { status: 409, body: { error: 'remote/host-offline', message: 'Laptop is offline; the link was not re-established' } }
+  await click(reconnects()[0])
+  assert.equal(shown().length, 1, 'the reason is on the page')
+  assert.equal(shown()[0].props.role, 'alert')
+  assert.equal(shown()[0].children.join(''), 'Laptop is offline; the link was not re-established')
+  assert.equal(reconnects()[0].props.disabled, false, 'the row stays usable for another try')
+  // A route that answers with a code alone still reaches the user.
+  ui.state.connectFailure = { status: 502, body: { error: 'unreachable' } }
+  await click(reconnects()[0])
+  assert.equal(shown()[0].children.join(''), 'unreachable')
+  page.unmount()
+})
+
+await check('connect tab: the row Reconnect renders in vi too, and the two dictionaries stay twins', async () => {
+  const ui = load({ locale: 'vi', remotes: [{ id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'offline', approvals: [] }] })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  const reconnects = () => find(page, (node) => node.type === 'button' && node.props['data-testid'] === 'remote-reconnect')
+  assert.equal(reconnects()[0].children.join(''), DICT.vi.reconnect)
+  assert.notEqual(DICT.vi.reconnect, DICT.en.reconnect, 'a real translation, not a copy')
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort())
   page.unmount()
 })
 

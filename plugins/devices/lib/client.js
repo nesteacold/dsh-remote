@@ -1249,10 +1249,31 @@ window.__ModuleLoader__.load({
       const [remotes, setRemotes] = React.useState([])
       const [openId, setOpenId] = React.useState('')
       const [error, setError] = React.useState('')
+      const [connecting, setConnecting] = React.useState('')
+      const [connectError, setConnectError] = React.useState(null)
       const mounted = React.useRef(true)
       const refresh = React.useCallback(async () => {
         try { const data = await request('/devices/remotes'); if (mounted.current) setRemotes(data.remotes || []) } catch (cause) { if (mounted.current) setError(cause.message) }
       }, [])
+      // The chip's Reconnect lives in a popover that exists only inside an already open
+      // remote session, and the row's Open only dials the host as a side effect of
+      // RemoteDetail's sessions read. So a dead link had no explicit retry here, which is
+      // exactly when one is needed: the row dials through the same route the chip uses,
+      // one click from this tab and without opening a session. The chip and this row never
+      // render in one view, so there is never a second Reconnect on screen.
+      const connect = async (remote) => {
+        if (connecting) return
+        setConnecting(remote.id); setConnectError(null)
+        try {
+          await post(`/devices/remotes/${encodeURIComponent(remote.id)}/connect`)
+          // Re-read the list this tab already polls (no new poll): the row's status and
+          // any `hostError` come from the Host's answer, not from our optimistic guess.
+          await refresh()
+        } catch (cause) {
+          // The route's reason is the point of pressing this: keep it on that row.
+          if (mounted.current) setConnectError({ id: remote.id, message: cause.message })
+        } finally { if (mounted.current) setConnecting('') }
+      }
       React.useEffect(() => {
         mounted.current = true
         refresh()
@@ -1282,8 +1303,17 @@ window.__ModuleLoader__.load({
                   ? h('div', { className: 'dshdev-muted', 'data-testid': 'host-refused' },
                     `${tr('hostRefused')} — ${remote.hostError.code}${remote.hostError.scope ? ` (${remote.hostError.scope})` : ''}`)
                   : null,
+                connectError && connectError.id === remote.id
+                  ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'remote-reconnect-error' }, connectError.message)
+                  : null,
                 remote.approvals && remote.approvals.length ? h('div', { className: 'dshdev-badge bad' }, `${tr('approvals')}: ${remote.approvals.length}`) : null),
               h('button', { type: 'button', className: 'dshdev-btn', disabled: remote.status === 'revoked', onClick: () => setOpenId(remote.id) }, tr('open')),
+              // A revoked remote gets no Reconnect at all: pairing again is the only fix, and
+              // the route would answer `auth/revoked`.
+              remote.status === 'revoked' ? null
+                : h('button', { type: 'button', className: 'dshdev-btn', 'data-testid': 'remote-reconnect',
+                  disabled: connecting !== '', onClick: () => connect(remote) },
+                connecting === remote.id ? tr('reconnecting') : tr('reconnect')),
               h('button', { type: 'button', className: 'dshdev-btn danger', onClick: () => remove(remote) }, tr('removeRemote')))))))
     }
 
