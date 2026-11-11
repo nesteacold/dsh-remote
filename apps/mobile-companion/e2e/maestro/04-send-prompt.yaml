@@ -1,0 +1,45 @@
+# 04 — open a session and send a follow-up instruction (US4, A023).
+#
+# SCENARIO: paired (run 02 first). App restart keeps the stored credential, so the gate unlocks
+#           straight into the live session.
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: `session-composer` (the multiline input) and `session-send` (its button). `session-send`
+#        is `disabled` while the composer is empty, so `enabled: true` after `inputText` proves the
+#        text reached the input before the tap — no placeholder matching involved.
+#
+# EXIT CRITERIA:
+#   1. the session screen loads history for `sess-alpha` after `subscribe` + `history`;
+#   2. the composer sends text with a stable `clientMsgId` and the optimistic row appears;
+#   3. the fixture saw exactly one `message` frame for it with a non-empty `clientMsgId`
+#      (asserted by the orchestrator from `GET /state` → `evidence.prompts`).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+  PROMPT_TEXT: E2E follow-up instruction
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/open-session.yaml
+
+# History arrived (fixture serves two rows).
+- assertVisible: ".*Please refactor the TLS listener.*"
+
+# Composer by hook.
+- tapOn:
+    id: "session-composer"
+- inputText: ${PROMPT_TEXT}
+- assertVisible:
+    id: "session-send"
+    enabled: true
+- tapOn:
+    id: "session-send"
+
+# The optimistic row is rendered from the outbox until the host acks it.
+- extendedWaitUntil:
+    visible: ".*${PROMPT_TEXT}.*"
+    timeout: 15000

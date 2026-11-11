@@ -13,6 +13,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { once } = require('node:events')
 const WebSocket = require('ws')
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 const pluginModule = await import('../lib/index.mjs')
 const plugin = pluginModule.default
 // Blocker 2: the interface table and the bind aliases are NOT plugin config —
@@ -163,8 +164,9 @@ async function startLanGateway(lanPort, options = {}) {
       fs.rmSync(temp, { recursive: true, force: true })
       throw error
     }
-    server.listen(0, '127.0.0.1')
-    await once(server, 'listening')
+    // fetch-safe: undici refuses whole classes of ports ("bad port"), and the OS
+    // may hand this listener one; the helper re-binds until `fetch` accepts it.
+    await listenFetchSafe(server)
     webServer.port = server.address().port
     const base = `http://127.0.0.1:${webServer.port}`
     const status = await waitForLanStatus(base)
@@ -426,8 +428,8 @@ async function postWithHeaders(gateway, pathname, body, headers) {
     // T016: the LAN listener is TLS and needs its own certificate directory.
     tlsCertificateDir: path.join(temp, 'tls'),
   })
-  server.listen(0, '127.0.0.1')
-  await once(server, 'listening')
+  // fetch-safe: see test/support/fetch-safe-listen.mjs.
+  await listenFetchSafe(server)
   webServer.port = server.address().port
   const base = `http://127.0.0.1:${webServer.port}`
 

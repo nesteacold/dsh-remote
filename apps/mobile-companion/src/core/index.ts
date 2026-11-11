@@ -10,7 +10,10 @@ export * from './transport';
 export {
   CompanionClient,
   classifyProtocolUnsupported,
+  classifyUpgradeRefusal,
   defaultRequestId,
+  DEFAULT_HANDSHAKE_TIMEOUT_MS,
+  DEFAULT_PAIR_APPROVAL_TIMEOUT_MS,
   DEFAULT_REQUEST_TIMEOUT_MS,
   NO_AUTO_RECONNECT_CLOSE_CODES,
 } from './client';

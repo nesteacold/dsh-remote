@@ -47,6 +47,9 @@ QR/manual text = **unpadded base64url** of UTF-8 JSON (same encoding as upstream
    <install-scoped UUID>` (fallback subprotocol `dsh-device.<id>`). Pairing code in the URL query is rejected.
 3. Server sends once: `{ "kind": "paired", "token": "<device token>", "device": { "id", "name", "createdAt" } }`.
    Client stores the token in the secure store immediately; it is never sent again.
+   **Rev 6 correction:** this frame does NOT arrive immediately on a first pairing. It is sent only after
+   the pairing-proof exchange and after the Host user approves on the desktop — see §3.8. A client that
+   waits for `paired` without answering the challenge will be closed with `4408 pairing/timeout`.
 4. Later connections: header `Authorization: Bearer <token>` (fallback subprotocol `dsh-auth.<token>`).
    Token in the URL query is rejected.
 5. Server sends `hello`:
@@ -88,6 +91,67 @@ bypass it. Close codes: `4004` gateway disabled (stop auto-reconnect), `4003` re
   socket on a shared web server.
 
 
+### 3.8 Pairing proof exchange (revision 6, additive — measured against the live gateway 2026-11-10)
+
+A pairing connection (subprotocol `dsh-pair.<code>`, header `X-DSH-Device-ID`) is a **restricted state
+machine, not a MobileConnection**. This section was missing from revisions 1–5 and its absence made the
+companion unable to pair with the real Host: the client was closed with `op/forbidden` and then
+`4408 pairing/timeout` while every fixture-based test passed.
+
+Immediately after the WebSocket opens, the gateway sends exactly one challenge (it is NOT triggered by
+any client frame):
+
+```json
+{ "kind": "pairing-challenge", "serverNonce": "<base64url, 24 random bytes>", "certSha256": "<64 lowercase hex>", "otpRequired": false }
+```
+
+`certSha256` is the pinned leaf the client just verified. `otpRequired` is `false` for the QR / long
+pairing-string flow and `true` for an OTP flow.
+
+Until this client has been admitted, the ONLY frame it may send is `pairing-proof`. Any other frame is
+refused with `{ "kind": "error", "code": "op/forbidden", "requestType": "<type>", "message": "only the
+pairing proof is accepted before the Host approves" }`; the third refusal closes the socket with **4403**
+and reason `pairing/refused`.
+
+The client MUST answer exactly once:
+
+```json
+{ "type": "pairing-proof", "clientNonce": "<16–64 chars of [A-Za-z0-9_-]>" }
+```
+
+- `clientNonce` is mandatory and MUST match `^[A-Za-z0-9_-]{16,64}$` (≥ 96 bits of randomness
+  RECOMMENDED). A missing or ill-formed nonce closes the socket with **4403**, reason `pairing/bad-nonce`.
+- When the challenge had `otpRequired: true`, `otpProof` is REQUIRED and carries the client's
+  one-time-code proof; a wrong or expired proof closes with **4410**, reason `pairing/expired`.
+- When `otpRequired` is `false` (long pairing string) the string is itself the secret: a well-formed
+  proof reserves it and raises one pending request. `otpProof` MUST be absent.
+
+After a valid proof the socket stays open while the **Host user approves on the desktop**:
+
+```json
+{ "kind": "pairing-pending", "verificationCode": "<short human code>", "requestId": "<id>", "expiresAt": 0 }
+```
+
+`verificationCode` MUST be shown to the user — they compare it with what the desktop displays. `expiresAt`
+is epoch milliseconds; the pending window is **5 minutes**. While pending the client MUST NOT send any
+frame and MUST NOT treat the pairing as failed or as successful: success is only `paired`. **Any client
+handshake deadline that spans this window is a defect** — the approval wait must be governed by its own
+deadline, not by the transport handshake timeout.
+
+On approval the gateway sends `paired` and then `hello` exactly as §3.3 / §3.5, and the `client-hello`
+exchange takes over. On refusal or expiry it sends `{ "kind": "pairing-rejected", "reason": "<reason>" }`
+and closes.
+
+Pairing close codes (additions to the §3 close-code list):
+
+| Code | Reasons (examples) | Meaning | Client behaviour |
+|---|---|---|---|
+| 4403 | `pairing/refused`, `pairing/bad-nonce`, `pairing/busy`, `pairing/disabled` | The Host refused this pairing attempt | Show "rejected"; do not retry automatically |
+| 4408 | `pairing/timeout` | No valid proof before the handshake deadline | Show "timed out"; retry with a fresh code |
+| 4410 | `pairing/expired` | The one-time code or the pending request expired | Show "expired or already used"; a new code is required |
+
+A bare `paired` frame is NOT part of the pairing connection and clients MUST NOT send it.
+
 ## 4. Operations (allowlist `companion-v1`)
 
 The op identity is the `type` value. Anything else → error `op/forbidden`.
@@ -101,13 +165,17 @@ The op identity is the `type` value. Anything else → error `op/forbidden`.
 | `history` | `sessionId`, `beforeSeq?`, `maxMessages?`, `maxBytes?` | `history` | upstream paging |
 | `subscribe` | `sessionId` | `subscribed` | starts `event` pushes + replays pending approvals |
 | `unsubscribe` | — | `unsubscribed` | |
-| `message` | `sessionId`, `text`, `clientMsgId`, `mode?` (`queue`\|`steer`) | `sent` `{sessionId, clientMsgId}` | `sessionId` required (no session creation in v1); idempotent by `clientMsgId` |
+| `message` | `sessionId`, `text`, `clientMsgId`, `mode?` (`queue`\|`steer`) | `sent` `{sessionId, clientMsgId}` | `sessionId` required (this op never creates a session; revision 7 adds `session-create` for that); idempotent by `clientMsgId` |
 | `session-cancel` | `sessionId` | `session-cancelled` `{accepted}` | |
 | `approval-response` | `rpcId`, `sessionId`, `approvalId`, `argsHash`, `outcome` | `approval-response` receipt | §5 |
 | `device-info` | — | `device-info` `{id, name, createdAt}` | |
 | `device-forget` | — | `device-forgotten` | revokes **this** device; server then closes `4401` |
 | `push-register` | `platform` (`apns`\|`fcm`), `token` | `push-registered` | only if `push-v1` advertised |
 | `push-remove` | — | `push-removed` | only if `push-v1` advertised |
+| `workspaces` | — | `workspaces` | revision 7, scope `sessions:author`: this Host's workspace list. A device without `workspace:manage` receives a projected list: each item carries `workspaceId` and a `name` — the Host's `name`/`title`, else the last path segment; a workspace with no label at all is omitted — while the absolute `path`, member `sessionIds`, timestamps and the top-level `archivedSessionIds` are omitted. A device holding `workspace:manage` receives the full Host shape |
+| `session-create` | `requestId`, `workspaceId?` \| `cwd?`, `title?` | `session-created` | revision 7, scope `sessions:author`; the workspace must exist on that Host. A device without `workspace:manage` MUST name a non-blank `workspaceId` and may not send `cwd` or `agentPreset` (any value, including `null`): refused `remote/argument-denied` with no Host call |
+| `models` | `sessionId?` | `models` | revision 7, scope `sessions:author`: the catalog, or one session's models |
+| `select-model` | `sessionId`, `provider`, `model`, `reasoningEffort?` | `select-model` | revision 7, scope `sessions:author`; session-scoped, never Host settings |
 
 ## 5. Approvals
 
@@ -172,3 +240,67 @@ call/open requests share the socket's duplicate-in-flight and 256-id admission r
 ## Revision 5 (spec 008 P1b + full control, additive)
 Pairing with Host approval, subprotocol `dsh-pair-otp.v1`: `pairing-challenge {serverNonce}`, then `pairing-proof {clientNonce, otpProof=HMAC-SHA256(otp, certSha256||clientNonce||serverNonce)}`, then `pairing-pending {verificationCode}` (6 digits; both sides display it), then on Host Approve the existing `paired` frame; on Reject `pairing-rejected`, close 4403. A wrong or expired code or a pending timeout closes 4410. The long pairing string also waits for approval when `requireHostApproval` is set (default true).
 Desktop-only explicit scopes: `commands:execute`, `workspace:manage`, `credentials:write`, `plugins:manage`, `schedule:write`, `terminal`. Presets `standard` / `full`. Bridge limits default to 0, meaning unlimited (owner decision).
+
+## Revision 7 (spec 011 session authoring, additive)
+
+Four client ops join §4: `workspaces`, `session-create`, `models`, `select-model`, answered with
+`workspaces`, `session-created`, `models` and `select-model`. They are gated by ONE new scope,
+`sessions:author` — for both device kinds on purpose: a paired phone may start its own session, and
+the owner decides per device. It is never a default and never implicit; `full` includes it.
+
+What the scope permits is exactly: list this Host's workspaces, list the model catalog (or one
+session's models), create a session, and pick the provider/model for a session the device may already
+address. `session-create` places the session in a `workspaceId` that exists on that Host; a `cwd`
+outside every known workspace still needs `workspace:manage`. `select-model` is session-scoped: it is
+NOT `settings:write` and it cannot change Host defaults or agent presets.
+
+**Workspace visibility is the Host's own per-item decision.** DSH's `workspace/follow` baseline
+filters each item through `remoteAccess.allows({kind:'workspace', id})`, so a device sees a workspace
+only where its policy binds that exact workspace id — a `global` action alone yields `items: []` with
+no error, which is how "this computer has no workspaces" reached a phone on a Host with nine. The
+gateway therefore registers one `workspace` binding per workspace id of the Host, whose only action is
+`workspace/follow`, for a device that holds `sessions:author`, and registers none for a device that
+does not. `name` is the Host's `name` or `title`; when both are empty the last path segment is used
+(`…\DXVK_Project` → `DXVK_Project`), and a workspace with no label at all is omitted rather than shown
+as a bare id. An absolute path, member session ids, timestamps and the archive list are never sent to a
+device without `workspace:manage`.
+
+Everything else stays refused for every device, whatever scopes it holds: creating, renaming or
+archiving a workspace; forking, renaming or archiving a session; queue control; attachments; slash
+commands; `settings/*`; the plugin and schedule families. Feature 012 turns that list into the single
+hard blocklist and makes every other capability grantable per device.
+
+**Never-default is a named rule, not a comment.** Because `sessions:author` is mobile-grantable it
+would otherwise fall into BOTH default computations (the gateway's pairing-offer default and the device
+registry's default), handing a newly paired phone the right to start agent work without the owner
+choosing it. The contract therefore exports
+`NEVER_DEFAULT_SCOPES = Object.freeze(['sessions:author'])`, and both default sites must subtract that
+set. A default grant never contains a member of it; an EXPLICIT `scopes` argument that names it keeps
+it, and an explicit empty list stays empty (never "no choice, so take the default"). See
+`plugins/mobile-gateway/test/session-authoring-defaults.test.mjs`.
+**Sub-agent sessions (revision 7, measured on a live Host where 827 of 861 sessions were
+sub-agents).** A `sessionId` on `models` may name a direct sub-agent. DSH itself refuses a root
+address for a sub-agent header (`session/agent-busy`, "subagent Sessions require their durable
+parent address"), so the gateway resolves the durable parent from the `session/list` rows its own
+peer may already list and re-reads with `{kind:'subagent', parentSessionId, childSessionId,
+mode:'unknown'}`. The reply is the SAME shape as for a root session and carries no parent field, so
+a device learns no session it could not already list; a stale or wrong parent is refused by DSH
+(`subagent/unauthorized`), and an unresolvable parent keeps `session/agent-busy` with no blind retry.
+
+`select-model` cannot work on a sub-agent at all: DSH's request schema has no address parameter and
+resolves a child outright. It therefore answers the STABLE code `subagent/model-inherited` (message:
+the sub-agent inherits its parent's model, without naming the parent) instead of the misleading
+`session/agent-busy`. Clients must render that as "this session follows its parent's model", never as
+a failure to reach the computer.
+**`session-create` is decided on the target Workspace as well as globally.** A Remote call resolves
+one resource per registered resource *kind* and **every** one of them must be allowed
+(`dsh-api-gateway` `callResources()`); the workspace controller registers a field kind on
+`workspaceId`, so a `session-create` that names a workspace is decided on
+`{kind:'workspace', id:<workspaceId>}` in addition to `global`. A device holding `sessions:author`
+therefore carries **exactly two** actions on each per-workspace binding it is granted —
+`workspace/follow` and `session/create` — and nothing else. A device without the scope holds no
+workspace binding at all, so it can neither list nor create. Every workspace-independent authoring op
+(`models`, `select-model`) is unaffected, and creating, renaming or archiving a **workspace** remains
+refused for every device.
+
+

@@ -15,7 +15,9 @@
 const fs = require('node:fs')
 const crypto = require('node:crypto')
 const path = require('node:path')
-const contract = require('@dsh-ext/mobile-protocol')
+// Generated copy of the contract (see scripts/sync-mobile-protocol.mjs): the
+// bare package specifier would not resolve in an installed tarball.
+const contract = require('./vendor/mobile-protocol.mjs')
 
 // The registry holds hashed device credentials: restrict it to the owner on
 // every platform (mode on POSIX, explicit ACL on Windows). `./secure-file.mjs`
@@ -37,7 +39,7 @@ const MAX_PAIRING_TTL_MS = DEFAULT_PAIRING_TTL_MS
 
 // Spec 005 FR1/FR2: a device record carries what it is and what it may do. The
 // vocabulary lives in the shared contract package.
-const { SCOPES: CONTRACT_SCOPES, DESKTOP_DEFAULT_SCOPES } = contract
+const { SCOPES: CONTRACT_SCOPES, DESKTOP_DEFAULT_SCOPES, NEVER_DEFAULT_SCOPES } = contract
 // Spec 008: `harness:remote` (tunnel DSH wire calls) is granted only to a
 // `desktop` device that was offered it explicitly. It is not part of the
 // "every scope" grant of a mobile device or of a pre-005 record migration.
@@ -66,7 +68,12 @@ function normalizeScopes(values, kind) {
 
 /** The grant an offer makes when it names no scopes at all. */
 function defaultScopes(kind) {
-  return kind === 'desktop' ? [...DESKTOP_DEFAULT_SCOPES] : [...ALL_SCOPES]
+  // Spec 011 FR-006: `sessions:author` is grantable to a mobile device (so it is not
+  // EXPLICIT_ONLY), which is exactly why the "every non-desktop scope" default would
+  // otherwise hand it out unasked. Contract `NEVER_DEFAULT_SCOPES` is the one list both
+  // default sites read; an explicit list (an owner's tick) is unaffected.
+  if (kind === 'desktop') return [...DESKTOP_DEFAULT_SCOPES]
+  return ALL_SCOPES.filter((scope) => !NEVER_DEFAULT_SCOPES.includes(scope))
 }
 
 function digest(secret) {
@@ -147,18 +154,23 @@ function createRegistry(file, options = {}) {
         }
         if (!tokenHash || !/^[a-f0-9]{64}$/.test(tokenHash)) return []
         // Spec 005 FR1: ONLY a record written before `kind` and `scopes` existed
-        // migrates, to a mobile device with every scope, so an already-paired
-        // phone keeps working. Everything else is read literally: a scope list
-        // the owner did write stays what it is (empty or unknown-only stays
-        // empty), and a malformed record — an unknown `kind`, `scopes` that is
-        // not an array — is dropped as unusable instead of being loaded with a
-        // full grant. The next save writes the fields; the store version is
-        // unchanged because the format is only additive.
+        // migrates, to the historical mobile grant (`defaultScopes('mobile')`), so
+        // an already-paired phone keeps working. Going through the helper keeps
+        // that grant identical for every scope that existed when such a record was
+        // written, and it subtracts the contract's NEVER_DEFAULT_SCOPES: spec 011
+        // `sessions:author` starts agent work on the owner's machine, so it must be
+        // an owner's tick and cannot arrive through a record that predates it
+        // (FR-006). Everything else is read literally: a scope list the owner did
+        // write stays what it is (empty or unknown-only stays empty), and a
+        // malformed record — an unknown `kind`, `scopes` that is not an array — is
+        // dropped as unusable instead of being loaded with a full grant. The next
+        // save writes the fields; the store version is unchanged because the
+        // format is only additive.
         let kind
         let scopes
         if (row.kind === undefined && row.scopes === undefined) {
           kind = 'mobile'
-          scopes = [...ALL_SCOPES]
+          scopes = defaultScopes('mobile')
           migrated = true
         } else {
           if (row.kind !== undefined && !contract.DEVICE_KINDS.includes(row.kind)) return []

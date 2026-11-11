@@ -24,6 +24,7 @@ import {
   CompanionClient,
   CoreError,
   DebugLog,
+  DEFAULT_PAIR_APPROVAL_TIMEOUT_MS,
   HistoryStore,
   Outbox,
   Reconnector,
@@ -39,6 +40,7 @@ import {
   type ApprovalResolvedFrame,
   type ClientState,
   type HistoryMessage,
+  type ListenerFailureInfo,
   type PairedHost,
   type PairingPayload,
   type ReconnectSnapshot,
@@ -49,7 +51,9 @@ import {
   addNotificationUrlListener,
   approvalNotification,
   clearNotifications,
+  clientNonce,
   configureNotifications,
+  CREDENTIAL_CLEANUP_FAILED,
   forgetHost,
   getInstallId,
   notifyApproval,
@@ -65,7 +69,14 @@ import { debugLogSinksFromEnv } from '../src/platform/debug-log-file';
 import { appVersion, platformName } from './runtime';
 import type { Locale } from '../i18n';
 
-export type BannerKind = 'none' | 'reconnecting' | 'offline' | 'gateway-off' | 'revoked' | 'reauth';
+export type BannerKind = 'none' | 'reconnecting' | 'offline' | 'gateway-off' | 'revoked' | 'reauth' | 'cleanup-failed';
+
+/**
+ * Fixed, secret-free status for a credential wipe that did not complete. It says what the user
+ * must know (the device is no longer paired and the credential will not be used) and nothing
+ * about the store error itself.
+ */
+const CREDENTIAL_CLEANUP_MESSAGE = 'The stored credential could not be deleted from this device';
 
 export interface PairFailure {
   kind: 'qr' | 'connect';
@@ -92,6 +103,172 @@ export interface ApprovalCardView {
   replay: boolean;
 }
 
+/**
+ * Spec 011 — the wire code a host returns when this device does not hold `sessions:author`. It is
+ * kept verbatim (never folded into a generic network failure) so the UI can say "this computer did
+ * not grant session authoring" instead of "check your connection".
+ */
+export const AUTHORING_FORBIDDEN_CODE = 'auth/forbidden-scope';
+
+/** Result of an authoring call that must report a reason instead of throwing at the screen. */
+export type AuthoringResult<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly code: string };
+
+/**
+ * Is a reconnect actually in progress?
+ *
+ * The reconnect loop's `'live'` state means "watching a healthy socket" — it is present whenever a
+ * connection exists, so **non-nullness is not a reconnect**. Reading it as one disabled the primary
+ * action forever on a healthy link (device defect: data flowing, button dead, reason line accusing a
+ * reconnect that had long finished).
+ */
+export function reconnectInProgress(reconnect: { readonly state: string } | null): boolean {
+  return reconnect !== null && reconnect.state !== 'live';
+}
+
+/** True when a failure is a permission refusal rather than a transport problem. */
+export function isAuthoringRefusal(code: string): boolean {
+  return code === AUTHORING_FORBIDDEN_CODE || code === 'op/forbidden';
+}
+
+/** The error code of a rejected request, kept as-is so refusals stay distinguishable. */
+function authoringErrorCode(error: unknown): string {
+  if (typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string') {
+    return (error as { code: string }).code;
+  }
+  return 'client/unknown';
+}
+
+/**
+ * `workspaces` reply → the picker's items. The Host shape is `workspace/list`'s: the id field has
+ * been `workspaceId` upstream, but we accept `id` too and drop any row without one, so a Host variant
+ * degrades to an empty list instead of crashing the screen.
+ */
+export function parseWorkspaceItems(answer: Record<string, unknown>): Array<{ id: string; name?: string; path?: string }> {
+  const raw = Array.isArray(answer.items) ? answer.items : [];
+  const items: Array<{ id: string; name?: string; path?: string }> = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const row = entry as Record<string, unknown>;
+    const id = typeof row.workspaceId === 'string' && row.workspaceId !== ''
+      ? row.workspaceId
+      : typeof row.id === 'string' && row.id !== ''
+        ? row.id
+        : '';
+    if (id === '') continue;
+    items.push({
+      id,
+      ...(typeof row.name === 'string' && row.name !== '' ? { name: row.name } : {}),
+      ...(typeof row.path === 'string' && row.path !== '' ? { path: row.path } : {}),
+    });
+  }
+  return items;
+}
+
+/** A trimmed non-empty string, or null. */
+function nonEmpty(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
+/**
+ * `models` reply → the catalog.
+ *
+ * The MEASURED shape of a real per-session reply (`dsh-api-session-controller/lib/types/catalog.js`
+ * and the gateway's `lib/dsh-host-adapter.mjs:364-376`) is:
+ *
+ *   { current: { provider, model, reasoningEffort? }, routable, groups, failures }
+ *   groups: [{ id (the provider id), name, models: [{ id, name, description?, reasoning?, badge? }] }]
+ *
+ * Two things follow, and both used to be wrong here:
+ *   * the provider id lives in `group.id`, NOT `group.provider` — inheriting only `group.provider`
+ *     left every row without a provider, and `select-model` needs it (the gateway compares
+ *     `candidate.id === selection.provider`, `plugins/mobile-gateway/lib/index.mjs:1564`);
+ *   * a model entry has `name` (there is no `label`/`displayName`), so the human label must come from
+ *     `name` with `id` as the last resort.
+ *
+ * Flat `items`/`models` replies are still accepted for older/pre-measurement fixtures.
+ */
+export function parseModelItems(answer: Record<string, unknown>): Array<{ id: string; label: string; provider?: string }> {
+  const flat = Array.isArray(answer.items) ? answer.items : Array.isArray(answer.models) ? answer.models : [];
+  const candidates: Array<{ entry: unknown; provider?: string }> = [];
+  if (flat.length > 0) {
+    for (const entry of flat) candidates.push({ entry });
+  } else if (Array.isArray(answer.groups)) {
+    for (const group of answer.groups) {
+      if (typeof group !== 'object' || group === null) continue;
+      const row = group as Record<string, unknown>;
+      const list = Array.isArray(row.models) ? row.models : Array.isArray(row.items) ? row.items : [];
+      // `group.id` is the provider id; `group.provider` does not exist on the real shape but is
+      // tolerated so an older fixture keeps working.
+      const provider = nonEmpty(row.provider) ?? nonEmpty(row.id) ?? undefined;
+      for (const entry of list) {
+        candidates.push(provider === undefined ? { entry } : { entry, provider });
+      }
+    }
+  }
+  const items: Array<{ id: string; label: string; provider?: string }> = [];
+  for (const candidate of candidates) {
+    const entry = candidate.entry;
+    if (typeof entry !== 'object' || entry === null) continue;
+    const row = entry as Record<string, unknown>;
+    const id = nonEmpty(row.id) ?? nonEmpty(row.model) ?? '';
+    if (id === '') continue;
+    const label = nonEmpty(row.label) ?? nonEmpty(row.name) ?? id;
+    const provider = nonEmpty(row.provider) ?? candidate.provider ?? undefined;
+    items.push({ id, label, ...(provider === undefined ? {} : { provider }) });
+  }
+  return items;
+}
+
+/** The session's current selection, when the per-session `models` reply reports one. */
+export function parseCurrentModel(answer: Record<string, unknown>): { id: string; label?: string; reasoningEffort?: string } | null {
+  const raw = answer.current;
+  if (typeof raw !== 'object' || raw === null) return null;
+  const row = raw as Record<string, unknown>;
+  const id = typeof row.model === 'string' && row.model !== ''
+    ? row.model
+    : typeof row.id === 'string' && row.id !== ''
+      ? row.id
+      : '';
+  if (id === '') return null;
+  return {
+    id,
+    ...(typeof row.label === 'string' && row.label !== '' ? { label: row.label } : {}),
+    ...(typeof row.reasoningEffort === 'string' && row.reasoningEffort !== '' ? { reasoningEffort: row.reasoningEffort } : {}),
+  };
+}
+
+/**
+ * Does this `select-model` receipt describe the selection we asked for?
+ *
+ * Upstream's client discards a reply whose `selected` differs from the request, so a racing or stale
+ * reply cannot repaint the composer with a model the host did not accept. Three shapes are handled:
+ * an explicit `selected` object, top-level `provider`/`model` fields, or a bare acknowledgement —
+ * and in the last case only the receipt's own `kind` is evidence, which we require to be
+ * `select-model` before applying anything.
+ */
+export function receiptConfirmsSelection(
+  answer: Record<string, unknown>,
+  requested: { provider: string; model: string },
+): boolean {
+  const selected = answer.selected;
+  if (typeof selected === 'object' && selected !== null) {
+    const row = selected as Record<string, unknown>;
+    const model = typeof row.model === 'string' ? row.model : typeof row.id === 'string' ? row.id : '';
+    const provider = typeof row.provider === 'string' ? row.provider : '';
+    if (model === '' || provider === '') return false;
+    return provider === requested.provider && model === requested.model;
+  }
+  if (typeof answer.model === 'string' || typeof answer.provider === 'string') {
+    const model = typeof answer.model === 'string' ? answer.model : '';
+    const provider = typeof answer.provider === 'string' ? answer.provider : '';
+    if (model === '' || provider === '') return false;
+    return provider === requested.provider && model === requested.model;
+  }
+  return answer.kind === 'select-model';
+}
+
 export interface AppStateSnapshot {
   /** Unlocked through biometrics (A020). */
   unlocked: boolean;
@@ -110,6 +287,16 @@ export interface AppStateSnapshot {
   openApprovals: ApprovalCardView[];
   history: HistoryMessage[];
   historyHasMore: boolean;
+  /**
+   * True only when the Host reports older history AND supplied a cursor to page with. The cursor is
+   * the honest signal: `hasMore` without `nextBeforeSeq` cannot be paged, and offering the control
+   * anyway produced a button that did nothing on device.
+   */
+  historyHasEarlier: boolean;
+  /** True while an older-history request is in flight: the affordance is busy and locked. */
+  historyLoading: boolean;
+  /** Failure code of the last older-history attempt (shown as one muted line, never swallowed). */
+  historyError: string | null;
   /** Outbox snapshots of the open session (queued/sent/failed prompts). */
   outgoing: Array<{ clientMsgId: string; text: string; status: string; lastError?: string }>;
   remoteControlOff: boolean;
@@ -117,8 +304,37 @@ export interface AppStateSnapshot {
   /** Reconnect-loop state (null when no retry loop runs, e.g. while locked). */
   reconnect: Pick<ReconnectSnapshot, 'state' | 'attempt' | 'lastDelayMs'> | null;
   pairing: PairFailure | null;
+  /**
+   * A pairing is waiting for the desktop user to approve this phone (contract §3.8): the
+   * verification code the desktop shows, so the user can compare them. Null otherwise.
+   */
+  pairingPending: { verificationCode: string; expiresAt: number } | null;
   /** Debug-only: the pinned transport is not built yet (A030). */
   pinnedTransportUnavailable: boolean;
+  /**
+   * Spec 011 — the scopes this device was granted, straight from `hello.device.scopes`. An empty
+   * array means the host reported none (an older gateway): the UI must read that as UNKNOWN, never
+   * as "denied".
+   */
+  grantedScopes: readonly string[];
+  /** Spec 011 — this host's workspaces, for the workspace picker. */
+  workspaces: Array<{ id: string; name?: string; path?: string }>;
+  /** Load state of {@link workspaces}: `idle` when nothing was asked yet. */
+  workspacesState: 'idle' | 'loading' | 'ready' | 'error';
+  /** The refusal code when {@link workspacesState} is `error` (e.g. `auth/forbidden-scope`). */
+  workspacesError: string | null;
+  /** Spec 011 — the model catalog for the composer's model row. */
+  models: Array<{ id: string; label: string; provider?: string }>;
+  /** The session's current model selection, or null when the host has not reported one. */
+  currentModel: { id: string; label?: string; reasoningEffort?: string } | null;
+  /**
+   * Load state of {@link models}. `error` carries the wire's own code in {@link modelsError} (for
+   * example a `sessions:author` refusal), so the composer can explain an absent model pill instead
+   * of silently showing nothing.
+   */
+  modelsState: 'idle' | 'loading' | 'ready' | 'error';
+  /** The refusal/failure code when {@link modelsState} is `error`. */
+  modelsError: string | null;
   lastError: { code: string; message: string } | null;
   locale: Locale;
 }
@@ -175,8 +391,8 @@ export interface ControllerOptions {
   locale?: () => Locale;
   /**
    * Override for tests/dev builds without the native module. It receives the construction
-   * options the app passes — only `trace`, and only when the debug log has a sink — so a
-   * zero-argument factory keeps working unchanged.
+   * options the app passes — the transport `trace` (only when the debug log has a sink) and the
+   * listener-failure reporter — so a zero-argument factory keeps working unchanged.
    */
   transport?: (options?: CreatePinnedTransportOptions) => PinnedTransport | ReturnType<typeof createPinnedTransport>;
   /**
@@ -192,6 +408,13 @@ export interface ControllerOptions {
    * the longer total budget. Defaults to the client's 10 s; tests shorten it.
    */
   handshakeTimeoutMs?: number;
+  /**
+   * Local upper bound for the desktop-approval wait of a pairing (contract §3.8). The wait is
+   * governed by the Host's `expiresAt`; this only caps a Host that promises a distant expiry.
+   * Defaults to the client's `DEFAULT_PAIR_APPROVAL_TIMEOUT_MS` (the 5-minute window + 30 s);
+   * tests shorten it.
+   */
+  pairApprovalTimeoutMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +530,19 @@ export class AppController {
    * `EXPO_PUBLIC_DSH_DEBUG_LOG=1` also appends them to a rotating file (see debug-log-file.ts).
    */
   private readonly debug = new DebugLog({ sinks: this.debugSinks });
+  /**
+   * Listener-boundary failures (`native` / `transport` / `client`).
+   *
+   * A throwing listener used to vanish into an empty catch — exactly how seven device builds
+   * could pass the whole unit suite while sending no frames, because the throw happened inside a
+   * wrapper. Isolation stays (one bad listener must not break a socket loop); the failure now
+   * reaches the same redacted log as the transport trace, so a device run shows it even though
+   * the JS console is invisible in a release build. Only a fixed boundary name and a fixed stage
+   * string travel here: never a message, payload, frame or stack.
+   */
+  private readonly onListenerFailure = (info: ListenerFailureInfo): void => {
+    this.debug.warn('listener failed', { boundary: info.boundary, stage: info.stage });
+  };
   private readonly sessions = new SessionsStore();
   private readonly approvals = new ApprovalCards();
   private readonly history = new HistoryStore();
@@ -336,9 +572,36 @@ export class AppController {
   private readonly createTransport: (options?: CreatePinnedTransportOptions) => ReturnType<typeof createPinnedTransport>;
   private readonly pairAckTimeoutMs: number;
   private readonly handshakeTimeoutMs: number | undefined;
+  private readonly pairApprovalTimeoutMs: number;
+  /**
+   * The pairing attempt is waiting for the desktop user to approve (contract §3.8): the code the
+   * desktop shows, for the screen to compare. Null outside that window.
+   */
+  private pairingPending: { verificationCode: string; expiresAt: number } | null = null;
 
   private client: CompanionClient | null = null;
   private reconnector: Reconnector | null = null;
+
+  /**
+   * Spec 011 (session authoring) — the fetched half of the authoring UI. `grantedScopes` is NOT
+   * stored: it is read from the live device (`hello.device.scopes`) in `snapshot()`. These lists are
+   * cleared whenever the connection or the host changes, so one computer's workspaces or selected
+   * model can never be shown against another.
+   */
+  private authoring = {
+    workspacesState: 'idle' as 'idle' | 'loading' | 'ready' | 'error',
+    workspacesError: null as string | null,
+    workspaces: [] as Array<{ id: string; name?: string; path?: string }>,
+    models: [] as Array<{ id: string; label: string; provider?: string }>,
+    currentModel: null as { id: string; label?: string; reasoningEffort?: string } | null,
+    /**
+     * Spec 011 — the model catalog's own load state. Without it a refused/unavailable catalog looked
+     * exactly like "this Host has no models": an empty pill area and no explanation, which is the
+     * same class of defect as rendering a label as a value.
+     */
+    modelsState: 'idle' as 'idle' | 'loading' | 'ready' | 'error',
+    modelsError: null as string | null,
+  };
   /** The one-time pairing socket (never resynced; replaced by the authenticated connection). */
   private pairingSocket: CompanionClient | null = null;
   /**
@@ -391,6 +654,7 @@ export class AppController {
     this.createTransport = options.transport ?? createPinnedTransport;
     this.pairAckTimeoutMs = options.pairAckTimeoutMs ?? 20_000;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs;
+    this.pairApprovalTimeoutMs = options.pairApprovalTimeoutMs ?? DEFAULT_PAIR_APPROVAL_TIMEOUT_MS;
   }
 
   // -------------------------------------------------------------------------
@@ -509,6 +773,12 @@ export class AppController {
    * the screen: the reconnect loop is stopped, its closure (which holds the bearer token) is
    * released, and the live client is closed. The generation bump invalidates any token read or
    * pairing that is still awaited, so a lock can never be undone by a late promise.
+   *
+   * Locking deliberately does NOT delete the stored credential — `unlock()` must reconnect with
+   * it — so there is no wipe result to check on this path. The wipe paths (`onRevoked`, `forget`)
+   * report `store/cleanup-failed` when a delete does not complete; here the in-memory copy is
+   * already unusable (`teardownConnection` drops the closure, `client.close` clears the one-time
+   * token).
    */
   lock(): void {
     this.unlocked = false;
@@ -570,6 +840,8 @@ export class AppController {
     }
     const payload = parsed.payload;
     this.pairing = null;
+    // A new attempt never inherits the previous one's approval code (§3.8).
+    this.pairingPending = null;
     this.remoteControlOff = false;
     this.updateRequired = null;
     // One live connection: drop the previous socket *and* its reconnect closure first.
@@ -605,6 +877,12 @@ export class AppController {
         void this.persistToken(payload.gatewayId, frame.token).then(
           (revision) => {
             tokenPersisted = true;
+            // The approval wait ended with the approval itself: the screen must stop showing the
+            // comparison code before it switches to the connected state.
+            if (this.pairingPending !== null) {
+              this.pairingPending = null;
+              this.bump();
+            }
             // The socket now owns exactly this credential instance (M5): revoking the pairing
             // connection may delete it, but never a newer token on the same gateway.
             attempt.revision = revision;
@@ -648,6 +926,64 @@ export class AppController {
     // Observed later, so an early refusal must not surface as an unhandled rejection.
     pairedOnce.catch(() => undefined);
 
+    /**
+     * `pairedOnce` plus this attempt's deadline (contract §3.8).
+     *
+     * Before `pairing-pending` the bound is the fixed pre-approval budget the pairing gate always
+     * had (20 s, `client/timeout`). Once the Host is waiting for a human to approve on the
+     * desktop, that budget must stop governing: it is cleared and re-armed from the Host's
+     * `expiresAt` (capped by `pairApprovalTimeoutMs`), because the approval wait is a five-minute
+     * window, not a handshake step. Expiry there is a distinct `client/pairing-timeout`.
+     */
+    let clearPairWait = (): void => {};
+    const pairedWait = new Promise<{ id: string; name: string }>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const clear = (): void => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
+      clearPairWait = clear;
+      const arm = (ms: number, code: string, message: string, retryable: boolean, stage: string): void => {
+        clear();
+        timer = setTimeout(() => {
+          timer = null;
+          reject(new CoreError({ code, message, retryable, details: { stage } }));
+        }, Math.max(0, ms));
+        (timer as unknown as { unref?: () => void }).unref?.();
+      };
+      arm(20_000, 'client/timeout', 'Timed out', true, 'waiting-approval');
+      pairingClient.on('pairingPending', (pending) => {
+        // A superseded attempt must not publish a stale code on the pairing screen.
+        if (!this.isCurrent(generation)) return;
+        this.pairingPending = { verificationCode: pending.verificationCode, expiresAt: pending.expiresAt };
+        this.bump();
+        const untilExpiry = Math.max(0, pending.expiresAt - Date.now());
+        const ms = this.pairApprovalTimeoutMs > 0
+          ? Math.min(untilExpiry, this.pairApprovalTimeoutMs)
+          : untilExpiry;
+        arm(
+          ms,
+          'client/pairing-timeout',
+          'The approval window on the computer ran out before this phone was approved',
+          false,
+          'waiting-approval',
+        );
+      });
+      pairedOnce.then(
+        (device) => {
+          clear();
+          resolve(device);
+        },
+        (error: unknown) => {
+          clear();
+          reject(error);
+        },
+      );
+    });
+    pairedWait.catch(() => undefined);
+
     let socketStarted = false;
     /** The authenticated connection this attempt opened, once past the pairing socket (M5). */
     let live: { client: CompanionClient; generation: number } | null = null;
@@ -667,7 +1003,7 @@ export class AppController {
         deviceName: `${platformName()} phone`,
       });
       socketStarted = true;
-      const device = await withTimeout(pairedOnce, 20_000, 'client/timeout');
+      const device = await pairedWait;
       if (!this.isCurrent(generation)) throw new CoreError({ code: 'client/bad-state', message: 'Pairing was superseded' });
       const host = pairedHostFromPayload(payload, { id: device.id, name: payload.gatewayName }, Date.now());
       attempt.host = host;
@@ -716,6 +1052,10 @@ export class AppController {
     } catch (error) {
       const code = error instanceof CoreError ? error.code : 'client/bad-message';
       const message = error instanceof Error ? error.message : String(error);
+      // The attempt is over: its deadline must not fire into a later attempt, and the screen must
+      // stop showing an approval code for a pairing that will not complete.
+      clearPairWait();
+      if (this.pairingPending !== null) this.pairingPending = null;
       // `code` is a redacted key (FR-011 masks anything named like a pairing code), so the error
       // code travels as `errorCode` and stays readable in the trace.
       this.debug.warn('pair failed', { gatewayId: payload.gatewayId, errorCode: code });
@@ -782,6 +1122,8 @@ export class AppController {
    * persists afterwards may reinstall a host record, a banner or the active host.
    */
   async forget(): Promise<void> {
+    // Spec 011: the workspaces/model of a computer we just forgot must not survive the forget.
+    this.clearAuthoring();
     const host = this.host;
     /** A pairing still in flight may already have persisted its one-time token (M5/M9). */
     const attempt = this.pairingAttempt;
@@ -800,6 +1142,8 @@ export class AppController {
     const generation = this.beginGeneration();
     this.teardownConnection('forget');
     this.host = null;
+    // A forgotten pairing has no approval window left to show (§3.8).
+    this.pairingPending = null;
     // The unlock gate owns `unlocked`: clearing it here left the app visually unlocked but
     // unable to connect after the next pairing (connectHost returns early while locked).
     this.updateRequired = null;
@@ -820,20 +1164,23 @@ export class AppController {
     }
 
     const deleted = new Map<string, PairedHost>();
-    try {
-      for (const target of targets) {
+    let cleanupFailed = false;
+    for (const target of targets) {
+      // Per target: one failed wipe must not skip the remaining credentials, and it must be
+      // reported to the user rather than leaving the device looking fully forgotten.
+      try {
         if (target.probe) await this.settleTokenWrite(target.gatewayId);
-        if (await this.deleteCredentialInstance(target.gatewayId, target.revision) && target.record !== null) {
+        if (await this.deleteCredentialInstance(target.gatewayId, target.revision, target.record) && target.record !== null) {
           deleted.set(target.gatewayId, target.record);
         }
+      } catch (error) {
+        cleanupFailed = true;
+        if (target.record !== null) deleted.set(target.gatewayId, target.record);
+        this.debug.warn('could not delete a forgotten credential', {
+          gatewayId: target.gatewayId,
+          errorCode: error instanceof CoreError ? error.code : CREDENTIAL_CLEANUP_FAILED,
+        });
       }
-    } catch (error) {
-      // A store failure must not leave the app on a credential the user asked to forget: the UI
-      // is cleared below, and the next connect/reconnect reports the leftover.
-      this.debug.warn('could not delete a forgotten credential', {
-        gatewayId: targets[0]?.gatewayId ?? null,
-        code: error instanceof CoreError ? error.code : 'client/bad-state',
-      });
     }
     // Drop only the exact records whose credential was deleted: a newer pairing of the same
     // gateway reuses its id, so pruning every candidate with that id would hide fresh state (M5).
@@ -846,11 +1193,18 @@ export class AppController {
     try {
       await clearNotifications();
     } catch {
-      // Best effort: the credential is already gone.
+      // Best effort: the device is already unpaired; the wipe outcome is reported separately.
     }
     // M5: the deletes above were awaited; a newer pairing/lock may own the UI now.
     if (!this.isCurrent(generation)) return;
-    this.banner = 'none';
+    if (cleanupFailed) {
+      // The wipe did not complete: say so instead of the "cleared" state, and never claim the
+      // credential is gone. The host record is already dropped, so nothing will use it.
+      this.banner = 'cleanup-failed';
+      this.lastError = { code: CREDENTIAL_CLEANUP_FAILED, message: CREDENTIAL_CLEANUP_MESSAGE };
+    } else {
+      this.banner = 'none';
+    }
     this.loading = false;
     this.bump();
   }
@@ -914,19 +1268,42 @@ export class AppController {
     }
   }
 
+  /** Older-history load state; drives the affordance's busy/locked state and its honest failure line. */
+  private historyLoad = { loading: false, error: null as string | null };
+
   async loadOlderHistory(): Promise<void> {
     const sessionId = this.openSessionId;
-    if (sessionId === null || this.client?.state !== 'ready' || !this.history.page.hasMore) return;
+    if (sessionId === null || this.client?.state !== 'ready') return;
+    // A double tap must never put two history requests in flight.
+    if (this.historyLoad.loading) return;
+    const page = this.history.page;
+    if (!page.hasMore) return;
+    const beforeSeq = page.nextBeforeSeq;
+    if (beforeSeq === null) {
+      // The Host says "more" but hands no cursor, so a request would re-serve the SAME opening page —
+      // which is exactly the tap that visibly did nothing on device. The gateway emits `nextBeforeSeq`
+      // only when it knows the oldest seq (`plugins/mobile-gateway/lib/index.mjs:1412`), so nothing is
+      // loadable: drop the affordance instead of inviting a second pointless tap.
+      this.history.prependPage([], { hasMore: false });
+      this.historyLoad = { loading: false, error: null };
+      this.bump();
+      return;
+    }
+    this.historyLoad = { loading: true, error: null };
+    this.bump();
     try {
-      const beforeSeq = this.history.page.nextBeforeSeq;
-      const answer = await this.client.request('history', {
-        sessionId,
-        ...(beforeSeq === null ? {} : { beforeSeq }),
-      });
-      this.history.prependPage(answer.items ?? answer.messages, { hasMore: answer.hasMore === true });
+      const answer = await this.client.request('history', { sessionId, beforeSeq });
+      const items = answer.items ?? answer.messages;
+      const arrived = Array.isArray(items) ? items.length : 0;
+      // An empty page means there is nothing older after all: never keep advertising more.
+      this.history.prependPage(items, { hasMore: answer.hasMore === true && arrived > 0 });
+      this.historyLoad = { loading: false, error: null };
       this.bump();
     } catch (error) {
+      // Never silent: the screen shows one muted line with the code's reason.
+      this.historyLoad = { loading: false, error: authoringErrorCode(error) };
       this.recordError(error);
+      this.bump();
     }
   }
 
@@ -1060,11 +1437,25 @@ export class AppController {
   // Deep links (A025): `dshcompanion://s/<sessionId>?a=<approvalId>`
   // -------------------------------------------------------------------------
 
+  /**
+   * A025: an app link (`dshcompanion://s/<sessionId>?a=<approvalId>`) from the router's `Linking`
+   * listener or a notification tap.
+   *
+   * The destination is parked whether or not the unlock gate is open: a link delivered while the
+   * app is locked must survive the gate. The gate takes it with `takeDeepLink()` right after a
+   * successful `unlock()` and routes there, so dropping it while locked lost the destination
+   * entirely (that is the bug this guards). The controller must not navigate while locked either:
+   * the credential is not usable until unlock, so the gate stays the only way in. The newest link
+   * wins — a later one replaces the parked destination instead of queueing behind it.
+   *
+   * Unlocked, the destination is reached immediately, exactly as before: `reachDeepLink()`
+   * consumes the parked link itself, so a later `takeDeepLink()` cannot route there a second time.
+   */
   async handleDeepLink(url: string): Promise<void> {
     const parsed = parseSessionDeepLink(url);
     if (parsed === null) return;
-    if (!this.unlocked) return; // the gate resumes it after unlock (see `resumeDeepLink`)
     this.pendingDeepLink = parsed;
+    if (!this.unlocked) return; // parked: the unlock gate resumes it via `takeDeepLink()`
     await this.reachDeepLink();
   }
 
@@ -1077,13 +1468,18 @@ export class AppController {
     if (target.approvalId !== null) {
       await this.ensureHistory();
     }
-    this.pendingDeepLink = null;
+    // Only the link this call consumed: a newer one that arrived meanwhile stays parked.
+    if (this.pendingDeepLink === target) this.pendingDeepLink = null;
     this.bump();
   }
 
-  /** The router asks for the destination once unlocked (cold start into a card). */
+  /**
+   * The router asks for the destination once unlocked (cold start into a card, or an intent
+   * delivered while the gate was closed). Taking it consumes it, so one link is routed once.
+   */
   takeDeepLink(): { sessionId: string; approvalId: string | null } | null {
     const target = this.pendingDeepLink;
+    this.pendingDeepLink = null;
     return target;
   }
 
@@ -1230,13 +1626,12 @@ export class AppController {
 
   /**
    * The construction options for the next transport: the redacted transport trace only when the
-   * debug log has a sink. A normal build passes `{}`, so `PinnedTransport` installs no hook and
-   * builds no line (the transport itself is the black box this trace exists to open: which native
-   * event arrived, in which state, and — when a frame is dropped — why).
+   * debug log has a sink (a normal build builds no trace line), plus the listener-failure
+   * reporter — it allocates nothing unless a listener actually throws.
    */
   private transportTrace(): CreatePinnedTransportOptions {
-    if (this.debugSinks.length === 0) return {};
-    return { trace: (line) => this.debug.debug(line) };
+    if (this.debugSinks.length === 0) return { onListenerFailure: this.onListenerFailure };
+    return { trace: (line) => this.debug.debug(line), onListenerFailure: this.onListenerFailure };
   }
 
   private newClient(): CompanionClient {
@@ -1246,10 +1641,18 @@ export class AppController {
       platform: platformName(),
       requestTimeoutMs: 20_000,
       ...(this.handshakeTimeoutMs === undefined ? {} : { handshakeTimeoutMs: this.handshakeTimeoutMs }),
+      // §3.8: the nonce comes from expo-crypto (through the platform layer, so the core stays
+      // expo-free), and the approval wait is bounded by the Host's expiry plus this cap.
+      clientNonce: () => clientNonce(),
+      pairApprovalTimeoutMs: this.pairApprovalTimeoutMs,
+      onListenerFailure: this.onListenerFailure,
       onRevoked: () => {
         void this.onRevoked(client);
       },
     });
+    // Spec 011: a new connection may target a different computer, so nothing fetched for the
+    // previous one may be carried over.
+    this.clearAuthoring();
     this.client = client;
     /** Handler guard: events from a socket that was replaced/closed are ignored (M5). */
     const current = () => this.client === client;
@@ -1276,7 +1679,8 @@ export class AppController {
       // Terminal states (protocol mismatch / revoked / owner switch) cannot be fixed by
       // retrying, so they never feed the loop; every other retryable drop does (M6).
       const terminal =
-        client.state === 'update-required' || client.state === 'revoked' || client.state === 'gateway-disabled';
+        client.state === 'update-required' || client.state === 'revoked' || client.state === 'gateway-disabled'
+        || client.state === 'reauth-required';
       if (payload.retry && !terminal) {
         // M6: every retryable drop feeds the retry loop; it owns the backoff and deduplicates
         // the several reports one outage produces (close + failed requests).
@@ -1310,6 +1714,10 @@ export class AppController {
     client.on('reauthRequired', () => {
       if (!current()) return;
       this.banner = 'reauth';
+      // A 401 upgrade refusal is permanent (the same stored credential is refused on every
+      // attempt), so the retry loop must stop here exactly like `gatewayDisabled`: otherwise it
+      // stayed `connecting` and kept trying a host that will never accept this device.
+      this.reconnector?.stop();
       this.bump();
     });
     client.on('approvalRequested', (frame) => {
@@ -1319,7 +1727,17 @@ export class AppController {
       if (current()) this.onApprovalResolved(frame);
     });
     client.on('event', (frame) => {
-      if (current()) this.onEvent(frame);
+      if (!current()) return;
+      // Belt-and-braces for the per-message send state: an event attributable to the open session
+      // proves the turn reached the Host, so no prompt of it may still render "sending" even if the
+      // receipt was lost (a receipt-based clear alone would leave the bubble lying).
+      const eventSession = typeof (frame as { sessionId?: unknown }).sessionId === 'string'
+        ? (frame as { sessionId: string }).sessionId
+        : null;
+      if ((eventSession === null || eventSession === this.openSessionId) && this.history.confirmAllPending() > 0) {
+        this.bump();
+      }
+      this.onEvent(frame);
     });
     return client;
   }
@@ -1544,6 +1962,7 @@ export class AppController {
       await client.request('subscribe', { sessionId });
       const history = await client.request('history', { sessionId });
       if (client !== this.client || this.openSessionId !== sessionId) return;
+      this.historyLoad = { loading: false, error: null };
       this.history.setPage(history.items ?? history.messages, { hasMore: history.hasMore === true });
     }
     await this.drainOutbox();
@@ -1553,17 +1972,25 @@ export class AppController {
   private async drainOutbox(): Promise<void> {
     this.outgoing.gateClosed = () => this.client?.connected !== true;
     await this.outgoing.drain();
-    this.outgoing.prune();
+    // Confirm/flag BEFORE pruning. `prune()` then DELETES the `acked` items, so the old order (prune,
+    // then look for acked) found an empty list and every delivered prompt kept rendering "đang gửi…"
+    // forever — the device defect. `'acked'` is set when the contract's `sent {sessionId,clientMsgId}`
+    // receipt resolves the request, which is the authoritative signal.
     for (const item of this.outgoing.list()) {
-      if (item.status === 'acked' && item.op === 'prompt') {
+      if (item.op !== 'prompt') continue;
+      if (item.status === 'acked') {
         this.history.confirmPending(item.clientMsgId, {
           id: item.clientMsgId,
           role: 'user',
           text: item.text,
           createdAt: Date.now(),
         });
+      } else if (item.status === 'failed') {
+        // A refused send must say why instead of staying in "sending" (silent-failure class).
+        this.history.markPromptFailed(item.clientMsgId, item.lastError ?? 'client/unknown');
       }
     }
+    this.outgoing.prune();
     this.bump();
   }
 
@@ -1574,6 +2001,7 @@ export class AppController {
       await client.request('subscribe', { sessionId });
       const history = await client.request('history', { sessionId });
       if (this.openSessionId !== sessionId) return; // the user moved on meanwhile
+      this.historyLoad = { loading: false, error: null };
       this.history.setPage(history.items ?? history.messages, { hasMore: history.hasMore === true });
       this.bump();
     } catch (error) {
@@ -1657,7 +2085,13 @@ export class AppController {
    * secret, and a newer pairing of the same gateway — which registered a fresh revision — keeps
    * the token it wrote. The UI is moved only when its generation is still current and the revoked
    * record is still the active host, so a newer selection/pairing is never clobbered; a newer
-   * record with the same gateway id is never pruned from the list.
+   * record with the same gateway id is never pruned from the list. The list is never re-read
+   * from the store and never installed from it, so a selection or pairing that landed while the
+   * cleanup was parked is kept as it is.
+   *
+   * The revoked record leaves the list with the store deletion, inside that transaction
+   * (`deleteCredentialInstance`), not after it resolves: the credential wipe and its verification
+   * can settle long after the record is gone, and the list must never outlive the store.
    */
   private async onRevoked(client: CompanionClient | null = null): Promise<void> {
     if (client !== null && client !== this.client) return; // an old socket's late event
@@ -1705,23 +2139,38 @@ export class AppController {
     }
 
     const deleted = new Map<string, PairedHost>();
-    try {
-      for (const target of deletions) {
-        if (await this.deleteRevokedCredential(target.gatewayId, target.revision) && target.record !== null) {
+    let cleanupFailed = false;
+    for (const target of deletions) {
+      // One target's store failure must not skip the others (a second credential could be
+      // destroyed by the same revocation), and it must be reported, not assumed away.
+      try {
+        if (await this.deleteRevokedCredential(target.gatewayId, target.revision, target.record) && target.record !== null) {
           deleted.set(target.gatewayId, target.record);
         }
+      } catch (error) {
+        // The credential could not be destroyed. The host record is still dropped: a device
+        // whose token survived must never look paired, and the fixed status below tells the
+        // user the wipe did not finish instead of advertising success.
+        cleanupFailed = true;
+        if (target.record !== null) deleted.set(target.gatewayId, target.record);
+        this.debug.warn('could not delete the revoked credential', {
+          gatewayId: target.gatewayId,
+          errorCode: error instanceof CoreError ? error.code : CREDENTIAL_CLEANUP_FAILED,
+        });
       }
-    } catch (error) {
-      // A store failure must not keep the app on a dead credential: the UI still returns to
-      // pairing, and the next connect/reconnect reports the revocation again.
-      this.debug.warn('could not delete the revoked credential', {
-        gatewayId: revokedGatewayId ?? interrupted?.gatewayId ?? null,
-        code: error instanceof CoreError ? error.code : 'client/bad-state',
-      });
+    }
+
+    // Surface the incomplete wipe beside the "revoked" outcome (the banner set above), so the
+    // user is not told the device was fully wiped when its credential may still be on disk.
+    if (cleanupFailed) {
+      this.banner = 'cleanup-failed';
+      this.lastError = { code: CREDENTIAL_CLEANUP_FAILED, message: CREDENTIAL_CLEANUP_MESSAGE };
     }
 
     // Drop only the exact record whose credential was deleted. A newer pairing of the same
     // gateway reuses its id, so pruning every candidate with that id would hide fresh state (M5).
+    // This runs unconditionally: a wipe that FAILED still drops its record, even while the store
+    // still lists it.
     if (deleted.size > 0) {
       this.hosts = this.hosts.filter((candidate) => {
         const removed = deleted.get(candidate.gatewayId);
@@ -1737,15 +2186,15 @@ export class AppController {
     try {
       await clearNotifications();
     } catch {
-      // Best effort: the credential is already gone.
+      // Best effort: the device is already unpaired; the wipe outcome is reported separately.
     }
     if (!this.isCurrent(generation)) return;
     this.bump();
   }
 
   /** A revocation's delete: the instance its socket used, and the record it belongs to. */
-  private deleteRevokedCredential(gatewayId: string, revision: number): Promise<boolean> {
-    return this.deleteCredentialInstance(gatewayId, revision);
+  private deleteRevokedCredential(gatewayId: string, revision: number, record: PairedHost | null): Promise<boolean> {
+    return this.deleteCredentialInstance(gatewayId, revision, record);
   }
 
   /**
@@ -1760,14 +2209,38 @@ export class AppController {
    * `hostWriteChain` is newer and its token survives. Holding the credential chain across the
    * delete also keeps a write registered meanwhile ordered *after* it. Returns true when the
    * instance was still current and its record/credential were deleted.
+   *
+   * `record` is the in-memory record this removal owns. It is dropped from the list *inside* this
+   * transaction, before `forgetHost` — matched by exact identity, never by `gatewayId`, because a
+   * newer pairing of the same gateway reuses the id (M5). Not after `forgetHost` resolves: that
+   * promise settles only after the credential is deleted *and* the wipe verified by reading the
+   * key back, which is a whole store round-trip after the record left the store. Reconciling on
+   * that tail left a revoked host in the list — the store had dropped it, the list still showed
+   * it — whenever the token wipe was slow (see the M5 test for a revocation parked on its token
+   * write). Dropping it with the record removal keeps the two in step, and a wipe that fails still
+   * drops the record, exactly as the callers' own prune does.
    */
-  private deleteCredentialInstance(gatewayId: string, revision: number): Promise<boolean> {
+  private deleteCredentialInstance(gatewayId: string, revision: number, record: PairedHost | null): Promise<boolean> {
     return this.enqueueCredentialOperation(gatewayId, async () => {
       if (this.credentialRevision(gatewayId) !== revision) return false;
-      await this.serializeHostWrite(() => forgetHost(gatewayId));
+      await this.serializeHostWrite(async () => {
+        this.dropHostRecord(record);
+        return forgetHost(gatewayId);
+      });
       this.bumpCredentialRevision(gatewayId);
       return true;
     });
+  }
+
+  /**
+   * Drop one exact record from the in-memory host list (M5). A newer pairing of the same gateway
+   * reuses its id with a new `pairedAt`/device id, so only the identity the removal owns goes; a
+   * `null` record (an attempt that never built one) drops nothing.
+   */
+  private dropHostRecord(record: PairedHost | null): void {
+    if (record === null) return;
+    const remaining = this.hosts.filter((candidate) => !sameHostRecord(candidate, record));
+    if (remaining.length !== this.hosts.length) this.hosts = remaining;
   }
 
   private notificationCopy: { title: string; body: (toolName: string) => string } = {
@@ -1820,7 +2293,8 @@ export class AppController {
       // is brought forward; the retry loop keeps the backoff step.
       const state = this.client?.state ?? 'idle';
       if (state === 'ready' || state === 'connecting' || state === 'waiting-hello' || state === 'waiting-client-hello') return;
-      if (state === 'gateway-disabled' || state === 'revoked' || state === 'update-required') return;
+      if (state === 'gateway-disabled' || state === 'revoked' || state === 'update-required'
+        || state === 'reauth-required') return;
       this.reconnector?.retryNow();
     });
     hook.unsubscribe = () => subscription.remove();
@@ -1851,6 +2325,139 @@ export class AppController {
     this.bump();
   }
 
+  // -------------------------------------------------------------------------
+  // Spec 011 — session authoring (workspaces / create / models / select-model)
+  // -------------------------------------------------------------------------
+
+  /** Fetch this host's workspaces for the picker. Refusals keep the wire's own code. */
+  async listWorkspaces(): Promise<void> {
+    if (this.client?.state !== 'ready') return;
+    this.authoring.workspacesState = 'loading';
+    this.authoring.workspacesError = null;
+    this.bump();
+    try {
+      const answer = await this.client.request('workspaces');
+      this.authoring.workspaces = parseWorkspaceItems(answer);
+      this.authoring.workspacesState = 'ready';
+    } catch (error) {
+      this.authoring.workspaces = [];
+      this.authoring.workspacesError = authoringErrorCode(error);
+      this.authoring.workspacesState = 'error';
+      this.recordError(error);
+    }
+    this.bump();
+  }
+
+  /** Create a session in one workspace. Returns the new id so the caller can open it. */
+  async createSession(input: { workspaceId: string }): Promise<AuthoringResult<string>> {
+    if (this.client?.state !== 'ready') return { ok: false, code: 'client/bad-state' };
+    try {
+      const answer = await this.client.request('session-create', { workspaceId: input.workspaceId });
+      const sessionId = typeof answer.sessionId === 'string' ? answer.sessionId : '';
+      if (sessionId === '') return { ok: false, code: 'client/bad-message' };
+      // The new session exists on the host now; reflect it without waiting for the next list poll.
+      await this.refreshSessions().catch(() => {});
+      return { ok: true, value: sessionId };
+    } catch (error) {
+      return { ok: false, code: authoringErrorCode(error) };
+    }
+  }
+
+  /** Fetch the model catalog (per-session when an id is given: that reply carries `current`). */
+  async listModels(sessionId?: string): Promise<void> {
+    if (this.client?.state !== 'ready') {
+      // Not an error: the caller retries when the socket is ready. Leaving the state `idle` is what
+      // lets the composer stay silent instead of claiming the Host has no models.
+      return;
+    }
+    this.authoring.modelsState = 'loading';
+    this.authoring.modelsError = null;
+    this.bump();
+    try {
+      const answer = await this.client.request('models', sessionId === undefined ? {} : { sessionId });
+      const models = parseModelItems(answer);
+      this.authoring.models = models;
+      const current = parseCurrentModel(answer);
+      if (current !== null) {
+        // `current` is `{ provider, model, reasoningEffort? }` with no human label
+        // (dsh-host-adapter.mjs:364-376), so the label comes from the catalog entry with that id.
+        const match = models.find((model) => model.id === current.id);
+        this.authoring.currentModel = {
+          ...current,
+          ...(current.label === undefined && match !== undefined ? { label: match.label } : {}),
+        };
+      }
+      this.authoring.modelsState = 'ready';
+    } catch (error) {
+      // Keep the wire's own code: a `sessions:author` refusal must be explainable as such, not shown
+      // as an empty catalog. The composer turns this into one honest line.
+      this.authoring.models = [];
+      this.authoring.modelsError = authoringErrorCode(error);
+      this.authoring.modelsState = 'error';
+      this.recordError(error);
+    }
+    this.bump();
+  }
+
+  /**
+   * Select a model for one session.
+   *
+   * The gateway needs `provider` + `model` separately; when the caller only knows the catalog id we
+   * take the provider from the catalog entry rather than guessing one. The receipt is applied ONLY
+   * when it confirms this exact request (upstream discards a reply whose `selected` differs), so a
+   * stale or racing reply can never repaint the composer with a model the host did not accept.
+   */
+  async selectModel(input: {
+    sessionId: string;
+    modelId: string;
+    provider?: string;
+    reasoningEffort?: string;
+  }): Promise<AuthoringResult<{ id: string; label?: string; reasoningEffort?: string }>> {
+    if (this.client?.state !== 'ready') return { ok: false, code: 'client/bad-state' };
+    const known = this.authoring.models.find((model) => model.id === input.modelId);
+    const provider = input.provider ?? known?.provider;
+    if (provider === undefined || provider === '') return { ok: false, code: 'client/model-provider-unknown' };
+    try {
+      const answer = await this.client.request('select-model', {
+        sessionId: input.sessionId,
+        provider,
+        model: input.modelId,
+        ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      });
+      if (!receiptConfirmsSelection(answer, { provider, model: input.modelId })) {
+        // Accepted per the wire, but not the selection we asked for: keep the old value.
+        return { ok: false, code: 'client/model-not-applied' };
+      }
+      const applied: { id: string; label?: string; reasoningEffort?: string } = {
+        id: input.modelId,
+        ...(known === undefined ? {} : { label: known.label }),
+        ...(input.reasoningEffort === undefined ? {} : { reasoningEffort: input.reasoningEffort }),
+      };
+      this.authoring.currentModel = applied;
+      this.bump();
+      return { ok: true, value: applied };
+    } catch (error) {
+      return { ok: false, code: authoringErrorCode(error) };
+    }
+  }
+
+  /**
+   * Drop everything fetched for the previous host/connection. Called on forget, on a new connection
+   * and before a host switch; `snapshot()` additionally reports these as empty while the socket is
+   * not ready, so a disconnect can never show one computer's workspaces against another.
+   */
+  private clearAuthoring(): void {
+    this.authoring = {
+      workspacesState: 'idle',
+      workspacesError: null,
+      workspaces: [],
+      models: [],
+      currentModel: null,
+      modelsState: 'idle',
+      modelsError: null,
+    };
+  }
+
   snapshot(): AppStateSnapshot {
     const needsDecision: Record<string, number> = {};
     for (const session of this.sessions.snapshot().items) {
@@ -1871,6 +2478,9 @@ export class AppController {
       openApprovals: this.openApprovals,
       history: this.history.items,
       historyHasMore: this.history.page.hasMore,
+      historyHasEarlier: this.history.page.hasMore && this.history.page.nextBeforeSeq !== null,
+      historyLoading: this.historyLoad.loading,
+      historyError: this.historyLoad.error,
       outgoing: this.outgoing
         .promptsFor(this.openSessionId ?? '')
         .filter((item) => item.status !== 'acked')
@@ -1882,6 +2492,11 @@ export class AppController {
         })),
       remoteControlOff: this.remoteControlOff,
       updateRequired: this.updateRequired,
+      // NOTE: this is the retry LOOP's own state, not a boolean "reconnecting". `state === 'live'` is
+      // the healthy state (the loop is watching a live socket) and it exists for the whole life of a
+      // connection — so `reconnect !== null` must never be read as "reconnecting". Use
+      // `reconnectInProgress()` for that question; the old wiring used non-nullness and disabled the
+      // primary action forever on a perfectly healthy link.
       reconnect: this.reconnector === null
         ? null
         : (() => {
@@ -1889,7 +2504,21 @@ export class AppController {
             return { state: reconnectState.state, attempt: reconnectState.attempt, lastDelayMs: reconnectState.lastDelayMs };
           })(),
       pairing: this.pairing,
+      pairingPending: this.pairingPending,
       pinnedTransportUnavailable: this.pinnedTransportUnavailable,
+      // Spec 011: read straight from the live device so a disconnect (client === null) reads as
+      // UNKNOWN rather than as the previous host's grant.
+      // Spec 011: the authoring state is only meaningful while a ready socket exists. Reporting it as
+      // empty/idle otherwise is what makes a disconnect (or a teardown that has not cleared yet)
+      // read as "nothing fetched", never as the previous computer's workspaces.
+      grantedScopes: this.client?.device?.scopes ?? [],
+      workspaces: this.client?.state === 'ready' ? this.authoring.workspaces : [],
+      workspacesState: this.client?.state === 'ready' ? this.authoring.workspacesState : 'idle',
+      workspacesError: this.client?.state === 'ready' ? this.authoring.workspacesError : null,
+      models: this.client?.state === 'ready' ? this.authoring.models : [],
+      currentModel: this.client?.state === 'ready' ? this.authoring.currentModel : null,
+      modelsState: this.client?.state === 'ready' ? this.authoring.modelsState : 'idle',
+      modelsError: this.client?.state === 'ready' ? this.authoring.modelsError : null,
       lastError: this.lastError,
       locale: this.localeFor(),
     };
@@ -1913,21 +2542,6 @@ export type { SessionDeepLink } from './core/deeplink';
 /** Same stored host record: a newer pairing of one gateway has a new `pairedAt`/device id. */
 function sameHostRecord(left: PairedHost, right: PairedHost): boolean {
   return left.deviceId === right.deviceId && left.pairedAt === right.pairedAt;
-}
-function withTimeout<T>(promise: Promise<T>, ms: number, code: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new CoreError({ code, message: 'Timed out', retryable: true })), ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error: unknown) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
-  });
 }
 
 export type { ApprovalNotification };

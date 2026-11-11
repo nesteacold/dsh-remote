@@ -19,8 +19,10 @@ import tls from 'node:tls'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import WebSocket from 'ws'
 import plugin, { Config } from '../lib/index.mjs'
+import { createGatewayState } from '../lib/gateway-state.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 
 const REMOTE_DISABLED = 'remote/disabled'
@@ -51,7 +53,9 @@ async function startGateway(overrides = {}) {
     if (upgrade) upgrade.handler(req, socket, head)
     else socket.destroy()
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe: undici refuses whole classes of ports ("bad port"), and `listen(0)`
+  // returns whatever the OS picks; the helper re-binds until `fetch` accepts it.
+  await listenFetchSafe(server)
   const port = server.address().port
   const config = {
     deviceFile: path.join(temp, `devices-${port}.json`),
@@ -464,6 +468,222 @@ function openWedgedSocket(tlsUrl, token) {
       'an explicit remoteControl.enabled wins over the legacy alias (on)')
     assert.equal(plugin.remoteControlEnabled({ gatewayEnabled: false }), false)
     passed('config precedence: explicit remoteControl.enabled beats legacy gatewayEnabled')
+  }
+
+  // =========================================================================
+  // 5. The switch position persists in the gateway state file: an OFF set in
+  //    the UI survives a reload (the owner's complaint), and the saved position
+  //    is what the next start uses. The config has NO veto over it — see 5d for
+  //    the schema measurement that makes a config-level veto impossible.
+  // =========================================================================
+  {
+    // One SHARED state file across instances, so a restart is observable; each
+    // startGateway otherwise gets its own per-port file.
+    const stateFile = path.join(temp, 'persisted-switch.gateway.json')
+    const withState = (extra = {}) => startGateway({ gatewayStateFile: stateFile, ...extra })
+
+    // 5a. Switching off persists `remoteControl:false` and says so.
+    {
+      const instance = await withState({ remoteControl: { enabled: true } })
+      try {
+        await setGateway(instance, 'persistent')
+        const off = await instance.post('remote-control', { enabled: false })
+        assert.equal(off.status, 200, `switch-off → ${off.status}: ${JSON.stringify(off.data)}`)
+        assert.equal(off.data.persists, true, 'a saved switch-off must report persists:true')
+        assert.equal(off.data.remoteControl.enabled, false)
+        const onDisk = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+        assert.equal(onDisk.version, 1, 'the persisted switch keeps the state file at version 1')
+        assert.equal(onDisk.remoteControl, false, 'the state file must hold the off position')
+        assert.equal(onDisk.mode, 'disabled', 'the kill switch still persists the runtime mode off')
+        passed('switch-off persists remoteControl:false in the gateway state file (persists:true)')
+      } finally {
+        await instance.close()
+      }
+    }
+
+    // 5b. The owner's symptom: the config says enabled:true, the file says false.
+    //     An earlier run may also have left `mode: persistent` behind (the state
+    //     module's own writer, so this is a real file shape), and the saved OFF
+    //     must outrank that mode: the initial mode follows the EFFECTIVE switch.
+    createGatewayState(stateFile).setMode('persistent')
+    {
+      const instance = await withState({ remoteControl: { enabled: true } })
+      try {
+        const status = await instance.status()
+        assert.equal(status.remoteControl.enabled, false, 'a saved switch-off must survive a restart')
+        assert.equal(status.remoteControl.accepting, false)
+        assert.equal(status.gatewayEnabled, false, 'a saved switch-off must not run the gateway')
+        assert.equal(status.gatewayMode, 'disabled',
+          'mode:persistent in the file must not start the gateway while the saved switch is off')
+        passed('saved switch-off survives a restart: config enabled:true + saved mode:persistent still start disabled')
+      } finally {
+        await instance.close()
+      }
+    }
+
+    // 5c. Switching back on persists `true`; a third start reports it, and the
+    //     saved persistent mode comes back now that the switch allows it.
+    {
+      const second = await withState({ remoteControl: { enabled: true } })
+      try {
+        const on = await second.post('remote-control', { enabled: true })
+        assert.equal(on.status, 200)
+        assert.equal(on.data.persists, true, 'a saved switch-on must report persists:true')
+        assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).remoteControl, true)
+      } finally {
+        await second.close()
+      }
+      const third = await withState({ remoteControl: { enabled: true } })
+      try {
+        const status = await third.status()
+        assert.equal(status.remoteControl.enabled, true, 'a saved switch-on must survive a restart')
+        assert.equal(status.gatewayEnabled, true, 'a saved switch-on lets the saved persistent mode start')
+        assert.equal(status.gatewayMode, 'persistent')
+        passed('saved switch-on survives a restart and releases the saved persistent mode')
+      } finally {
+        await third.close()
+      }
+    }
+
+    // 5d. There is NO config veto over a saved switch-on, and this block pins
+    //     both halves of why: the schema measurement that makes one impossible,
+    //     and the owner-shaped config that must still honour the saved `true`.
+    {
+      // Why a config veto cannot exist: `apply()` never sees the owner's
+      // profile. DSH hands it the SCHEMA-APPLIED config, and the schema fills
+      // the switch's default `false` in before the plugin can look at it — so
+      // at the only place the code can look, an explicit `false` and an
+      // untouched default are the same value and "the owner said no" is
+      // unrepresentable. A veto built on that value would drop EVERY saved
+      // `true` on the next reload, which is the bug persistence exists to fix.
+      // Do not rebuild a config veto on this field.
+      assert.equal(Config({}).remoteControl.enabled, false,
+        'the schema injects remoteControl.enabled:false, so a config false cannot be told apart from the default and cannot mean "the owner said no"')
+      assert.equal(Config({ lanEnabled: true, lanHost: '127.0.0.1' }).remoteControl.enabled, false,
+        'the owner-shaped config (lanEnabled + lanHost, no switch key) receives that same injected default')
+
+      // The observable consequence. The owner's profile carries only
+      // `lanEnabled`/`lanHost`, so the config the plugin receives is the
+      // schema's output — which carries `remoteControl: {enabled:false}`.
+      // Passing exactly that block reproduces production; the rest of the
+      // harness config stays test-owned (spreading all of `Config()` here would
+      // blank `deviceFile` and write into the owner's real `~/.dsh`).
+      const state = createGatewayState(stateFile)
+      state.setRemoteControl(true)
+      state.setMode('persistent')
+      assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).remoteControl, true,
+        '5d needs the state file to hold a saved switch-on')
+      const instance = await withState({ remoteControl: Config({ lanEnabled: true, lanHost: '127.0.0.1' }).remoteControl })
+      try {
+        const status = await instance.status()
+        assert.equal(status.remoteControl.enabled, true,
+          'the schema-injected default remoteControl.enabled:false must not veto a saved switch-on')
+        assert.equal(status.gatewayEnabled, true,
+          'a saved switch-on lets the saved persistent mode start even on a config the schema filled in')
+        assert.equal(status.gatewayMode, 'persistent')
+        passed('no config veto: the schema-injected remoteControl.enabled:false still honours a saved switch-on (and its persistent mode)')
+      } finally {
+        await instance.close()
+      }
+    }
+
+    // 5e. The state module itself: absent means "never moved", booleans round
+    //     trip, and a malformed value refuses to load instead of being repaired
+    //     into a position nobody chose.
+    const unitFile = path.join(temp, 'switch-state-unit.json')
+    const fresh = createGatewayState(unitFile)
+    assert.equal(fresh.remoteControl, undefined, 'a fresh state file has no saved switch decision')
+    fresh.setRemoteControl(true)
+    assert.equal(createGatewayState(unitFile).remoteControl, true)
+    createGatewayState(unitFile).setRemoteControl(false)
+    assert.equal(createGatewayState(unitFile).remoteControl, false)
+    assert.throws(() => fresh.setRemoteControl('yes'), TypeError, 'a non-boolean switch must be refused')
+    const malformed = path.join(temp, 'switch-state-malformed.json')
+    fs.writeFileSync(malformed, JSON.stringify({ version: 1, gatewayId: crypto.randomUUID(), mode: null, remoteControl: 'yes' }))
+    assert.throws(() => createGatewayState(malformed), /invalid remote control switch/,
+      'a malformed switch value must fail loading, not be dropped')
+    passed('createGatewayState round-trips the switch, reports undefined when absent, and refuses a non-boolean')
+
+    // 5f. Fault injection: a failed write must still fire the kill switch.
+    //     The mode write commits to the file BEFORE the live teardown, so the
+    //     same filesystem fault that fails the switch write fails that write
+    //     too. The route must answer 200 with `persists:false` and still close
+    //     the live socket (4004) and the TLS listener, never a 500 with both
+    //     still alive.
+    {
+      const faultFile = path.join(temp, 'fault-switch.gateway.json')
+      const instance = await startGateway({ gatewayStateFile: faultFile, remoteControl: { enabled: true } })
+      try {
+        await setGateway(instance, 'persistent')
+        const live = (await instance.status()).lan.urls[0]
+        assert.ok(live?.startsWith('wss://'), 'the gateway must publish a wss listener')
+
+        const pair = await instance.post('pair', { name: 'Fault phone', publicUrl: `wss://127.0.0.1:${instance.port}/ws/mobile` })
+        assert.equal(pair.status, 201, `pairing while enabled must succeed, got ${pair.status}: ${JSON.stringify(pair.data)}`)
+        const socket = new WebSocket(live, ['dsh-mobile-v1', `dsh-pair.${pair.data.payload.pairingCode}`], {
+          rejectUnauthorized: false,
+          headers: { 'X-DSH-Device-ID': 'fault-test-device' },
+        })
+        const tokenFrame = new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('paired frame timed out')), 3_000)
+          socket.on('message', (data) => {
+            const frame = JSON.parse(data.toString())
+            if (frame.kind !== 'paired') return
+            clearTimeout(timer)
+            resolve(frame)
+          })
+        })
+        await once(socket, 'open')
+        await tokenFrame
+        assert.equal((await instance.status()).connectedClients, 1, 'one live companion socket expected')
+
+        // Break BOTH writes. The state file is read only at startup, so the
+        // in-memory snapshot keeps working while the temp file can no longer be
+        // renamed onto its path: a directory refuses the rename on every OS.
+        fs.rmSync(faultFile, { force: true })
+        fs.mkdirSync(faultFile)
+
+        const socketClosed = new Promise((resolve) => socket.once('close', (code) => resolve(code)))
+        const off = await instance.post('remote-control', { enabled: false })
+        assert.equal(off.status, 200, `a failed write must still answer 200, got ${off.status}: ${JSON.stringify(off.data)}`)
+        assert.equal(off.data.persists, false, 'a failed mode write must report the whole switch-off as not persisted')
+        assert.equal(off.data.remoteControl.enabled, false, 'the switch itself still moves for this run')
+        assert.equal(off.data.gatewayMode, 'disabled', 'the runtime mode still moves for this run')
+
+        const closeCode = await Promise.race([
+          socketClosed,
+          new Promise((_resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(
+              `the live socket is still open ${CLOSE_BUDGET_MS}ms after a failed-write switch-off`)), CLOSE_BUDGET_MS)
+            timer.unref?.()
+          }),
+        ])
+        assert.equal(closeCode, 4004, `the live socket must be killed with 4004 even when the write fails, got ${closeCode}`)
+        assert.equal((await instance.status()).connectedClients, 0, 'no companion connection may survive the switch-off')
+
+        // The listener is really gone: not merely unadvertised, but refusing.
+        const target = new URL(live)
+        const lanHost = target.hostname.replace(/^\[|\]$/g, '')
+        const lanPort = Number(target.port)
+        const status = await instance.status()
+        assert.equal(status.lan.listening, false, 'the TLS listener must be closed by the failed-write switch-off')
+        const connectRefused = () => new Promise((resolve) => {
+          const probe = net.connect({ host: lanHost, port: lanPort })
+          probe.once('connect', () => { probe.destroy(); resolve(false) })
+          probe.once('error', () => resolve(true))
+        })
+        let refused = false
+        const deadline = Date.now() + CLOSE_BUDGET_MS
+        while (!refused && Date.now() < deadline) {
+          refused = await connectRefused()
+          if (!refused) await delay(50)
+        }
+        assert.equal(refused, true, `a fresh connect to ${lanHost}:${lanPort} must be refused after the switch-off`)
+        passed('a failed state-file write still fires the kill switch: 200, persists:false, socket 4004, listener refused')
+      } finally {
+        await instance.close()
+      }
+    }
   }
 
   void listeningSockets

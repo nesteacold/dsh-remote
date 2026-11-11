@@ -1,0 +1,51 @@
+# 15 — create a session from the phone (spec 011 authoring, happy path).
+#
+# SCENARIO: paired device whose `hello.device.scopes` includes `sessions:read` +
+#           `sessions:author` (the harness default). The fixture serves two workspaces and accepts
+#           `session-create`, answering with a deterministic id (`sess-created-1`) whose row it then
+#           serves from every later `sessions`/`search` answer.
+# HARNESS:  `--cert-mode ok`; default scopes, no scenario arming.
+# MANUAL:   biometric prompt only (`subflows/unlock.yaml`).
+#
+# HOOKS: `workspace-home` (the tab the app opens on), `new-session` (the primary action, whose
+#        `enabled` state is the proof that the grant + workspace gating really passed),
+#        `session-composer` (the created session really opened) and `session-title` (the header
+#        title). The workspace name and the created title are fixture DATA, matched as text on
+#        purpose: they are not app copy, so they are locale-independent (see check-flows.mjs).
+#
+# EXIT CRITERIA:
+#   1. the picker shows the served workspace name and "New session" is ENABLED (grant + selection);
+#   2. tapping it creates the session, and the app opens that session (composer + title present);
+#   3. the fixture saw exactly one `session-create` for the selected workspace and no refusals
+#      (asserted by the orchestrator from `GET /state` → `evidence.sessionCreates`).
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+# Spec 011 P1-A: the app opens on the Workspace home tab. The served workspace name means the
+# `workspaces` frame really arrived and the picker is populated.
+- extendedWaitUntil:
+    visible: ".*DiskTree.*"
+    timeout: 30000
+- assertVisible:
+    id: "workspace-home"
+
+# The authoring gate (grant + selected workspace + loaded list) is open: the action is enabled.
+- assertVisible:
+    id: "new-session"
+    enabled: true
+- tapOn:
+    id: "new-session"
+
+# The app creates the session and opens it: the conversation shell, not the home.
+- extendedWaitUntil:
+    visible:
+      id: "session-composer"
+    timeout: 30000
+- assertVisible:
+    id: "session-title"
+- assertVisible: ".*Created from phone.*"
+- assertNotVisible:
+    id: "new-session-reason"

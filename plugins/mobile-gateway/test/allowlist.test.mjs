@@ -19,6 +19,7 @@ import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -27,9 +28,9 @@ import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs
 import { connect, pair, upgradeStatus } from './client/pair.mjs'
 import * as contract from '@dsh-ext/mobile-protocol'
 import {
-  ADMIN_ONLY_TYPES, CLOSE_REVOKED, COMPANION_CAPABILITIES, COMPANION_DENIED_HOST_ENDPOINTS,
-  COMPANION_V1_TYPES, OP_FORBIDDEN, fetchPathAllowedForCompanion, hostEndpointAllowedForCompanion,
-  isAdminOnlyType, isCompanionType,
+  ADMIN_ONLY_TYPES, AUTHOR_SCOPE, CLOSE_REVOKED, COMPANION_CAPABILITIES, COMPANION_DENIED_HOST_ENDPOINTS,
+  COMPANION_V1_TYPES, OP_FORBIDDEN, SESSIONS_AUTHOR_TYPES, fetchPathAllowedForCompanion,
+  hostEndpointAllowedForCompanion, isAdminOnlyType, isCompanionType,
 } from '../lib/allowlist.mjs'
 import { createDshHostAdapter } from '../lib/dsh-host-adapter.mjs'
 import { PLUGIN_REQUEST_TYPES } from '../lib/plugin-management.mjs'
@@ -178,7 +179,9 @@ async function startGateway() {
     if (upgrade) upgrade.handler(req, socket, head)
     else socket.destroy()
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe: undici refuses whole classes of ports ("bad port"), and `listen(0)`
+  // returns whatever the OS picks; the helper re-binds until `fetch` accepts it.
+  await listenFetchSafe(server)
   const port = server.address().port
   const config = {
     deviceFile: path.join(temp, `devices-${port}.json`),
@@ -279,13 +282,18 @@ try {
   const lanStatus = await instance.waitForLan()
   const endpoint = lanStatus.lan.urls[0]
 
-  const pairDevice = async (name, deviceId) => {
-    const created = await instance.post('pair', { name, publicUrl: endpoint })
+  const pairDevice = async (name, deviceId, scopes) => {
+    const created = await instance.post('pair', { name, publicUrl: endpoint, ...(scopes === undefined ? {} : { scopes }) })
     assert.equal(created.status, 201, JSON.stringify(created.data))
     return pair({ payload: created.data.payload, deviceId, deviceName: name })
   }
 
-  const phone = await pairDevice('Phone A', 'aaaa0000-0000-4000-8000-000000000001')
+  // Spec 011: `sessions:author` is a POSITIVE grant, so this device is paired
+  // without it — the authoring family must then be refused by SCOPE (never
+  // served), which is what section 1 proves. The scope's own positive path is
+  // covered by test/device-authoring.test.mjs.
+  const WITHOUT_AUTHOR = ['sessions:read', 'prompt:send', 'approval:respond']
+  const phone = await pairDevice('Phone A', 'aaaa0000-0000-4000-8000-000000000001', WITHOUT_AUTHOR)
   const otherPhone = await pairDevice('Phone B', 'bbbb0000-0000-4000-8000-000000000002')
 
   // -------------------------------------------------------------------------
@@ -315,6 +323,13 @@ try {
       accepted.set(type, 'device-forgotten') // revokes the caller; scenario 4
       continue
     }
+    if (SESSIONS_AUTHOR_TYPES.includes(type)) {
+      // Spec 011: in the §4 vocabulary since revision 7, but served only to a
+      // device that holds `sessions:author`; this phone was paired without it,
+      // so the scope gate refuses it. The next block asserts all four exactly.
+      accepted.set(type, 'auth/forbidden-scope')
+      continue
+    }
     const reply = await request(phoneConnection, { type, ...(COMPANION_PROBES[type] ?? {}) })
     const expected = contract.OP_RESPONSES[type]
     if (type === 'push-register' || type === 'push-remove') {
@@ -329,7 +344,9 @@ try {
 
   // Every other router type: `op/forbidden`, the caller's requestId, nothing on the Host.
   // The client sends each type as an unknown op (its frame has no operation params).
-  const forbidden = [...ROUTER_TYPES].filter((type) => !isCompanionType(type))
+  // Spec 011: the four authoring types are scoped instead of unknown, so they are
+  // refused by the SCOPE gate (asserted separately below) and not here.
+  const forbidden = [...ROUTER_TYPES].filter((type) => !isCompanionType(type) && !SESSIONS_AUTHOR_TYPES.includes(type))
   const hostCallsBefore = instance.hostRecords.length
   for (const type of forbidden) {
     const requestId = `forbid-${type}`
@@ -343,6 +360,26 @@ try {
   assert.equal(instance.hostRecords.length, hostCallsBefore,
     `a refused type must not reach the Host: ${JSON.stringify(instance.hostRecords.slice(hostCallsBefore)).slice(0, 400)}`)
   passed(`${forbidden.length} non-companion request types → ${OP_FORBIDDEN} with requestId, and never reach the Host`)
+
+  // Spec 011: a device WITHOUT `sessions:author` is refused all four by scope,
+  // with the requestId echoed, and the refusal happens before any Host call —
+  // the fake's call log is the evidence that no handler ran.
+  assert.deepEqual([...SESSIONS_AUTHOR_TYPES].sort(), ['models', 'select-model', 'session-create', 'workspaces'])
+  const authorCallsBefore = instance.hostRecords.length
+  for (const type of SESSIONS_AUTHOR_TYPES) {
+    for (const extra of [{}, { sessionId: 's1' }, { workspaceId: 'w1' }, { sessionId: 's1', provider: 'p', model: 'm' }]) {
+      const requestId = `author-${type}-${Object.keys(extra).length}`
+      const reply = await request(phoneConnection, { type, requestId, ...extra })
+      assert.equal(reply.kind, 'error', `${type} must be refused without sessions:author, got ${JSON.stringify(reply).slice(0, 160)}`)
+      assert.equal(reply.code, 'auth/forbidden-scope', `${type} must be refused by SCOPE, got ${reply.code}`)
+      assert.equal(reply.requestId, requestId, `${type} must echo the requestId`)
+      assert.equal(reply.requestType, type)
+      assert.equal(reply.scope, AUTHOR_SCOPE, `${type} must name the missing scope`)
+    }
+  }
+  assert.equal(instance.hostRecords.length, authorCallsBefore,
+    `an authoring frame without the scope must not reach the Host: ${JSON.stringify(instance.hostRecords.slice(authorCallsBefore)).slice(0, 400)}`)
+  passed(`the ${SESSIONS_AUTHOR_TYPES.length} authoring types → auth/forbidden-scope without ${AUTHOR_SCOPE}, and never reach the Host`)
 
   // An unknown type ('plugin-manager', a future op) is refused the same way.
   for (const type of ['plugin-manager', 'sessions.list', 'not-an-operation', '']) {

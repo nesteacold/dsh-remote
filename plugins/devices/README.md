@@ -2,7 +2,7 @@
 
 A **Devices** page inside DSH Settings (Qoder-style), spec `specs/008-devices-page`. Private package, `engines.dsh: 0.2.2-rc.1`.
 
-- **Allow connections to this device** — switch the local `mobile-gateway` on/off (LAN), generate a `desktop` pairing code (copy + expiry countdown), see this device's addresses, list authorized devices, remove access, edit permissions.
+- **Allow connections to this device** — switch the local `mobile-gateway` on/off (LAN), generate a `desktop` pairing code (copy + expiry countdown), see this device's addresses, list authorized devices, remove access, edit permissions. The switch position is remembered in the gateway state file, so it survives a plugin reload or a DSH restart; the off position is remembered too, and that is the kill switch. If the write fails the page says so and the position applies only until the session ends.
 - **Connect to other devices** — paste an address + pairing string from another Host; this Host dials it (pinned WSS), then lists its sessions, shows history, sends prompts and decides approvals.
 
 It needs `@dsh-ext/mobile-gateway` loaded in the same profile (the page drives its `/mgw/*` admin routes). It does not edit the gateway, DSH core, or the protocol package.
@@ -19,7 +19,7 @@ or add it from the plugin manager UI ("install from folder"). This appends the p
 
 `ws` is not yet a dependency of this folder (no network install in this workspace). `lib/remote-client.mjs` resolves `ws` normally and otherwise falls back to `../../mobile-gateway/node_modules/ws`. For a standalone install add `"ws": "^8.18.0"` to `dependencies` and run `npm install`.
 
-Config (`cordis.patch.yml`): `dataDir` (default `~/.dsh/devices-page`), `allowPublicRemotes` (default `false`), `remoteSessions` (default `true`, the multi-host gateway wrapper), `sessionCacheMaxBytes` (default 2 MiB per transcript file) and `sessionCacheRotations` (default 2) for the offline copy below.
+Config (`cordis.patch.yml`): `dataDir` (default `~/.dsh/devices-page`), `allowPublicRemotes` (default `false`), `remoteSessions` (default `true`, the multi-host gateway wrapper), `sessionCacheMaxBytes` (default 2 MiB per transcript file) and `sessionCacheRotations` (default 2) for the offline copy below. The link supervisor is configured by `autoReconnect` (default `true`), `reconnectDelaysMs` (default `[1000, 2000, 5000, 10000, 30000]`, each entry clamped to an integer in `[100, 300000]` ms before the ±20% jitter; an empty or invalid list falls back to the default) and `reconnectStableMs` (default `10000`, clamped to the same range): every stored remote is dialled once at start-up and again, with that bounded ±20% backoff, whenever the Host drops the link on its own, so a remote Host's workspace group returns after either side restarts without a human pressing Reconnect. The backoff sequence starts over only once the link has stayed online for `reconnectStableMs` — a host that greets and immediately drops keeps climbing instead of being redialled at the first step forever. A close this side asked for (including one that arrives during the TLS handshake: the pending socket is destroyed before the credential-bearing upgrade), a `4401` revocation (the token is wiped), a missing credential and a `pin-mismatch` (the host now presents another certificate; nothing was sent, the row says so and only pairing again clears it) are never retried automatically, and `autoReconnect: false` restores the explicit-only behaviour. `test/auto-reconnect.test.mjs` and `test/reconnect-hardening.test.mjs` cover it.
 
 ## Usage
 

@@ -30,9 +30,20 @@ export function createGatewayState(file) {
       && (typeof value.listenHost !== 'string' || value.listenHost === '' || value.listenHost.length > 255)) {
       throw new Error('invalid listen host')
     }
+    // Optional for the same reason as `listenHost`: a file written before the
+    // owner switch was persisted still validates. Absent means "never moved",
+    // which the caller must tell apart from an explicit `false`.
+    if (value.remoteControl !== undefined && typeof value.remoteControl !== 'boolean') {
+      throw new Error('invalid remote control switch')
+    }
     return value
   }
   const read = () => validate(JSON.parse(fs.readFileSync(file, 'utf8')))
+  // Single writer by design: every createGatewayState() instance keeps its OWN
+  // snapshot and replaces the file wholesale, so two instances (or two
+  // processes) on one file can drop each other's fields. The atomic replacement
+  // only prevents a torn read; it does not prevent a lost update. Locking is
+  // deliberately out of scope.
   const write = (value, initial = false) => {
     fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
     const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
@@ -74,6 +85,16 @@ export function createGatewayState(file) {
     setListenHost(host) {
       if (typeof host !== 'string' || host === '' || host.length > 255) throw new TypeError('invalid listen host')
       const next = { ...state, listenHost: host }
+      validate(next)
+      write(next)
+      state = next
+    },
+    // The owner's last "Allow connections" position (POST /mgw/remote-control).
+    // `undefined` means the switch was never moved: the config decides at start.
+    get remoteControl() { return state.remoteControl },
+    setRemoteControl(enabled) {
+      if (typeof enabled !== 'boolean') throw new TypeError('invalid remote control switch')
+      const next = { ...state, remoteControl: enabled }
       validate(next)
       write(next)
       state = next

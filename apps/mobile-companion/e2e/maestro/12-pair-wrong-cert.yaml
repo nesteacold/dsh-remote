@@ -1,0 +1,40 @@
+# 12 — the certificate does not match the QR: abort and send nothing (US1 §2, FR-002, SC-002).
+#
+# SCENARIO: a fixture instance started with `--cert-mode wrong`: it advertises the SHA-256 of leaf
+#           A in the pairing QR and serves leaf B. This is what a regenerated certificate or an
+#           impostor on the network looks like to the phone.
+# HARNESS:  `node e2e/harness/gateway.mjs --cert-mode wrong` (separate run; the orchestrator uses
+#           its own instance and asserts `upgradeAttempts === 0`).
+# MANUAL:   biometric prompt only. The certificate modes `expired` / `not-yet` cannot be judged in
+#           a simulator-agnostic way here: Node accepts those leaves by design and only the device
+#           trust manager refuses them (see device-validation.md §4.1).
+#
+# EXIT CRITERIA:
+#   1. the pair screen shows the "not the computer the code belongs to / nothing was sent" copy;
+#   2. the app does not pair and no session row hook appears;
+#   3. the fixture saw **zero HTTP upgrade requests** and no pairing code / device id on the wire —
+#      the pin check must abort inside the TLS handshake, before the upgrade request (SC-002).
+#      That is a server-side assertion (`GET /state`), not a UI one, and is the actual security
+#      property; the UI copy alone would not prove it.
+
+appId: com.dshext.companion
+env:
+  PAIR_QR: ${PAIR_QR}
+---
+- launchApp:
+    clearState: true
+    clearKeychain: true
+    permissions:
+      camera: deny
+
+- runFlow: subflows/unlock.yaml
+- tapOn: ".*(Pair a computer|Ghép đôi máy tính).*"
+
+- runFlow: subflows/pair-paste.yaml
+
+- extendedWaitUntil:
+    visible: ".*(Could not pair|Không ghép đôi được).*"
+    timeout: 30000
+- assertVisible: ".*(That computer is not the one the code belongs to|Máy tính này không khớp với mã).*"
+- assertNotVisible:
+    id: "session-row-sess-alpha"

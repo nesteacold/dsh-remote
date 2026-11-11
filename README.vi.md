@@ -132,6 +132,18 @@ sequenceDiagram
 Hai cửa sổ, một quyết định. Có mã cũng không tự vào được — phải có người ngồi máy
 này nhìn danh sách chờ mà bấm duyệt, và có thể bớt quyền ngay lúc duyệt.
 
+**Công tắc Allow được nhớ.** Bật lên một lần là gateway ghi vị trí đó vào file
+trạng thái, nên nạp lại plugin hay khởi động lại DSH nó vẫn quay về đúng thế —
+chế độ và địa chỉ đã lưu nằm sẵn trong file đó, nên nó lắng nghe trở lại trước khi
+bạn kịp động tay. Ý của công tắc là vậy: không phải mỗi phiên lại tự mở cửa cho máy
+mình. Kéo theo một hệ quả nên biết trước: restart DSH không còn là cách thu hồi
+quyền nữa. Muốn thu hồi thì tắt công tắc — công tắc chính là công tắc ngắt, và vị
+trí tắt cũng được nhớ. Máy chưa từng bật lần nào thì vẫn khởi động ở trạng thái
+tắt; mặc định đó không đổi. Còn khi file trạng thái đang ghi "bật" thì profile
+không ép nó về tắt được: DSH điền sẵn giá trị mặc định của công tắc trước khi
+plugin đọc config, nên `enabled: false` viết trong profile không phân biệt được với
+chính cái mặc định ấy. Muốn tắt thì tắt trong UI — lần ghi đó mới là lần được nhớ.
+
 ### 3. Xem qua app điện thoại
 
 `apps/mobile-companion` nói cùng một hợp đồng, nên điện thoại ghép đôi y hệt và

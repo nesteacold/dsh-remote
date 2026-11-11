@@ -14,9 +14,12 @@
 //    implements for the legacy loopback admin client. Keeping the list explicit
 //    makes `test/allowlist.test.mjs` able to enumerate it.
 //
-// The imported `@dsh-ext/mobile-protocol` package is the contract's source of
-// truth; `COMPANION_PROTOCOL_VERSION` is defined locally until it lands there.
-import * as contract from '@dsh-ext/mobile-protocol'
+// `./vendor/mobile-protocol.mjs` is the GENERATED copy of the contract's source
+// of truth (`packages/mobile-protocol/src/index.mjs`); a bare package specifier
+// would not resolve in an installed tarball. Regenerate with
+// `node scripts/sync-mobile-protocol.mjs`; `COMPANION_PROTOCOL_VERSION` is
+// defined locally until it lands there.
+import * as contract from './vendor/mobile-protocol.mjs'
 
 /** Companion wire-protocol revision (contract §3.5/§3.6). TODO use @dsh-ext/mobile-protocol */
 export const COMPANION_PROTOCOL_VERSION = contract.COMPANION_PROTOCOL_VERSION ?? 1
@@ -116,6 +119,37 @@ export const COMPANION_DENIED_HOST_ENDPOINTS = Object.freeze([
   'speech/*',
 ])
 
+/** Scope that lifts the authoring exemptions below (spec 011). */
+export const AUTHOR_SCOPE = contract.AUTHORING_SCOPE
+
+/**
+ * Spec 011 FR-008: `session/create` and `session/selectModel` stay in the denied
+ * list above, but a device token that actually holds `sessions:author` may now
+ * reach them. The denial is lifted by PERMISSION, never by deleting the entry,
+ * so a device without the scope is denied here exactly as before — and a router
+ * regression that skipped the scope gate still could not reach a create/model
+ * write. These are the only two endpoint forms in the list that the scope
+ * covers; `workspace/create`, `session/rename`, the plugin/schedule/settings
+ * families and everything else stay denied for every device, whatever it holds.
+ */
+export const COMPANION_AUTHOR_DENIED_ENDPOINTS = Object.freeze(['session/create', 'session/selectModel'])
+
+/**
+ * Spec 011: the four authoring message types. They remain in `ADMIN_ONLY_TYPES`
+ * (the enumeration of everything outside the companion surface, kept intact so a
+ * new router type cannot slip in unclassified) — the router now serves them to a
+ * device that holds `sessions:author`, and refuses them by scope to any other.
+ */
+export const SESSIONS_AUTHOR_TYPES = Object.freeze(
+  Array.isArray(contract.AUTHORING_CLIENT_TYPES) ? [...contract.AUTHORING_CLIENT_TYPES] : [],
+)
+
+/** Whether `scopes` grants the spec 011 author scope (a malformed list grants nothing). */
+export function holdsAuthorScope(scopes) {
+  if (typeof AUTHOR_SCOPE !== 'string') return false
+  return Array.isArray(scopes) && scopes.includes(AUTHOR_SCOPE)
+}
+
 /** Path prefixes of the shared Fetch channel a device token may never use (file upload). */
 export const COMPANION_DENIED_FETCH_PREFIXES = Object.freeze(['/api/session/upload'])
 
@@ -126,9 +160,19 @@ function matchesEndpoint(pattern, namespace, method) {
   return namespaceMatches && methodMatches
 }
 
-/** Whether a device-token caller may invoke this Host Remote endpoint. */
-export function hostEndpointAllowedForCompanion(namespace, method) {
-  return !COMPANION_DENIED_HOST_ENDPOINTS.some((pattern) => matchesEndpoint(pattern, namespace, method))
+/**
+ * Whether a device-token caller may invoke this Host Remote endpoint.
+ *
+ * `scopes` is the calling device's live scope list. It only matters for the
+ * endpoints in {@link COMPANION_AUTHOR_DENIED_ENDPOINTS}: a device holding
+ * `sessions:author` reaches them, every other caller is denied. Omitted scopes
+ * grant nothing beyond the plain denied list (fail closed).
+ */
+export function hostEndpointAllowedForCompanion(namespace, method, scopes) {
+  const denied = COMPANION_DENIED_HOST_ENDPOINTS.find((pattern) => matchesEndpoint(pattern, namespace, method))
+  if (denied === undefined) return true
+  if (!COMPANION_AUTHOR_DENIED_ENDPOINTS.includes(`${namespace}/${method}`)) return false
+  return holdsAuthorScope(scopes)
 }
 
 /** Whether a device-token caller may use this shared Fetch path (file upload). */
@@ -145,6 +189,11 @@ export function isCompanionType(type) {
 export function isRemoteBridgeType(type) {
   return typeof type === 'string' && Array.isArray(contract.REMOTE_CLIENT_TYPES)
     && contract.REMOTE_CLIENT_TYPES.includes(type)
+}
+
+/** Whether a request `type` is a spec 011 authoring op (not a companion-v1 op either). */
+export function isSessionsAuthorType(type) {
+  return typeof type === 'string' && SESSIONS_AUTHOR_TYPES.includes(type)
 }
 
 /**
@@ -172,7 +221,10 @@ export function scopeDenial(device, type) {
   if (SCOPE_EXEMPT_TYPES.has(type)) return undefined
   // Spec 008: the remote-bridge frames are not companion-v1 ops but they ARE
   // scoped (`harness:remote`); they must not fall through as "not my business".
-  if (!isCompanionType(type) && !isRemoteBridgeType(type)) return undefined
+  // Spec 011: the four authoring types are the same — outside `OPS`, but mapped
+  // to `sessions:author`, so a device without it is refused here (fail closed)
+  // instead of reaching the router's unknown-type refusal.
+  if (!isCompanionType(type) && !isRemoteBridgeType(type) && !isSessionsAuthorType(type)) return undefined
   const scopes = Array.isArray(device?.scopes) ? device.scopes : []
   const scope = Object.hasOwn(contract.SCOPE_BY_TYPE, type) ? contract.SCOPE_BY_TYPE[type] : undefined
   if (scope && scopes.includes(scope)) return undefined
@@ -206,13 +258,26 @@ export const COMPANION_DEVICE_GUARD = Object.freeze({
  * file keeps no dependency on it). Fetch is refused outright: DSH's shared
  * Fetch handler already answers 403 to every non-owner Peer, and the device
  * adapter has no reason to open an HTTP upload, so there is no allowed path.
+ *
+ * Spec 011: `getScopes()` supplies the calling device's LIVE scope list, so the
+ * denied-list half can lift `session/create` and `session/selectModel` for a
+ * device that actually holds `sessions:author` — and for no one else. A missing,
+ * throwing or malformed source grants no exemption (fail closed). Called on
+ * every endpoint, so it must stay synchronous and cheap; the caller reads an
+ * in-memory device record, never the Host.
  * @param {(namespace: string, method: string) => boolean} positiveHostEndpoint
+ * @param {() => unknown} [getScopes]
  */
-export function createPositiveDeviceGuard(positiveHostEndpoint) {
+export function createPositiveDeviceGuard(positiveHostEndpoint, getScopes = () => undefined) {
   if (typeof positiveHostEndpoint !== 'function') throw new TypeError('createPositiveDeviceGuard requires a positive endpoint predicate')
+  if (typeof getScopes !== 'function') throw new TypeError('createPositiveDeviceGuard requires a scopes function when one is given')
   return Object.freeze({
-    hostEndpoint: (namespace, method) => hostEndpointAllowedForCompanion(namespace, method)
-      && positiveHostEndpoint(namespace, method) === true,
+    hostEndpoint: (namespace, method) => {
+      let scopes
+      try { scopes = getScopes() } catch { return false }
+      return hostEndpointAllowedForCompanion(namespace, method, scopes)
+        && positiveHostEndpoint(namespace, method) === true
+    },
     fetchPath: () => false,
   })
 }

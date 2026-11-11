@@ -1,0 +1,54 @@
+# 11 — pairing errors that must be visible (US1 §1, edge cases).
+#
+# These are **client-side** rejections: the app must refuse the pasted payload before opening any
+# socket, with a specific message. No gateway is involved, so this flow runs against any harness
+# (even none) and is the cheapest regression check for `src/core/qr.ts` + `i18n`.
+#
+# REQUIRES env `EXPIRED_QR` — a payload with `expiresAt` in the past. Generate one:
+#   node -e "import('./e2e/harness/pairing.mjs').then(m => console.log(m.buildRejectedOffer('expired')))"
+#
+# HOOKS: `pair-manual-input` / `pair-submit` (same as subflows/pair-paste.yaml). The payload is
+#        never matched as text: `pair-submit` only enables once the field holds something, which is
+#        the deterministic proof the paste landed without echoing an opaque code into a selector.
+#
+# EXIT CRITERIA:
+#   1. an expired payload shows the "expired / already used" copy — and *only* that;
+#   2. no pairing request is attempted (orchestrator: `upgradeAttempts` unchanged);
+#   3. the submit hook is still present and enabled after the failure (the screen is not stuck busy).
+
+appId: com.dshext.companion
+env:
+  EXPIRED_QR: ${EXPIRED_QR}
+---
+- launchApp:
+    clearState: true
+    clearKeychain: true
+    permissions:
+      camera: deny
+
+- runFlow: subflows/unlock.yaml
+- assertVisible: ".*(Pair a computer|Ghép đôi máy tính).*"
+
+# Reach the pair screen without pairing.
+- tapOn: ".*(Pair a computer|Ghép đôi máy tính).*"
+- assertVisible: ".*(Pair your computer|Ghép đôi máy tính).*"
+
+- tapOn:
+    id: "pair-manual-input"
+- inputText: ${EXPIRED_QR}
+- assertVisible:
+    id: "pair-submit"
+    enabled: true
+- hideKeyboard
+- tapOn:
+    id: "pair-submit"
+
+# The typed failure, not a generic one.
+- extendedWaitUntil:
+    visible: ".*(Could not pair|Không ghép đôi được).*"
+    timeout: 20000
+- assertVisible: ".*(This pairing code expired or was already used|Mã ghép đôi đã hết hạn hoặc đã dùng).*"
+- assertNotVisible: ".*(That computer is not the one the code belongs to|Máy tính này không khớp với mã).*"
+- assertVisible:
+    id: "pair-submit"
+    enabled: true

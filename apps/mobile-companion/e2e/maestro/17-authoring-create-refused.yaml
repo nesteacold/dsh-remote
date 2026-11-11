@@ -1,0 +1,45 @@
+# 17 — the gateway refuses `session-create`: the failure must be VISIBLE, never a silent no-op.
+#
+# SCENARIO: paired, ready, full authoring grant — the action is enabled and really tapped, but the
+#           Host refuses the write. The orchestrator arms
+#           `POST /scenario/session-create-refuse {"enabled":true,"code":"internal"}` before this
+#           flow; `internal` is deliberately NOT an authoring/scope code, because the app must not
+#           report a plain gateway failure as "you were not granted permission".
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: `new-session` (enabled, so the tap is a real authoring attempt) and `new-session-error`
+#        (the visible failure line). Copy is matched in both locales because the user-facing
+#        wording is the point of this flow: the app has to say something happened.
+#
+# EXIT CRITERIA:
+#   1. after the tap, the failure line appears (the app did not swallow the refusal);
+#   2. the app STAYS on the workspace home — no conversation opens, the retry path is the same
+#      screen, so the user can tap again;
+#   3. the refusal was really caused by the Host: the fixture recorded the `session-create` attempt
+#      (asserted by the orchestrator from `GET /state` → `evidence.authoringRequests`).
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+- extendedWaitUntil:
+    visible: ".*DiskTree.*"
+    timeout: 30000
+- assertVisible:
+    id: "new-session"
+    enabled: true
+- tapOn:
+    id: "new-session"
+
+# The refusal is reported on the same screen: a visible line, not a silent no-op.
+- extendedWaitUntil:
+    visible:
+      id: "new-session-error"
+    timeout: 30000
+- assertVisible: ".*(Could not create the session|Không tạo được phiên).*"
+- assertVisible:
+    id: "workspace-home"
+- assertNotVisible:
+    id: "session-composer"

@@ -1,0 +1,32 @@
+# 01 — cold start behind the unlock gate (A020, FR-003, US1 §3).
+#
+# SCENARIO: fresh install state (`clearState` + `clearKeychain`): no stored host, no credential.
+# HARNESS:  any (nothing is contacted before unlock).
+# MANUAL:   the OS biometric / passcode prompt — see subflows/unlock.yaml. The gate itself has no
+#           test hook (it is one button whose copy is locale-dependent), so it stays text-matched.
+#
+# EXIT CRITERIA (all must hold):
+#   1. the gate renders the app title before any session UI;
+#   2. with no stored host, the empty state + "Pair a computer" CTA is shown after unlock;
+#   3. no session row hook is rendered (`session-row-sess-alpha` absent);
+#   4. nothing was sent to the fixture before unlock (asserted by the orchestrator from
+#      `GET /state`: `upgradeAttempts === 0`, `offeredPairingCodes` empty).
+
+appId: com.dshext.companion
+---
+- launchApp:
+    clearState: true
+    clearKeychain: true
+    permissions:
+      # Denied so the pair screen never mounts a live camera preview (deterministic screens).
+      camera: deny
+
+- assertVisible: "DSH Companion"
+
+- runFlow: subflows/unlock.yaml
+
+# No host stored: the sessions screen is the empty state, not a list.
+- assertVisible: ".*(No sessions in this tab yet|Chưa có phiên nào trong mục này).*"
+- assertVisible: ".*(Pair a computer|Ghép đôi máy tính).*"
+- assertNotVisible:
+    id: "session-row-sess-alpha"

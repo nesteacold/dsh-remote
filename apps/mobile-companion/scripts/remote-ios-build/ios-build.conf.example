@@ -1,0 +1,53 @@
+# ios-build.conf.example - config template for the remote iOS build (spec 009)
+#
+# Two ways to use it:
+#   1. Windows driver: copy to  scripts/remote-ios-build/.env.ios-build
+#      (already git-ignored, so a local hostname/user never shows up in `git status`).
+#      `ios-build.conf` in this folder is also read if present, but then keep it uncommitted.
+#   2. Mac orchestrator: copy to  ~/.dsh-ios-build.conf  with mode 600
+#      (`bash bootstrap-mac.sh --apply-guards` writes that template for you).
+#
+# SECRETS ARE NEVER IN THIS FILE.
+#   - no App Store Connect key content, no `.p8` file
+#   - no issuer UUID value
+#   - no certificate, no provisioning profile
+# The Mac reads the key id / key path / issuer from its own ~/.dsh-ios-build.conf only;
+# the Windows driver only ever passes paths and the team id on the command line.
+#
+# Format: KEY=value, one per line, `#` starts a comment, quotes are optional and stripped.
+
+# --- where the Mac answers ---------------------------------------------------------------
+# Tailscale MagicDNS name or 100.x address of the Mac. Never a LAN/Public address:
+# sshd on the Mac is expected to ListenAddress the Tailscale interface only.
+DSH_IOS_HOST=mac-mini.tailnet-example.ts.net
+DSH_IOS_USER=builder
+
+# SSH port. Keep 22 unless sshd was moved; the driver also uses it for scp.
+DSH_IOS_SSH_PORT=22
+
+# --- signing ------------------------------------------------------------------------------
+# Apple Developer team id (10 upper-case letters/digits). Not a secret, but not public either.
+# The driver passes it as --team-id; `xcodebuild` gets it as DEVELOPMENT_TEAM.
+DSH_IOS_TEAM_ID=ABCDE12345
+
+# --- disk policy --------------------------------------------------------------------------
+# APFS volume quota for one build (GB). The volume is deleted whole at the end.
+DSH_IOS_QUOTA_GB=30
+# Refuse to start when the Mac has less free space than this on / (GB).
+DSH_IOS_FLOOR_GB=15
+# Required user-idle time in seconds before a build may start (600 = 10 min).
+DSH_IOS_IDLE_SECONDS=600
+
+# --- run shape ----------------------------------------------------------------------------
+# preview | production | development. Chooses the ExportOptions method only;
+# it never changes signing style (always automatic, always the Mac's key).
+DSH_IOS_PROFILE=production
+
+# Staging directory (relative to the Mac's $HOME) for per-run artifacts that are scp'd back.
+DSH_IOS_STAGE=.dsh-ios-build
+
+# --- Mac-only keys (read by mac/ios-build.sh from ~/.dsh-ios-build.conf) -------------------
+# Copy this block into the Mac's config, not into the Windows copy.
+# DSH_IOS_ASC_KEY_ID=XXXXXXXXXX
+# DSH_IOS_ASC_KEY_PATH=<absolute path of the key file inside the App Store Connect key dir>
+# DSH_IOS_ASC_ISSUER_ID=<fill in by hand on the Mac; never commit, never transfer>

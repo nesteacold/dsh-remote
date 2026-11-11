@@ -28,6 +28,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -42,9 +43,6 @@ import { devicePrincipal } from '../lib/device-peers.mjs'
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const DEV_A = 'authz0000-0000-4000-8000-00000000000a'
 const DEV_B = 'authz0000-0000-4000-8000-00000000000b'
-// WHATWG fetch refuses a few "bad ports"; re-listen until the ephemeral port is usable.
-const FETCH_BAD_PORTS = new Set([1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566,
-  6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080])
 
 async function factory(t, options = {}) {
   const remoteAccess = createTestRemoteAccess()
@@ -63,11 +61,9 @@ async function factory(t, options = {}) {
     res.writeHead(404).end()
   })
   server.on('upgrade', (req, socket, head) => { if (upgrade) upgrade.handler(req, socket, head); else socket.destroy() })
-  for (;;) {
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-    if (!FETCH_BAD_PORTS.has(server.address().port)) break
-    await new Promise((resolve) => server.close(resolve))
-  }
+  // WHATWG fetch refuses a few "bad ports"; the helper re-binds until the
+  // ephemeral port is one `fetch` accepts (test/support/fetch-safe-listen.mjs).
+  await listenFetchSafe(server)
   const port = server.address().port
   const ctx = {
     webServer: {

@@ -1,4 +1,4 @@
-# dsh-plugin-mobile-gateway bundle patch.
+# @dsh-ext/mobile-gateway bundle patch.
 # Applied after dsh-base and dsh-web-app: inserts the persistent /ws/mobile
 # gateway row into the host plane (it consumes `webServer`, the Host Remote
 # Gateway and the `session/event` feed, and publishes no service of its own).
@@ -62,4 +62,4 @@
 # a non-insert patch assigns the target's whole `config`, so the gateway would
 # override DSH's `openAt: never` default for every profile that installs it.
 # Enabling the full-text session index is the owner's own patch-layer choice;
-# see the repository README ("Optional: Full-Text Session Search").
+# see README.md ("Optional: Full-Text Session Search").

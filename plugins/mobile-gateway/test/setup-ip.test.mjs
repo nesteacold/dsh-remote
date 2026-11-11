@@ -73,7 +73,7 @@ fs.symlinkSync(binPath, linkedBin)
 assert.equal(isMainModule(linkedBin), true)
 const linkedInvocation = spawnSync(process.execPath, [linkedBin, '--help'], { encoding: 'utf8' })
 assert.equal(linkedInvocation.status, 0, linkedInvocation.stderr)
-assert.match(linkedInvocation.stdout, /dsh-plugin-mobile-gateway setup/)
+assert.match(linkedInvocation.stdout, /@dsh-ext\/mobile-gateway setup/)
 
 // FR-011 / R9 (T031): the command must refuse instead of configuring anything.
 // `setup`, `init`, `setup-helper`, `remove-helper`, `status` and `remove` all

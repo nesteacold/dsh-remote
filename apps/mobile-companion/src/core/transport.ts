@@ -24,6 +24,22 @@ export type TransportEvent =
 
 export type TransportListener = (event: TransportEvent) => void;
 
+/** Which listener boundary swallowed an exception. Fixed, secret-free names only. */
+export type ListenerFailureBoundary = 'native' | 'transport' | 'client';
+
+/**
+ * What a listener-failure reporter receives: a fixed boundary name and a fixed stage string the
+ * call site chose (e.g. `message`, `onMessage`, `frame:hello`). Deliberately nothing else — no
+ * exception message, payload, frame text or stack can reach a log sink through this channel.
+ */
+export interface ListenerFailureInfo {
+  boundary: ListenerFailureBoundary;
+  stage: string;
+}
+
+/** Injected by the app to make listener failures observable (absent by default: no allocation). */
+export type ListenerFailureReporter = (info: ListenerFailureInfo) => void;
+
 export interface TransportConnectOptions {
   /**
    * SHA-256 of the host leaf certificate, 64 lowercase hex chars (from the QR / stored
@@ -71,9 +87,21 @@ export const TRANSPORT_ERROR = {
 export type TransportErrorCode = (typeof TRANSPORT_ERROR)[keyof typeof TRANSPORT_ERROR];
 export type TransportErrorDetails = Record<string, unknown>;
 
-/** Minimal event emitter shared by transports; keeps listener ordering and error isolation. */
+/**
+ * Minimal event emitter shared by transports; keeps listener ordering and error isolation.
+ *
+ * Isolation stays: one throwing listener cannot break the socket loop. The failure is no longer
+ * invisible though — it is reported to the injected `onListenerFailure` with the fixed kind of
+ * event that was being delivered (`open`/`message`/`close`/`error`, a closed literal union, never
+ * the payload). Nothing here ends a socket: an unrelated listener bug must not disconnect.
+ */
 export class TransportEmitter {
   private readonly listeners = new Set<TransportListener>();
+  private readonly onListenerFailure: ListenerFailureReporter | undefined;
+
+  constructor(onListenerFailure?: ListenerFailureReporter) {
+    this.onListenerFailure = onListenerFailure;
+  }
 
   on(listener: TransportListener): () => void {
     this.listeners.add(listener);
@@ -87,12 +115,23 @@ export class TransportEmitter {
       try {
         listener(event);
       } catch {
-        // A throwing listener must not break the socket's event loop.
+        this.reportListenerFailure(event.type);
       }
     }
   }
 
   clear(): void {
     this.listeners.clear();
+  }
+
+  /** Diagnostics only: a reporter that throws is itself swallowed (it must never alter a socket). */
+  private reportListenerFailure(stage: string): void {
+    const report = this.onListenerFailure;
+    if (report === undefined) return;
+    try {
+      report({ boundary: 'transport', stage });
+    } catch {
+      // best effort
+    }
   }
 }

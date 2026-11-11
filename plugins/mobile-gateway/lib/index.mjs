@@ -11,7 +11,7 @@ import { TRANSPORT_DEFAULTS, normalizeTransportConfig, managedStunServers } from
 import { assistantFinish, failureDetails, toolResultDetails, turnReasonDetails } from './session-event-details.mjs'
 import { toolImages } from './tool-images.mjs'
 import { REMOTE_DISABLED, REMOTE_DISABLED_STATUS, resolveRemoteControl } from './remote-control.mjs'
-// dsh-plugin-mobile-gateway — persistent Host plugin.
+// @dsh-ext/mobile-gateway — persistent Host plugin.
 //
 // Two directions:
 //  1. Agent -> mobile: registers a WebSocket endpoint at /ws/mobile on the dsh
@@ -163,13 +163,15 @@ import { WebSocketServer } from 'ws'
 import devicesModule from './devices.js'
 import { createDshHostAdapter, SESSION_FORMAT_VERSION } from './dsh-host-adapter.mjs'
 import { createDeviceAccess } from './device-peers.mjs'
+import { hostEndpointAllowedForDevice } from './companion-access.mjs'
 import { loadOrCreateTlsIdentity, tlsServerOptions } from './tls.mjs'
 import {
   CLOSE_REVOKED, COMPANION_CAPABILITIES, COMPANION_DEVICE_GUARD, COMPANION_PROTOCOL_VERSION,
-  MIN_CLIENT_VERSION, OP_FORBIDDEN, PROTOCOL_UNSUPPORTED, isCompanionType, scopeDenial,
+  MIN_CLIENT_VERSION, OP_FORBIDDEN, PROTOCOL_UNSUPPORTED, SESSIONS_AUTHOR_TYPES,
+  createPositiveDeviceGuard, isCompanionType, scopeDenial,
 } from './allowlist.mjs'
 import { approvalArgsHash } from './approval-hash.mjs'
-import { createRemoteBridge, REMOTE_SCOPE } from './remote-bridge.mjs'
+import { checkArguments, checkArgumentsWithHost, createRemoteBridge, REMOTE_SCOPE } from './remote-bridge.mjs'
 import { createPairingRequests, otpProof, verificationCode } from './pairing-requests.mjs'
 import { createSpeechInputManager, SPEECH_REQUEST_TYPES } from './speech-input.mjs'
 import { createFileUploadManager, FILE_UPLOAD_REQUEST_TYPES, FILE_UPLOAD_DEFAULTS } from './file-upload.mjs'
@@ -181,7 +183,9 @@ import { gatewayProbeHeader } from './gateway-probe.mjs'
 import { webRestartAvailable, prepareWebRestart } from './gateway-tools.mjs'
 import { serializeMessageText, userMessageTextParts } from './message-text.mjs'
 import { handleScheduleQuery, SCHEDULE_REQUEST_TYPES } from './schedule-management.mjs'
-import { DEVICE_KINDS, SCOPES, REMOTE_CLIENT_TYPES, DESKTOP_DEFAULT_SCOPES } from '@dsh-ext/mobile-protocol'
+// Generated copy of the contract (see scripts/sync-mobile-protocol.mjs): the
+// bare package specifier would not resolve in an installed tarball.
+import { DEVICE_KINDS, SCOPES, REMOTE_CLIENT_TYPES, DESKTOP_DEFAULT_SCOPES, NEVER_DEFAULT_SCOPES } from './vendor/mobile-protocol.mjs'
 import QRCode from 'qrcode'
 
 const { createRegistry, clampPairingTtlMs, MAX_PAIRING_TTL_MS } = devicesModule
@@ -2141,6 +2145,130 @@ async function handleQuery(api, host, agentDefaultModel, msg, pluginContext) {
   return null
 }
 
+// Spec 011: the four authoring ops (`workspaces`, `session-create`, `models`,
+// `select-model`) are served to a device that holds `sessions:author` by the SAME
+// upstream handlers the loopback admin channel uses (`handleQuery`), through THIS
+// connection's non-owner adapter: the positive guard and DSH's `remoteAccess`
+// policy therefore see every Host call, and the handlers themselves are unchanged.
+// What is added here is only the argument rule the desktop bridge already enforces
+// for `session/create` (FR-005). A session the device cannot address needs no rule
+// here: `session/selectModel` is mapped as a `session` resource in
+// `companion-access.mjs` exactly like `session/prompt`, so DSH applies the
+// identical rule to both and no second session policy exists.
+async function admitAuthoring(api, host, agentDefaultModel, msg, device, refreshWorkspaces) {
+  if (msg.type === 'session-create') {
+    const refusal = await createdSessionRefusal(api, msg, device)
+    if (refusal) return refusal
+  }
+  // DSH decides item visibility from the policy bindings, which are built from the
+  // cached workspace ids, so the cache must be current BEFORE the filtered call.
+  if (msg.type === 'workspaces' && typeof refreshWorkspaces === 'function') {
+    await refreshWorkspaces().catch(() => {})
+  }
+  const frame = await handleQuery(api, host, agentDefaultModel, msg, {})
+  // Minor 1 (reviewer, spec 011): a phone learns which workspace ids it may target,
+  // not where the owner's projects live on disk.
+  return msg.type === 'workspaces' ? projectWorkspacesForDevice(frame, device) : frame
+}
+
+/**
+ * Last path segment of a Host path, for a label. Never returns the path itself:
+ * `/home/me/DXVK_Project` → `DXVK_Project`, `C:\Users\me\default-workspace\` →
+ * `default-workspace`. Empty when there is no usable segment.
+ */
+function pathBasename(value) {
+  if (typeof value !== 'string' || value === '') return ''
+  const segments = value.split(/[\\/]+/).filter((segment) => segment !== '')
+  return segments.length === 0 ? '' : segments[segments.length - 1]
+}
+
+/**
+ * Spec 011 Minor 1: the `workspaces` answer for a device that does NOT hold
+ * `workspace:manage` carries only the identity a phone needs to create a session:
+ * `{ workspaceId, name }` per item.
+ *
+ * The Host's workspace baseline also carries the absolute `path`, the member
+ * `sessionIds` and timestamps — Host filesystem structure, which is exactly what a
+ * stolen phone must not learn about a machine it can no longer be trusted on. The
+ * companion app only reads `workspaceId` (or `id`) plus an optional display `name`,
+ * and falls back to the id when the name is absent, so dropping the rest is
+ * compatible with it. A device that may already manage workspaces
+ * (`workspace:manage`) keeps the full Host shape: it is allowed to name paths
+ * anyway, and the desktop bridge already exposes them to that class of device.
+ */
+function projectWorkspacesForDevice(frame, device) {
+  if (!frame || frame.kind !== 'workspaces' || !Array.isArray(frame.items)) return frame
+  const scopes = Array.isArray(device?.scopes) ? device.scopes : []
+  if (scopes.includes('workspace:manage')) return frame
+  const items = []
+  for (const item of frame.items) {
+    if (!item || typeof item !== 'object') continue
+    const id = typeof item.workspaceId === 'string' && item.workspaceId !== ''
+      ? item.workspaceId
+      : typeof item.id === 'string' && item.id !== '' ? item.id : ''
+    // No id: the app drops the row and cannot create a session from it.
+    if (id === '') continue
+    const named = typeof item.name === 'string' && item.name !== ''
+      ? item.name
+      : typeof item.title === 'string' && item.title !== '' ? item.title : ''
+    // Real Hosts store an EMPTY name and only a path (measured 2026-11-10: nine
+    // workspaces, all `name: ""`), so the last path segment is the label. It is a
+    // label, not a location: the path itself never leaves the Host, and a row with
+    // nothing a picker could show is skipped instead of rendering a raw uuid.
+    const name = named !== '' ? named : pathBasename(item.path)
+    if (name === '') continue
+    items.push({ workspaceId: id, name })
+  }
+  // `archivedSessionIds` names sessions the device may not be able to address: it
+  // is archive bookkeeping the peer that can already list those sessions keeps, not
+  // something a phone needs to render a workspace picker.
+  const { archivedSessionIds: _archived, ...rest } = frame
+  return { ...rest, items }
+}
+
+/**
+ * Spec 011 FR-005 for `session-create`, the same rule `remote-bridge.mjs`
+ * already applies to the 008 bridge: `cwd` and `agentPreset` pick an arbitrary
+ * directory or agent composition, so they need `workspace:manage`; a
+ * `workspaceId` must name a workspace of THIS Host, and a device that cannot name
+ * directories must name one at all (lead decision 2026-11-10: the Host's own
+ * default working directory is not a place a phone may choose by omission). The
+ * list is read through the same adapter the create call will use and never cached;
+ * an unreadable list refuses instead of guessing (fail closed).
+ */
+async function createdSessionRefusal(api, msg, device) {
+  const requestId = typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}
+  const refuse = (code, message) => ({ kind: 'error', code, message, requestType: 'session-create', ...requestId })
+  const scopes = Array.isArray(device?.scopes) ? device.scopes : []
+  const workspaceManage = scopes.includes('workspace:manage')
+  if (!workspaceManage) {
+    for (const key of ['cwd', 'agentPreset']) {
+      if (msg[key] === undefined) continue
+      return refuse('remote/argument-denied',
+        `session-create: ${key} needs workspace:manage; pass a workspaceId of an existing workspace`)
+    }
+  }
+  const workspaceId = typeof msg.workspaceId === 'string' ? msg.workspaceId.trim() : ''
+  // A device with `workspace:manage` may place a session anywhere on its Host (the
+  // admin/desktop rule). Every other device MUST name a workspace of this Host: an
+  // omitted, blank, whitespace-only or non-string `workspaceId` would let the create
+  // land in the Host's default working directory, which the phone never chose.
+  if (workspaceManage) return undefined
+  if (workspaceId === '') {
+    return refuse('remote/argument-denied',
+      'session-create: workspaceId is required; name a workspace of this Host')
+  }
+  let baseline
+  try { baseline = await api.workspace.list({}) } catch { baseline = undefined }
+  if (!baseline || !Array.isArray(baseline.items)) {
+    return refuse('remote/unavailable', 'session-create: the Host workspace list is unavailable')
+  }
+  if (!baseline.items.some((item) => item && item.workspaceId === workspaceId)) {
+    return refuse('remote/argument-denied', 'session-create: workspaceId is not a workspace of this Host')
+  }
+  return undefined
+}
+
 // ---------------------------------------------------------------------------
 // Device auth: a QR carries a short-lived one-time pairing code. Claiming it
 // over WebSocket yields a long-lived bearer token exactly once. The registry
@@ -2549,6 +2677,84 @@ function resolveHostGateway(ctx) {
   return undefined
 }
 
+// The plugin package whose Settings → Devices page drives the same `/mgw/*`
+// admin routes as this plugin's own "Mobile Devices" section.
+const DEVICES_PLUGIN_PACKAGE = '@dsh-ext/devices'
+// Loader row ids of that plugin: `dsh-ext.devices`, and any row of it
+// (`dsh-ext.devices.hosts`, …) keeps the same prefix.
+const DEVICES_ENTRY_ID_PREFIX = 'dsh-ext.devices'
+
+/**
+ * Does one `configEditor.entries()` row describe the `@dsh-ext/devices` plugin?
+ *
+ * The exact `Entry` shape was NOT inspectable from this workspace (the DSH build
+ * is an unreadable asar here), so the match is deliberately defensive: any one of
+ * the fields a Loader row is known to use for its package name is enough, and one
+ * shallow nested descriptor is followed because rows that carry settings keep
+ * them under `config`/`options`. A row that says `disabled: true` is not active
+ * and never counts.
+ * @param {unknown} entry one row of `configEditor.entries()`
+ * @returns {boolean}
+ */
+function isDevicesPluginEntry(entry) {
+  if (!entry || typeof entry !== 'object') return false
+  if (entry.disabled === true) return false
+  if (entry.name === DEVICES_PLUGIN_PACKAGE) return true
+  if (entry.package === DEVICES_PLUGIN_PACKAGE) return true
+  if (String(entry.id ?? '').startsWith(DEVICES_ENTRY_ID_PREFIX)) return true
+  for (const key of ['config', 'plugin', 'options']) {
+    const nested = entry[key]
+    if (typeof nested === 'string') {
+      if (nested === DEVICES_PLUGIN_PACKAGE) return true
+      continue
+    }
+    if (!nested || typeof nested !== 'object') continue
+    if (nested.name === DEVICES_PLUGIN_PACKAGE || nested.package === DEVICES_PLUGIN_PACKAGE
+      || nested.plugin === DEVICES_PLUGIN_PACKAGE) return true
+  }
+  return false
+}
+
+/**
+ * Is `@dsh-ext/devices` loaded in this profile?
+ *
+ * Its own Settings → Devices page drives the gateway's `/mgw/*` admin routes, so
+ * the browser half hides this plugin's "Mobile Devices" section while it is
+ * loaded (owner decision 2026-11-10) — otherwise the owner sees two entries for
+ * one set of controls. The client cannot answer that itself (`slots` exposes only
+ * register / registerFactory / inject), so the Host reports it on `/mgw/status`.
+ *
+ * `configEditor.entries()` lists the ACTIVE profile rows, and it is read
+ * optionally: `configEditor` is not in this plugin's `inject`, and a profile
+ * without it must keep working. `ctx.get(name, false)` is the form this file
+ * already relies on (`resolveHostGateway`) — Cordis returns `undefined` instead
+ * of throwing for a service the row did not inject; the single-argument form is
+ * retried in a `try` for contexts that only accept it. Anything unexpected (no
+ * service, a non-array, a throwing reader) reads as `false`, which keeps today's
+ * behaviour: our section stays visible.
+ * @param {object} ctx the plugin context
+ * @returns {boolean} true only when a devices row is provably active
+ */
+function devicesPluginActive(ctx) {
+  if (!ctx || typeof ctx.get !== 'function') return false
+  let editor
+  try {
+    editor = ctx.get('configEditor', false)
+  } catch { /* this context only knows the single-argument form */ }
+  if (!editor) {
+    try {
+      editor = ctx.get('configEditor')
+    } catch { return false }
+  }
+  if (!editor || typeof editor.entries !== 'function') return false
+  let entries
+  try {
+    entries = editor.entries()
+  } catch { return false }
+  if (!Array.isArray(entries)) return false
+  return entries.some(isDevicesPluginEntry)
+}
+
 /**
  * Test seams: the interface table and the bind aliases a test harness injects.
  *
@@ -2667,13 +2873,86 @@ const plugin = {
     // older in-flight `session/list` must not bring back a session the Host just
     // removed. Cleared when a refresh that began after the removal is accepted.
     const removedSessionIds = new Set()
+    // Spec 011 (measured live 2026-11-10): the visible-session snapshot is refreshed
+    // from the Host's `session/list`, which is asynchronous, so a session this
+    // gateway JUST created for a device had no binding for about a second — the very
+    // next `models`/`subscribe` on it was refused `remote-access/denied
+    // (resource-not-allowed)`, and an app that opens the new session immediately
+    // always hits that window. `createdAtVersion` is the mirror of the removal
+    // tombstone below: an id created AFTER a refresh started is not in that answer's
+    // authority either, so the answer must not drop it. Entries are dropped by a
+    // refresh that started after the creation (the Host's own list then reflects it,
+    // and a later removal tombstone covers the reverse direction).
+    const createdAtVersion = new Map() // sessionId -> removalVersion at creation
+    let removalVersion = 0
+    const removedAtVersion = new Map() // sessionId -> removalVersion at removal
+    // Spec 011 FR-003, live blocker 2026-11-10: DSH filters a `workspace/follow`
+    // baseline item by item through `remoteAccess.allows({kind:'workspace', id})`,
+    // and a DSH binding cannot express a wildcard, so the policy can only admit the
+    // workspace ids it is told about. This is that list: the owner `api` sees every
+    // workspace, and the device path re-reads it before answering.
+    let visibleWorkspaceIds = []
+    let workspaceIdsRefreshedAt = 0
+    let workspaceIdsRefresh = null
+    const WORKSPACE_IDS_TTL_MS = 2_000
+    /** Refresh `visibleWorkspaceIds` from the OWNER adapter (the device one is filtered). */
+    const refreshWorkspaceIds = async (ownerApi, { force = false } = {}) => {
+      if (!ownerApi?.workspace || typeof ownerApi.workspace.list !== 'function') return visibleWorkspaceIds
+      if (!force && Date.now() - workspaceIdsRefreshedAt < WORKSPACE_IDS_TTL_MS) return visibleWorkspaceIds
+      // One flight at a time: several devices may ask at once, and the owner list is
+      // the expensive part. A failure keeps the previous list rather than widening or
+      // emptying the grant.
+      if (workspaceIdsRefresh) return workspaceIdsRefresh
+      workspaceIdsRefresh = (async () => {
+        try {
+          const baseline = await ownerApi.workspace.list({})
+          const items = Array.isArray(baseline?.items) ? baseline.items : []
+          visibleWorkspaceIds = items
+            .map((item) => (typeof item?.workspaceId === 'string' && item.workspaceId !== ''
+              ? item.workspaceId
+              : typeof item?.id === 'string' ? item.id : ''))
+            .filter((id) => id !== '')
+          workspaceIdsRefreshedAt = Date.now()
+        } catch (error) {
+          log(`workspace id refresh failed (keeping the previous ${visibleWorkspaceIds.length}): ${error?.message ?? error}`)
+        } finally {
+          workspaceIdsRefresh = null
+        }
+        return visibleWorkspaceIds
+      })()
+      return workspaceIdsRefresh
+    }
     const deviceAccess = createDeviceAccess({
       ctx,
       getDevice: (deviceId) => registry.get(deviceId),
       getVisibleSessionIds: () => visibleSessionIds,
+      getWorkspaceIds: () => visibleWorkspaceIds,
       log,
     })
     const host = api
+    void refreshWorkspaceIds(host, { force: true })
+    /**
+     * Spec 011: make a session this gateway just created for a device addressable at
+     * once, before the client is answered. DSH asks the policy per decision for the
+     * device's bound session ids, so appending the id here is what closes the window;
+     * `invalidate()` refreshes the device's DSH access snapshot for everything else.
+     *
+     * This only ever adds an id the Host itself created in answer to that device's
+     * own `session-create`, so it widens nothing: an id the device never created (or
+     * one it cannot see) still has no binding and is still refused
+     * `remote-access/denied (resource-not-allowed)`. `refreshVisibleSessions()` stays
+     * the reconciliation path and will drop the id once the Host stops reporting it.
+     */
+    const noteSessionCreated = (sessionId) => {
+      const id = typeof sessionId === 'string' ? sessionId.trim() : ''
+      if (id === '') return
+      // A brand-new id cannot be tombstoned; clear defensively so a re-created
+      // identifier is never shadowed by an older removal.
+      removedAtVersion.delete(id)
+      createdAtVersion.set(id, removalVersion)
+      if (!visibleSessionIds.includes(id)) visibleSessionIds = [...visibleSessionIds, id]
+      deviceAccess.invalidate()
+    }
     const agentDefaultModel = ctx.agentDefaultModel
     const options = {
       path: DEFAULT_WS_PATH,
@@ -3020,11 +3299,31 @@ const plugin = {
     let sessionQueues = null
     let sessionProjectionBaselines = {}
     let counter = 0
-    // The saved mode is only honoured when the owner switch permits remote
-    // control at all; `remoteControl.enabled:false` starts (and stays) disabled.
-    // The switch is a *permission*, not a start signal: which mode to start in
-    // still comes from the saved/configured mode, defaulting to "off".
-    let gatewayMode = remoteControlRequested
+    // The owner switch also survives a reload: the saved position is the switch
+    // for this run, unconditionally — there is deliberately NO config veto.
+    // The schema injects `remoteControl.enabled: false` before `apply()` ever
+    // sees the config (`Config({}).remoteControl.enabled === false`, pinned in
+    // test/remote-switch.test.mjs), so a config `false` cannot be told apart
+    // from an untouched default and therefore cannot mean "the owner said no";
+    // a veto built on it would silently drop EVERY saved `true` on the next
+    // reload — the exact bug this persistence exists to fix. It would also add
+    // no authority: `POST /mgw/remote-control` already overrides the config
+    // from the same loopback owner, so persistence changes where the START
+    // comes from, not who may flip the switch. The real ceiling is the runtime
+    // mode below: no listener exists unless the mode is not `disabled`. The
+    // deprecated `gatewayEnabled` alias is not consulted here for the same
+    // reason the resolver folds "not set" and an explicit `false` together.
+    let remoteControlLive = null
+    const savedRemoteControl = gatewayState.remoteControl
+    if (savedRemoteControl !== undefined) remoteControlLive = savedRemoteControl
+    // Runtime owner switch, settable while the plugin lives (POST /mgw/remote-control).
+    const remoteControlEnabled = () => remoteControlLive ?? remoteControlRequested
+    // The saved mode is only honoured when the effective switch permits remote
+    // control at all: a saved switch-off or `remoteControl.enabled:false` starts
+    // (and stays) disabled. The switch is a *permission*, not a start signal:
+    // which mode to start in still comes from the saved/configured mode,
+    // defaulting to "off".
+    let gatewayMode = remoteControlEnabled()
       ? (gatewayState.mode ?? options.gatewayMode ?? (options.gatewayEnabled === true ? 'persistent' : 'disabled'))
       : 'disabled'
     const gatewayInstanceId = crypto.randomUUID()
@@ -3063,10 +3362,6 @@ const plugin = {
     let wedgeTimer = null
     // Sockets targeted by the kill switch, kept until they really close (T014).
     const closingSockets = new Set()
-    // Runtime owner switch, settable while the plugin lives (POST /mgw/remote-control).
-    // Starts from the config; `null` means "follow remoteControlRequested".
-    let remoteControlLive = null
-    const remoteControlEnabled = () => remoteControlLive ?? remoteControlRequested
     // An owner-set endpoint is the only public URL this gateway knows. The
     // `publicUrlFile` read is gone (T031): its only writer was the now-disabled
     // setup-ip helper, so nothing is read from disk any more.
@@ -3790,6 +4085,12 @@ const plugin = {
             const profile = ctx.get?.('profileContext')
             sendJson(res, 200, {
               version: PLUGIN_VERSION,
+              // Owner decision 2026-11-10: while `@dsh-ext/devices` is loaded its
+              // own Settings page owns these controls, so the browser half does
+              // not register its "Mobile Devices" section. Only the Host can see
+              // the profile rows, so it answers here; `false` (including "could
+              // not tell") keeps the section visible, as before.
+              devicesPluginPresent: devicesPluginActive(ctx),
               // T023 (FR-007): authentication is permanent. Reported for the
               // admin UI, never switchable.
               requireAuth: true,
@@ -3815,7 +4116,7 @@ const plugin = {
               platform: process.platform,
               // T031 (FR-011/R9): the tunnel wiring is removed from this file and
               // lib/cloudflare-tunnel.mjs refuses at call time. The shape stays
-              // because the Devices page reads it for the connection plan.
+              // because lib/client.js reads it for the connection plan.
               cloudflare: { supported: false, enabled: false, mode: null, state: 'disabled', publicReady: false, publicUrl: null, hardDisabled: true },
               webrtc: rtc.snapshot(),
               pairingRoute,
@@ -3913,12 +4214,38 @@ const plugin = {
             const body = await readBody(req)
             if (typeof body.enabled !== 'boolean') throw badRequest('enabled must be a boolean')
             remoteControlLive = body.enabled
+            // Persist the position so an OFF (or ON) survives a reload. A failed
+            // write must never skip the kill switch below: the switch still
+            // applies for this run, and the next start follows the saved value.
+            let persists = false
+            try {
+              gatewayState.setRemoteControl(body.enabled)
+              persists = true
+            } catch (error) {
+              log(`failed to persist the remote control switch: ${error.message}`)
+            }
             if (!body.enabled) {
-              if (gatewayMode !== 'disabled') setGatewayMode('disabled', 'remote control turned off by the owner')
-              else applyDisabledState()
+              // `setGatewayMode` commits the mode BEFORE it tears the live service
+              // down, so the same filesystem fault that just failed the switch
+              // write fails this one too: the teardown would never run and the
+              // caller would get a 500 with sockets and the TLS listener alive.
+              // Every path below therefore reaches the kill switch; the fallback
+              // performs it in memory only (`persist:false`).
+              try {
+                if (gatewayMode !== 'disabled') setGatewayMode('disabled', 'remote control turned off by the owner')
+                else applyDisabledState()
+              } catch (error) {
+                log(`could not persist the disabled gateway mode: ${error.message}`)
+                // The whole switch-off was not persisted, even when only this
+                // second write failed after the switch write succeeded.
+                persists = false
+                if (gatewayMode !== 'disabled') setGatewayMode('disabled', 'remote control turned off by the owner (not persisted)', false)
+                else applyDisabledState()
+              }
             }
             log(`remote control ${body.enabled ? 'enabled' : 'disabled'} from management UI`)
             sendJson(res, 200, {
+              persists,
               remoteControl: { enabled: remoteControlEnabled(), accepting: gatewayEnabled },
               gatewayMode,
               connectedClients: clients.size,
@@ -4102,7 +4429,12 @@ const plugin = {
               // endpoint or pin (the client reads the pin by TOFU and proves the
               // code over it), so the Host only returns the code, what it grants
               // and the addresses the client can type.
-              const offerScopes = scopes ?? (kind === 'desktop' ? [...DESKTOP_DEFAULT_SCOPES] : SCOPES.filter((scope) => scope !== REMOTE_SCOPE))
+              // Spec 011 FR-006: a mobile offer that names no scopes must not hand out
+              // `sessions:author` (contract `NEVER_DEFAULT_SCOPES`) — creating sessions
+              // and choosing models is always a deliberate tick, never a default.
+              const offerScopes = scopes ?? (kind === 'desktop'
+                ? [...DESKTOP_DEFAULT_SCOPES]
+                : SCOPES.filter((scope) => scope !== REMOTE_SCOPE && !NEVER_DEFAULT_SCOPES.includes(scope)))
               const created = pairingRequests.createOffer({ kind, scopes: offerScopes.filter((scope) => kind === 'desktop' || scope !== REMOTE_SCOPE) })
               log(`otp pairing offer created: kind=${kind}, scopes=${created.offer.scopes.join(', ')}, expires=${new Date(created.offer.expiresAt).toISOString()}`)
               sendJson(res, 201, {
@@ -4475,7 +4807,11 @@ const plugin = {
           return undefined
         }
         connApi = createDshHostAdapter(ctx.typertGateway, devicePeer.peer, ctx.connection, {
-          guard: deviceAccess.guard,
+          // Spec 011: the guard reads THIS device's live scopes, so the deny layer
+          // can lift `session/create`/`session/selectModel` only for a device that
+          // holds `sessions:author`. Read per call from the registry, never cached:
+          // a revoked or re-paired record stops granting at once.
+          guard: createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => registry.get(device.id)?.scopes),
           onDenied: (endpoint) => log(`device denied host endpoint: ${endpoint} device=${device.id}`),
         })
       }
@@ -4618,7 +4954,13 @@ const plugin = {
           handleRemoteFrame(ws, msg)
           return
         }
-        if (!isCompanionType(msg.type) && !adminCaller) {
+        // Spec 011: the four authoring types are not companion-v1 ops either, but
+        // they ARE scoped (`sessions:author`), so they must reach the scope gate
+        // below instead of being refused as unknown: a device without the scope is
+        // answered `auth/forbidden-scope`, never `op/forbidden`, and never reaches
+        // a handler. Every other non-companion type keeps the refusal here.
+        const authoringType = SESSIONS_AUTHOR_TYPES.includes(msg.type)
+        if (!isCompanionType(msg.type) && !authoringType && !adminCaller) {
           ws.send(stringifyWireFrame({ kind: 'error', code: OP_FORBIDDEN, requestType: msg.type,
             ...requestIdEcho(msg),
             message: `${msg.type} is not part of the companion-v1 operations` }))
@@ -4725,10 +5067,11 @@ const plugin = {
           const requestId = typeof msg.requestId === 'string' && msg.requestId.length > 0 && msg.requestId.length <= 128
             ? { requestId: msg.requestId } : {}
           ws.send(stringifyWireFrame({ kind: 'pong', at: Date.now(), ...requestId }))
-        } else if (!adminCaller && !isCompanionType(msg.type)) {
+        } else if (!adminCaller && !isCompanionType(msg.type) && !authoringType) {
           // Unreachable: a companion type always has an entry above and the
           // allowlist refuses every non-companion type without an admin
-          // channel. Kept as a closed backstop (fail closed).
+          // channel — the scoped authoring types included, which are diverted
+          // to their own branch below. Kept as a closed backstop (fail closed).
           sendFrame({ kind: 'error', code: OP_FORBIDDEN, requestType: msg.type,
             ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}),
             message: `${msg.type} is not part of the companion-v1 operations` })
@@ -4859,6 +5202,23 @@ const plugin = {
             sendFrame(frame
               ? { ...frame, ...requestId }
               : { kind: 'error', code: 'bad-request', requestType: msg.type, ...requestId, message: `${msg.type} could not be served` })
+          })
+        } else if (authoringType && !adminCaller) {
+          // Spec 011: the authoring ops run through the same upstream handlers the
+          // loopback admin client uses, but on THIS connection's non-owner adapter:
+          // the device guard and DSH's `remoteAccess` policy see every call, and the
+          // `admitAuthoring` adds only the argument rules the desktop bridge already
+          // enforces (FR-005). Contract §1: the receipt echoes this request's id.
+          const authorIdentity = requestIdEcho(msg)
+          trackInFlight(ws, msg, admitAuthoring(connApi, connApi, agentDefaultModel, msg, scopedDevice,
+            () => refreshWorkspaceIds(host))).then((frame) => {
+            // Spec 011: the creating device can address the new session on its NEXT
+            // request (an app opens it immediately and asks for its models), so the
+            // id joins the visible-session snapshot before the answer goes out.
+            if (frame?.kind === 'session-created') noteSessionCreated(frame.sessionId)
+            sendFrame(frame
+              ? { ...frame, ...authorIdentity }
+              : { kind: 'error', code: 'bad-request', requestType: msg.type, ...authorIdentity, message: `${msg.type} could not be served` })
           })
         } else if (adminCaller && (PLUGIN_REQUEST_TYPES.has(msg.type) || SCHEDULE_REQUEST_TYPES.has(msg.type)
           || msg.type === 'agent-team' || msg.type === 'subagents' || msg.type === 'workspaces'
@@ -5553,8 +5913,6 @@ const plugin = {
     // aborted, timed-out or invalid refresh changes nothing.
     const VISIBLE_REFRESH_TIMEOUT_MS = Number.isSafeInteger(options.testVisibleRefreshTimeoutMs) && options.testVisibleRefreshTimeoutMs > 0
       ? options.testVisibleRefreshTimeoutMs : 10_000
-    let removalVersion = 0
-    const removedAtVersion = new Map() // sessionId -> removalVersion at removal
     let refreshInFlight = null // Promise of the running refresh
     let refreshPending = false // one more refresh requested while one was running
     let refreshAbort = null
@@ -5574,10 +5932,19 @@ const plugin = {
         // An id removed after this refresh started is not in the answer's
         // authority: the removal event is newer than the data.
         const fresh = ids.filter((id) => !((removedAtVersion.get(id) ?? 0) > startedAtVersion))
+        // Symmetric rule for a session this gateway created for a device after this
+        // refresh started: the answer predates the creation too, so it must not drop
+        // the id that was just made addressable.
+        for (const [id, version] of createdAtVersion) {
+          if (version > startedAtVersion && !fresh.includes(id)) fresh.push(id)
+        }
         visibleSessionIds = [...new Set(fresh)]
         // Accepted: tombstones at or before this refresh's start are reflected in
         // the Host's own list (it started after the removal) and can go.
         for (const [id, version] of removedAtVersion) if (version <= startedAtVersion) removedAtVersion.delete(id)
+        // The same holds for a creation: this answer already reflects it, so the
+        // Host's list is now the authority for that id (a later removal re-tombstones it).
+        for (const [id, version] of createdAtVersion) if (version <= startedAtVersion) createdAtVersion.delete(id)
         deviceAccess.invalidate()
       } catch (error) {
         log(`visible session refresh failed (keeping the previous list): ${error && error.message ? error.message : String(error)}`)
@@ -6008,5 +6375,5 @@ function createMobileGatewayPlugin(seams) {
   return { ...plugin, apply: (ctx, config) => plugin.apply(ctx, config, sealedSeams) }
 }
 
-export { Config, admitMessage, createMobileGatewayPlugin, handleQuery, isLoopbackListenHost }
+export { Config, admitMessage, createMobileGatewayPlugin, devicesPluginActive, handleQuery, isLoopbackListenHost }
 export default plugin

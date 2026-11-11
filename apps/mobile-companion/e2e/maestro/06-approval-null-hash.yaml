@@ -1,0 +1,44 @@
+# 06 — an approval with `argsHash: null` is NOT decidable from the phone (US3 §3, FR-006).
+#
+# SCENARIO: paired; `sess-beta` has pending approval `apv-null` (tool `fs.write`, no hash).
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: `approval-card-apv-null` / `approval-state-apv-null` are asserted present, and the
+#        decide hooks `approval-approve-apv-null` / `approval-reject-apv-null` are asserted
+#        **absent**. That is the security property expressed structurally: a missing hook, not a
+#        screen-wide text coincidence (another card's buttons cannot satisfy it).
+#
+# EXIT CRITERIA:
+#   1. the card says "Decide on your computer";
+#   2. no approve and no reject hook exists for that card;
+#   3. the fixture received no `approval-response` for `apv-null` (orchestrator assertion).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-beta
+  SESSION_TAB: idle
+  SESSION_TITLE: Release notes draft
+  APPROVAL_ID: apv-null
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/open-session.yaml
+
+- extendedWaitUntil:
+    visible:
+      id: "approval-card-${APPROVAL_ID}"
+    timeout: 20000
+- assertVisible: ".*(Approval needed: fs.write|Cần phê duyệt: fs.write).*"
+
+# The notice line is the per-card "decide on the computer" state.
+- assertVisible:
+    id: "approval-state-${APPROVAL_ID}"
+- assertVisible: ".*(Decide on your computer|Quyết định trên máy tính).*"
+
+# The point of the checkpoint: no decision UI at all for this card.
+- assertNotVisible:
+    id: "approval-approve-${APPROVAL_ID}"
+- assertNotVisible:
+    id: "approval-reject-${APPROVAL_ID}"
+- assertNotVisible: ".*(This request changed since you opened it|Yêu cầu đã thay đổi kể từ khi bạn mở).*"

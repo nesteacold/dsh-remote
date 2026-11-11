@@ -140,6 +140,19 @@ Two windows, one decision. The code alone does not let anybody in — a human on
 this machine has to look at the pending request and approve it, and can narrow
 the scopes while doing so.
 
+**The Allow switch is remembered.** Once you turn connections on, the gateway
+writes that position to its state file, so after a plugin reload or a restart it
+comes back the same way — with the saved mode and address already in that file, it
+is listening again before you touch anything. That is the point of the switch: you
+should not have to re-arm your own machine every session. It also means restarting
+DSH is not a way to withdraw permission any more. To withdraw it, switch it off:
+the switch is the kill switch, and the off position is remembered too. A machine
+that has never had the switch turned on still starts off — that default is
+unchanged. While a saved position says on, a profile cannot force it back off:
+DSH fills the switch's default in before the plugin sees your config, so an
+explicit `enabled: false` there is indistinguishable from the default. Switch it
+off in the UI instead — that write is the one that is remembered.
+
 ### 3. Watch the phone companion
 
 `apps/mobile-companion` speaks the same contract, so a phone pairs the same way

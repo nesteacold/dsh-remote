@@ -15,6 +15,8 @@ export interface HistoryMessage {
   text: string;
   /** Our own prompt not yet confirmed by the host. */
   pending?: boolean;
+  /** Set when the Host refused this prompt: the wire code, so the bubble never silently "sends". */
+  failed?: string;
   /** Epoch ms (host `createdAt`/`timestamp`, or the send time for pending rows). */
   at: number | null;
 }
@@ -148,6 +150,31 @@ export class HistoryStore {
    * Our own prompt before the host echoed it. Rendered immediately; replaced when the host
    * reports the same `clientMsgId`.
    */
+  /**
+   * Confirm EVERY still-pending prompt of the open session.
+   *
+   * Safety net: a streamed event for this session proves the turn reached the Host, so no prompt of it
+   * may keep claiming "sending" even if its receipt was lost in a drop. Returns how many changed.
+   */
+  confirmAllPending(): number {
+    let changed = 0;
+    for (const message of this.messages) {
+      if (message.pending === true) {
+        message.pending = false;
+        changed += 1;
+      }
+    }
+    return changed;
+  }
+
+  /** The Host refused this prompt: stop claiming it is sending, and keep the reason for the UI. */
+  markPromptFailed(clientMsgId: string, code: string): void {
+    const prompt = this.messages.find((message) => message.id === clientMsgId);
+    if (prompt === undefined) return;
+    prompt.pending = false;
+    prompt.failed = code;
+  }
+
   addPendingPrompt(clientMsgId: string, text: string): HistoryMessage {
     const existing = this.messages.find((m) => m.id === clientMsgId);
     if (existing) return existing;

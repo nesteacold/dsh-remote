@@ -1,0 +1,72 @@
+# 07 — the request changed between render and decision: review again (US3 §2, M10/A049).
+#
+# SCENARIO: paired; `sess-alpha` shows pending approval `apv-hash`; the fixture is armed with
+#           `POST /scenario/approval/mismatch-once {approvalId:"apv-hash"}` so the **next**
+#           decision is refused with `hash-mismatch` and the stored hash rotates.
+# HARNESS:  `--cert-mode ok`. The orchestrator arms the mismatch immediately before this flow.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: the decide hooks disappear on refusal and the `approval-state-apv-hash` hook carries the
+#        "changed" notice — no "is some Allow button on screen" guesswork. "Review again" has no
+#        hook yet (single button, both locales), so it stays text-matched; it is a documented
+#        gap, not a manual step.
+#
+# EXIT CRITERIA:
+#   1. the first "Allow once" does not decide anything: the card shows the review-again copy and
+#      both decide hooks are gone (M10: a refused card must not be decidable from the stale cache);
+#   2. "Review again" issues a fresh `subscribe`, the replayed push carries the new hash, and the
+#      decide hooks come back;
+#   3. the second "Allow once" succeeds, and its receipt carries the **new** hash
+#      (asserted by the orchestrator: first receipt `hash-mismatch`, last receipt `accepted` true,
+#      and the two `argsHash` values differ).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+  APPROVAL_ID: apv-hash
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/open-session.yaml
+
+- extendedWaitUntil:
+    visible:
+      id: "approval-card-${APPROVAL_ID}"
+    timeout: 20000
+- assertVisible:
+    id: "approval-approve-${APPROVAL_ID}"
+
+# 1) The decision is refused server-side (hash-mismatch).
+- tapOn:
+    id: "approval-approve-${APPROVAL_ID}"
+
+- extendedWaitUntil:
+    visible:
+      id: "approval-state-${APPROVAL_ID}"
+    timeout: 20000
+- assertVisible: ".*(This request changed since you opened it|Yêu cầu đã thay đổi kể từ khi bạn mở).*"
+
+# 1b) M10: a refused card is not decidable until a fresh server view arrives.
+- assertNotVisible:
+    id: "approval-approve-${APPROVAL_ID}"
+- assertNotVisible:
+    id: "approval-reject-${APPROVAL_ID}"
+- assertVisible: "^Review again$|^Xem lại$"
+
+# 2) Ask the host for its current view: the replayed push reopens the card.
+- tapOn: "^Review again$|^Xem lại$"
+- extendedWaitUntil:
+    visible:
+      id: "approval-approve-${APPROVAL_ID}"
+    timeout: 20000
+
+# 3) Decide with the hash the host now shows.
+- tapOn:
+    id: "approval-approve-${APPROVAL_ID}"
+- extendedWaitUntil:
+    visible:
+      id: "approval-state-${APPROVAL_ID}"
+    timeout: 20000
+- assertVisible: ".*(Allowed once|Đã cho phép một lần).*"

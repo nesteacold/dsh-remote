@@ -1,0 +1,36 @@
+# SUBFLOW — get from a cold app start to the session list.
+#
+# PREREQUISITES (device-gated, see docs/device-validation.md §3):
+#   * Android emulator with a screen lock enrolled, e.g.
+#       adb shell locksettings set-pin 1234
+#       adb -e emu finger touch 1        # or: Settings > Security > Fingerprint, enrol
+#     iOS simulator: Features > Face ID > Enrolled, then "Matching Face".
+#   * The app is a **dev build** (Expo Go has no `pinned-ws` module, and the app refuses to
+#     connect without it — `banner.pinnedTransportMissing`).
+#
+# WHY THIS IS NOT PURELY AUTOMATED: the unlock prompt is an OS dialog owned by the platform, not
+# the app's view tree. Maestro can see it, but pressing it is a device-owner step:
+#   Android: `adb -e emu finger touch 1` while the prompt is up (or type the PIN)
+#   iOS:     Simulator menu Features > Face ID > Matching Face (no CLI equivalent)
+# The flow waits for the post-unlock screen instead of pretending it pressed the prompt.
+#
+# WHAT IT PROVES (A020 / FR-003 / US1 §3):
+#   * the app starts locked and only then shows the sessions UI;
+#   * after unlock, either the pair CTA (no stored host) or the session list is rendered.
+
+appId: com.dshext.companion
+---
+- assertVisible: "DSH Companion"
+
+# If the gate is showing its own retry button, the automatic attempt was cancelled / failed.
+- runFlow:
+    when:
+      visible: "^Unlock$|^Mở khoá$"
+    commands:
+      - tapOn: "^Unlock$|^Mở khoá$"
+
+# The OS prompt is up now: a human or `adb -e emu finger touch 1` answers it.
+# Either the empty state (nothing paired yet) or the list (already paired) means "unlocked".
+- extendedWaitUntil:
+    visible: ".*(Pair a computer|Ghép đôi máy tính|No sessions in this tab yet|Chưa có phiên nào trong mục này).*"
+    timeout: 60000

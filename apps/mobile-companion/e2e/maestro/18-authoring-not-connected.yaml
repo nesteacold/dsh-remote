@@ -1,0 +1,41 @@
+# 18 — NOT connected: the app must never accuse the user of a missing permission.
+#
+# SCENARIO: paired, but the Host never completes the handshake. The orchestrator arms
+#           `POST /scenario/suppress-hello {"suppress":true}` before this flow, so the socket opens
+#           and `hello` never arrives: the app knows nothing about scopes yet.
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   biometric prompt only.
+#
+# WHAT IS ASSERTED, AND WHY IT IS NOT THE "connecting" LINE: on a cold start with no session list
+# yet, the workspace home renders its loading state (`home.loadingSessions`) and does not draw the
+# authoring area at all (app/(tabs)/index.tsx: the loading branch precedes the action block). So the
+# honest device assertion for this state is:
+#   * no permission accusation anywhere on the screen (the real regression this guards);
+#   * the action is NOT presented as enabled (nothing claims a path to the Host exists);
+#   * no authoring frame is sent while the socket is unknown (orchestrator: `authoringRequests`);
+#   * the `authoring.connecting` / `authoring.reconnecting` copy remains covered by unit tests
+#     (`newSessionAvailability`, which is where that decision lives) rather than by a screen that
+#     does not render it. This gap is reported to the lead, not papered over here.
+#
+# HOOKS: `workspace-home` (we are on the home, not a conversation) and the ABSENCE of
+#        `session-composer` / the permission copy.
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+# Still connecting: the home is up, but nothing was fetched (no `workspaces` request yet).
+- extendedWaitUntil:
+    visible:
+      id: "workspace-home"
+    timeout: 30000
+- assertNotVisible: ".*(not granted permission to create sessions|chưa được cấp quyền tạo phiên).*"
+- assertNotVisible: ".*(did not report its permissions|không báo quyền của thiết bị).*"
+- assertNotVisible:
+    id: "session-composer"
+# The action must not be offered as enabled while the socket state is unknown. It is either absent
+# (loading branch) or disabled with a reason — never enabled, and never blamed on permissions.
+- assertNotVisible:
+    id: "new-session"
+    enabled: true

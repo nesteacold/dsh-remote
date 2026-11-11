@@ -64,6 +64,13 @@ export class PinMismatchError extends RemoteInputError {
   }
 }
 
+/**
+ * A dial the caller stopped (`RemoteConnection.close()`): our own decision, not a
+ * link loss, so nothing was sent and nothing is worth retrying. Distinct from a
+ * `pin-mismatch`, which a human may still resolve by pairing again.
+ */
+export const dialCancelled = () => new RemoteInputError('the connection attempt was cancelled', 499, 'cancelled')
+
 export const sha256Hex = (der) => crypto.createHash('sha256').update(der).digest('hex')
 
 /** Decode and validate the unpadded-base64url JSON pairing string (contract §2). */
@@ -180,14 +187,31 @@ export async function probeCertificate(url, { timeoutMs = 8000 } = {}) {
  * UNABLE_TO_VERIFY_LEAF_SIGNATURE and Node then skips `checkServerIdentity`, so
  * the pin was never compared and every dial ended as "unreachable".
  */
-async function openPinnedTlsSocket({ url, expected, timeoutMs }) {
+async function openPinnedTlsSocket({ url, expected, timeoutMs, signal }) {
   const { host, port } = dialTarget(url)
   // The hash comparison below is the trust decision: the gateway's certificate
   // is self-signed by design, so the platform's chain verdict is not consulted.
   const socket = tls.connect({ host, port, servername: net.isIP(host) ? undefined : host, rejectUnauthorized: false })
   const timer = setTimeout(() => socket.destroy(new Error('TLS handshake timed out')), timeoutMs)
+  // A dial the caller stopped must not wait for the peer. A listener that accepts TCP
+  // and then says nothing (or a handshake stalled in the middle) would otherwise hold
+  // one socket AND this timer until `timeoutMs` for every cancelled dial, and settle
+  // its connect() only then. Cancelling destroys the socket here and reports our own
+  // stop — never a link loss, which the supervisor would retry.
+  let onAbort = null
+  const aborted = new Promise((_resolve, reject) => {
+    onAbort = () => { socket.destroy(); reject(dialCancelled()) }
+    signal?.addEventListener?.('abort', onAbort, { once: true })
+  })
+  const secured = once(socket, 'secureConnect')
+  // Only one of the two settles the race, and the loser's rejection is still delivered
+  // to it here (a socket the timeout/handshake destroys emits 'error'), so a cancelled
+  // dial never leaves an unhandled rejection behind.
   try {
-    await once(socket, 'secureConnect')
+    await Promise.race([secured, aborted])
+    // The handshake and the abort can interleave: a socket the caller stopped is not
+    // read for its certificate, let alone handed on for an upgrade.
+    if (signal?.aborted) throw dialCancelled()
     const raw = socket.getPeerCertificate(true)?.raw
     // An empty buffer would hash to the digest of no input, so reject it here:
     // only a certificate we actually hashed may be compared with the pin.
@@ -202,7 +226,11 @@ async function openPinnedTlsSocket({ url, expected, timeoutMs }) {
     socket.destroy()
     throw error
   } finally {
+    // Every completion path (pin matched, TLS error, abort) releases both: a listener
+    // left on the caller's signal would fire once more on the next close(), and a live
+    // handshake timer would hold the Host process open for `timeoutMs`.
     clearTimeout(timer)
+    if (onAbort) signal?.removeEventListener?.('abort', onAbort)
   }
 }
 
@@ -210,14 +238,34 @@ async function openPinnedTlsSocket({ url, expected, timeoutMs }) {
  * Open a WebSocket over that already-verified socket. `ws` writes the upgrade —
  * and with it the pairing code or the device token — only after the pin matched,
  * so the credential cannot precede the check.
+ *
+ * `signal` is how a caller stops a dial it no longer wants. The handshake itself
+ * honours it (see `openPinnedTlsSocket`), and the check below sits between the pin
+ * and the upgrade on purpose: during the handshake there is no WebSocket to
+ * terminate yet, so a connection closed at that moment (DELETE, a re-pair in place,
+ * a plugin teardown) would otherwise finish its handshake, upgrade with the token it
+ * captured and come up online behind the caller's back. Cancelling destroys the
+ * pending socket before its credential exists.
  * @returns {Promise<import('ws').WebSocket>} the ws client, not yet open
  */
-export async function openPinnedSocket({ url, protocols, headers, certSha256, timeoutMs = 8000, WebSocketImpl = getWebSocket() }) {
+export async function openPinnedSocket({ url, protocols, headers, certSha256, timeoutMs = 8000, signal, WebSocketImpl = getWebSocket() }) {
   const expected = String(certSha256).toLowerCase()
   if (!HEX64.test(expected)) throw new RemoteInputError('invalid certificate pin')
-  const socket = await openPinnedTlsSocket({ url, expected, timeoutMs })
+  if (signal?.aborted) throw dialCancelled()
+  const socket = await openPinnedTlsSocket({ url, expected, timeoutMs, signal })
+  if (signal?.aborted) {
+    socket.destroy()
+    throw dialCancelled()
+  }
   try {
-    return new WebSocketImpl(url, protocols, { createConnection: () => socket, headers, handshakeTimeout: timeoutMs })
+    const ws = new WebSocketImpl(url, protocols, { createConnection: () => socket, headers, handshakeTimeout: timeoutMs })
+    // Every caller terminates a dial it no longer wants, and `ws` reports that as an
+    // asynchronous 'error' even while CONNECTING. Between construction and handoff
+    // nobody owns the socket yet, and an unhandled 'error' would take the Host process
+    // down instead of just failing this dial. The owner registers its own listeners
+    // after this; this one only keeps the process alive.
+    ws.on('error', () => { /* owned by the caller after handoff; a dial cancelled before that must not crash the process */ })
+    return ws
   } catch (error) {
     socket.destroy()
     throw error
@@ -313,6 +361,12 @@ export class RemoteConnection extends EventEmitter {
     this.earlyStreamFrames = new Map()
     this.closedByUs = false
     this.hello = null
+    // One generation per dial. `close()` bumps it and aborts that dial's controller,
+    // which is what stops a handshake that is still in flight: during it `this.ws` is
+    // still null, and a detached socket would finish, send the bearer token in the
+    // upgrade and come up online after its caller had already let it go.
+    this.generation = 0
+    this.dial = null
   }
 
   setState(state, detail) {
@@ -330,11 +384,21 @@ export class RemoteConnection extends EventEmitter {
     if (!token) throw new RemoteInputError('no stored credential for this device; pair it again', 401, 'auth/required')
     this.closedByUs = false
     this.setState('connecting')
-    this.connecting = this.#open(token).finally(() => { this.connecting = null })
-    return this.connecting
+    const generation = this.generation
+    const controller = new AbortController()
+    this.dial = { generation, controller }
+    const promise = this.#open(token, generation, controller)
+    this.connecting = promise
+    // Only this dial may clear the slot: a cancelled attempt must not clobber the
+    // fresh one a caller started right after close().
+    const clear = () => { if (this.connecting === promise) this.connecting = null }
+    promise.then(clear, clear)
+    return promise
   }
 
-  async #open(token) {
+  async #open(token, generation, controller) {
+    // `close()` since this dial began: whatever it produced belongs to nobody.
+    const cancelled = () => generation !== this.generation
     let ws
     try {
       ws = await openPinnedSocket({
@@ -342,15 +406,37 @@ export class RemoteConnection extends EventEmitter {
         protocols: [PROTOCOL],
         headers: { Authorization: `Bearer ${token}`, 'X-DSH-Device-ID': this.remote.clientDeviceId },
         certSha256: this.remote.certSha256,
+        signal: controller.signal,
       })
     } catch (error) {
+      // Our own stop, already reported as offline with no detail by close(): never a
+      // link loss, so it must not surface as `error` (which the supervisor retries).
+      if (cancelled()) throw dialCancelled()
       this.setState('error', error.message)
       throw error
+    } finally {
+      if (this.dial?.controller === controller) this.dial = null
     }
+    // `close()` landed while the handshake was finishing: the socket belongs to nobody,
+    // so it is never adopted — `this.ws` must not point at a dial its caller gave up on
+    // (a request would use it, and it would still come up online behind their back).
+    if (cancelled()) {
+      try { ws.terminate() } catch { /* already gone */ }
+      throw dialCancelled()
+    }
+    // Adopt the socket WITH its handlers before anything can terminate it: `ws`
+    // emits 'error' for a terminate before the connection is established, and an
+    // unhandled one would take the Host process down.
     this.ws = ws
-    ws.on('message', (data) => this.#onMessage(data))
+    // Everything a socket says belongs to the dial that adopted it. One connection
+    // outlives the socket it was dialled on (close() then connect() again, a re-pair),
+    // and the old socket's events arrive later: a frame or a close from it must never
+    // resolve the new dial's hello, reject its waiters, move its state, or revoke the
+    // entry that now holds this remote.
+    const isCurrent = () => generation === this.generation && this.ws === ws
+    ws.on('message', (data) => this.#onMessage(data, isCurrent))
     ws.on('error', () => { /* surfaced through close/handshake below; never log the error object (headers) */ })
-    ws.on('close', (code) => this.#onClose(code))
+    ws.on('close', (code) => this.#onClose(code, isCurrent))
     const hello = await new Promise((resolve, reject) => {
       const fail = (reason) => { cleanup(); reject(reason) }
       const onHello = (frame) => { cleanup(); resolve(frame) }
@@ -363,9 +449,18 @@ export class RemoteConnection extends EventEmitter {
       this.once('hello', onHello)
     }).catch((error) => {
       try { ws.terminate() } catch { /* already gone */ }
+      // A close that landed while the hello was pending leaves the state `offline`
+      // (set by close()), not `error`: there is nothing to retry on our own behalf.
+      if (cancelled()) throw dialCancelled()
       if (this.state === 'connecting') this.setState('error', error.message)
       throw error
     })
+    if (cancelled()) {
+      // A close that landed while the hello was pending already terminated this
+      // socket (close() knows it); nothing was sent and nothing comes online.
+      try { ws.terminate() } catch { /* already gone */ }
+      throw dialCancelled()
+    }
     this.hello = hello
     // Contract §4: declare the protocol revision we speak; a mismatch closes us with 4003.
     ws.send(JSON.stringify({ type: 'client-hello', requestId: nextRequestId(), companionProtocol: COMPANION_PROTOCOL_VERSION,
@@ -374,7 +469,14 @@ export class RemoteConnection extends EventEmitter {
     return hello
   }
 
-  #onMessage(data) {
+  /**
+   * One frame from `ws`. `isCurrent` is false as soon as a later dial (or `close()`)
+   * took this connection over: the frame then belongs to a dial nobody is using — it
+   * may not answer a request, resolve the CURRENT dial's hello, or push a card into an
+   * entry that has moved on.
+   */
+  #onMessage(data, isCurrent) {
+    if (!isCurrent()) return
     let frame
     try { frame = JSON.parse(data.toString()) } catch { return }
     if (!frame || typeof frame !== 'object') return
@@ -398,25 +500,43 @@ export class RemoteConnection extends EventEmitter {
     }
   }
 
-  #onClose(code) {
-    this.ws = null
+  /**
+   * Fail everything still waiting on this connection's transport. Called when the
+   * adopted socket closes AND by `close()` itself: that path nulls `this.ws` before the
+   * socket's own close event arrives, so the event is already "stale" by then and a
+   * request in flight (DELETE, teardown, re-pair) must not be left to its timeout.
+   */
+  #failPending(closeCode) {
     for (const [id, waiter] of this.waiters) {
       clearTimeout(waiter.timer)
-      waiter.reject(Object.assign(new Error('the connection closed before the remote answered'), { closeCode: code }))
+      waiter.reject(Object.assign(new Error('the connection closed before the remote answered'), { closeCode }))
       this.waiters.delete(id)
     }
     for (const [id, collector] of this.streams) {
       clearTimeout(collector.timer)
-      collector.reject(Object.assign(new Error('the connection closed before the streamed result arrived'), { closeCode: code }))
+      collector.reject(Object.assign(new Error('the connection closed before the streamed result arrived'), { closeCode }))
       this.streams.delete(id)
     }
     // An open `remote-stream-open` cannot survive its transport: end it so the
     // consumer (e.g. a merged workspace stream) can report the host as offline.
     for (const [id, state] of this.wireStreams) {
       clearOpenTimer(state)
-      state.reader.fail(Object.assign(new Error('the connection closed while the stream was open'), { closeCode: code }))
+      state.reader.fail(Object.assign(new Error('the connection closed while the stream was open'), { closeCode }))
       this.wireStreams.delete(id)
     }
+  }
+
+  /**
+   * The adopted socket closed. `isCurrent` is false for a socket a later dial (or
+   * `close()`) superseded: its own listeners already settled its dial's hello wait, and
+   * nothing else here belongs to it. Rejecting the CURRENT waiters, marking the current
+   * dial offline, or revoking the entry from a stale close is exactly how an old socket
+   * used to knock the connection that replaced it offline (and wipe its token).
+   */
+  #onClose(code, isCurrent) {
+    if (!isCurrent()) return
+    this.ws = null
+    this.#failPending(code)
     if (code === CLOSE_REVOKED) {
       this.setState('revoked')
       this.emit('revoked')
@@ -659,9 +779,24 @@ export class RemoteConnection extends EventEmitter {
 
   close() {
     this.closedByUs = true
+    // Invalidate the dial BEFORE touching this.ws: while `openPinnedSocket` runs there
+    // is no WebSocket to terminate, and the generation is what keeps that handshake
+    // from being upgraded with the token it captured (see `#open`/`openPinnedSocket`).
+    this.generation += 1
+    const dial = this.dial
+    this.dial = null
+    this.connecting = null
+    try { dial?.controller.abort() } catch { /* nothing to cancel */ }
     try { this.ws?.close(1000, 'removed') } catch { /* already closed */ }
     try { this.ws?.terminate() } catch { /* already closed */ }
     this.ws = null
+    // Our own stop settles what the socket was carrying: nulling `this.ws` above makes
+    // the socket's own close event stale, so a request in flight would otherwise wait
+    // out `requestTimeoutMs` after the remote was deleted or the plugin torn down.
+    this.#failPending()
+    // A link we stopped is offline with no detail, so the supervisor cancels instead
+    // of treating it as an unexpected loss worth another dial.
+    if (this.state !== 'offline') this.setState('offline')
   }
 }
 

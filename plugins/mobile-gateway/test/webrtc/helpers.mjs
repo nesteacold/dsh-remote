@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import { listenFetchSafe } from '../support/fetch-safe-listen.mjs'
 import { setTimeout as delay } from 'node:timers/promises'
 import WebSocket from 'ws'
 import plugin from '../../lib/index.mjs'
@@ -15,7 +16,12 @@ export async function startGateway(webrtc = { enabled: true }, overrides = {}, i
   const listeners = new Map()
   const server = http.createServer((req, res) => management.handler(req, res))
   server.on('upgrade', (req, socket, head) => upgrade.handler(req, socket, head))
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe, tcp-probed: this fixture binds before `implementation.apply` below
+  // registers `management`, so its request handler cannot answer a probe yet —
+  // an HTTP probe would hit `management.handler` while it is still undefined
+  // (measured: TypeError, five failing tests). The helper's blocklist still
+  // rejects every port undici's `fetch` refuses; only the reachability half is TCP.
+  await listenFetchSafe(server, { probe: 'tcp' })
   const port = server.address().port
   const ctx = {
     connection: createTestConnection(),

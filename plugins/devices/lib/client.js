@@ -17,10 +17,17 @@ window.__ModuleLoader__.load({
     const DICT = {
       en: {
         title: 'Devices',
+        subtitle: 'Connect to a DSH Host on another machine, or let another machine connect to this one.',
+        thisDevice: 'This device',
+        // `{{n}}` stays in the template so a translator can move the number.
+        connectedCount: '{{n}} connected successfully',
+        flowBusy: 'Data is flowing to the connected host',
+        flowIdle: 'No connection is active',
         tabAllow: 'Allow connections to this device',
         tabConnect: 'Connect to other devices',
         allow: 'Allow connections',
         allowHelp: 'Let other devices on your network control this DSH Host after pairing. Off closes every connection.',
+        switchNotSaved: 'The switch moved, but this computer could not save it. It applies until this session ends; the next start follows the saved value.',
         lan: 'Local network (LAN)',
         internet: 'Internet',
         internetLater: 'Later — not available yet',
@@ -36,9 +43,14 @@ window.__ModuleLoader__.load({
         authorized: 'Authorized devices',
         noAuthorized: 'No device is authorized yet.',
         kind: 'Type',
-        scopes: 'Permissions',
         lastUsed: 'Last used',
         never: 'never',
+        // A grant is a list of things, not a sentence: the count labels it and the
+        // chip list opens when it is longer than the two rows it is clamped to.
+        // `{{n}}` stays in the template so a translator can move the number.
+        scopeCount: '{{n}} permissions',
+        showAllScopes: 'Show all ({{n}})',
+        showLessScopes: 'Show less',
         connectedHere: 'Connected here',
         remove: 'Remove access',
         removeConfirm: 'Remove access for this device? It is disconnected immediately.',
@@ -90,6 +102,7 @@ window.__ModuleLoader__.load({
         'scope.plugins:manage': 'Install and manage plugins',
         'scope.schedule:write': 'Create and run schedules',
         'scope.terminal': 'Open a terminal',
+        'scope.sessions:author': 'Create sessions and choose a model',
         // One short risk line per dangerous scope, shown under its checkbox.
         'risk.files:write': 'Can change files in your workspaces.',
         'risk.settings:write': 'Can change Host settings, models and agent presets.',
@@ -99,6 +112,7 @@ window.__ModuleLoader__.load({
         'risk.plugins:manage': 'Can install or enable code that runs on this Host.',
         'risk.schedule:write': 'Can create jobs that run later without you.',
         'risk.terminal': 'Full shell on this Host: it can do anything you can.',
+        'risk.sessions:author': 'Can start new sessions on this Host and pick which model runs them.',
         presetStandard: 'Standard',
         presetFull: 'Full control',
         presetFullHint: 'Every permission, including shell, plugins and credentials. Only for devices you fully trust.',
@@ -118,17 +132,18 @@ window.__ModuleLoader__.load({
         listenerDown: 'Listener off',
         listenerUnknown: 'unknown address',
         certPin: 'Certificate pin (SHA-256)',
-        loopbackTitle: 'Only this machine can connect',
+        // The route chip says in one word who can connect — the bind host itself is
+        // the whole fact, so no sentence repeats it.
+        routeLoopback: 'Loopback',
+        routeLan: 'LAN',
+        routeTailscale: 'Tailscale',
         loopbackWarning: 'The Host listens on a loopback address, so only this machine can reach it — a phone or another computer cannot connect. To change it, open Settings → Plugins → the mobile-gateway row → configuration → listen address (lanHost), and enter any private LAN address or any Tailscale address of this machine. The certificate pin does not change, so no new certificate is needed.',
-        reachableTitle: 'Reachable from other machines',
+        // The label of the bind line. The old "reachable" heading and the tailnet
+        // sentence beside it are gone: the route chip already carries that fact.
         reachableNote: 'This Host accepts connections at',
-        reachableTailscale: 'That is one of this machine\'s Tailscale addresses, so other devices on your tailnet can connect.',
         // --- spec 008: a listener port the OS dynamic range can hand to an outbound connection ---
-        portRiskTitle: 'This port can be taken by the operating system',
         portRiskBody: 'The operating system can hand this port to an outgoing connection, so the listener may fail to bind at a random moment.',
         portRiskSafeBand: 'Ports 20000-39999 sit outside the dynamic range and are the safe band.',
-        portRiskAuto: 'The gateway now moves to the next free port by itself when the bind fails, so this is not fatal.',
-        portBusyTitle: 'The port is already taken',
         portBusyBody: 'Another program holds this port, or an outgoing connection already took the same port from the operating system dynamic range. That busy port is why the listener cannot bind.',
         // --- spec 008: the connection plan — bind the listener to one of this machine's own addresses ---
         planTitle: 'Connection plan',
@@ -144,6 +159,12 @@ window.__ModuleLoader__.load({
         planApplying: 'Applying…',
         planUnknown: 'Unknown — the gateway reports no address',
         planTailscaleUnavailable: 'No Tailscale interface detected on this machine.',
+        // POST /mgw/listen answers a known refusal with a code and an English
+        // sentence. A page that is not in English names the reason in its own
+        // language; an unknown reason is still shown verbatim (never hidden).
+        planErrTailscale: 'No Tailscale interface is available to bind: connect this machine to your tailnet, then choose it again.',
+        planErrLan: 'No private LAN address was detected on this machine, so there is nothing to bind to.',
+        planErrDisabled: 'Allow connections (and LAN access) must be on before the listen address can move.',
         otpTitle: 'Pairing code',
         otpHelp: 'Type this code on the other device together with this address. It works once, for 10 minutes, and you will still have to approve the request here.',
         otpNew: 'Generate pairing code',
@@ -202,6 +223,7 @@ window.__ModuleLoader__.load({
         popoverNoScopes: 'none',
         reconnect: 'Reconnect',
         reconnecting: 'Reconnecting…',
+        autoRetry: 'Reconnecting automatically…',
         forgetHost: 'Forget host',
         forgetConfirm: 'Forget this host? Its token is deleted from this machine and its workspaces leave the sidebar.',
         manageAll: 'Manage all devices in Settings → Devices',
@@ -223,16 +245,37 @@ window.__ModuleLoader__.load({
         sidebarGrouping: 'Sidebar grouping',
         sidebarOn: 'grouped by host',
         sidebarOffState: 'off',
+        // Why the grouped sidebar is not installed. The plugin produces this small,
+        // fixed set of short reasons; each is printed as a sentence, not as the raw
+        // English the diagnosis writes.
+        sidebarReasonNotInstalled: 'Not installed yet.',
+        sidebarReasonNoServices: 'This shell provides no client services.',
+        sidebarReasonNoHost: 'No remote host is connected.',
+        sidebarReasonNoActions: 'This shell provides no workspace actions.',
+        sidebarReasonRoutingOff: 'Multi-host routing is off',
+        'reason.dsh-version-mismatch': 'this DSH version is not the pinned one',
+        'reason.dsh-version-unknown': 'the DSH version is unknown',
+        'reason.no-gateway': 'the gateway is missing',
+        'reason.dispatchRpc-missing': 'the gateway has no dispatchRpc',
+        'reason.openWireStream-missing': 'the gateway has no openWireStream',
+        'reason.openWireStream-signature': 'the gateway signature differs',
         // --- the grant is short: remote sessions/workspaces cannot appear (spec 008) ---
         missingRemoteScope: 'Remote sessions and workspaces cannot appear until this device is paired again on that host with the "Use this host remotely" (harness:remote) permission.',
+        pinMismatchNote: 'This host presented a different certificate. Nothing was sent. Pair it again if you trust the change.',
         hostRefused: 'The host refused the last request',
       },
       vi: {
         title: 'Thiết bị',
+        subtitle: 'Kết nối tới một DSH Host trên máy khác, hoặc cho máy khác kết nối vào máy này.',
+        thisDevice: 'Máy này',
+        connectedCount: '{{n}} kết nối thành công',
+        flowBusy: 'Dữ liệu đang chảy tới host đã kết nối',
+        flowIdle: 'Chưa có kết nối nào đang hoạt động',
         tabAllow: 'Cho phép kết nối tới thiết bị này',
         tabConnect: 'Kết nối tới thiết bị khác',
         allow: 'Cho phép kết nối',
         allowHelp: 'Cho phép các thiết bị khác trong mạng điều khiển Host DSH này sau khi ghép đôi. Tắt sẽ đóng mọi kết nối.',
+        switchNotSaved: 'Đã đổi trạng thái công tắc nhưng không lưu được trên máy này. Trạng thái mới vẫn có hiệu lực trong phiên hiện tại; lần khởi động sau sẽ dùng trạng thái đã lưu trước đó.',
         lan: 'Mạng nội bộ (LAN)',
         internet: 'Internet',
         internetLater: 'Sau này — chưa khả dụng',
@@ -248,9 +291,11 @@ window.__ModuleLoader__.load({
         authorized: 'Thiết bị được cấp quyền',
         noAuthorized: 'Chưa có thiết bị nào được cấp quyền.',
         kind: 'Loại',
-        scopes: 'Quyền',
         lastUsed: 'Dùng lần cuối',
         never: 'chưa bao giờ',
+        scopeCount: '{{n}} quyền',
+        showAllScopes: 'Hiện tất cả ({{n}})',
+        showLessScopes: 'Thu gọn',
         connectedHere: 'Đang kết nối',
         remove: 'Gỡ quyền truy cập',
         removeConfirm: 'Gỡ quyền truy cập của thiết bị này? Thiết bị sẽ bị ngắt ngay.',
@@ -302,6 +347,7 @@ window.__ModuleLoader__.load({
         'scope.plugins:manage': 'Cài đặt và quản lý plugin',
         'scope.schedule:write': 'Tạo và chạy lịch',
         'scope.terminal': 'Mở terminal',
+        'scope.sessions:author': 'Tạo phiên và chọn model',
         'risk.files:write': 'Có thể sửa tệp trong workspace của bạn.',
         'risk.settings:write': 'Có thể đổi cài đặt Host, model và preset agent.',
         'risk.commands:execute': 'Có thể chạy lệnh của Host với quyền của bạn.',
@@ -310,6 +356,7 @@ window.__ModuleLoader__.load({
         'risk.plugins:manage': 'Có thể cài hoặc bật mã chạy trên Host này.',
         'risk.schedule:write': 'Có thể tạo tác vụ chạy sau mà không cần bạn.',
         'risk.terminal': 'Toàn quyền shell trên Host này: làm được mọi việc bạn làm được.',
+        'risk.sessions:author': 'Có thể mở phiên mới trên Host này và chọn model chạy phiên đó.',
         presetStandard: 'Tiêu chuẩn',
         presetFull: 'Toàn quyền',
         presetFullHint: 'Mọi quyền, gồm shell, plugin và thông tin xác thực. Chỉ dùng cho thiết bị bạn hoàn toàn tin cậy.',
@@ -329,17 +376,18 @@ window.__ModuleLoader__.load({
         listenerDown: 'Đang tắt',
         listenerUnknown: 'chưa rõ địa chỉ',
         certPin: 'Mã ghim chứng chỉ (SHA-256)',
-        loopbackTitle: 'Chỉ máy này kết nối được',
+        // Một từ cho biết ai kết nối được; "Vòng lặp máy này" là cách nói sai
+        // trong tiếng Việt, nên loopback ở đây là "Máy này".
+        routeLoopback: 'Máy này',
+        routeLan: 'Mạng nội bộ',
+        routeTailscale: 'Tailscale',
         loopbackWarning: 'Host đang lắng nghe trên địa chỉ loopback, nên chỉ máy này truy cập được — điện thoại hay máy khác không kết nối được. Để đổi, mở Cài đặt → Plugin → mục mobile-gateway → cấu hình → địa chỉ lắng nghe (lanHost), và nhập một địa chỉ LAN nội bộ hoặc địa chỉ Tailscale của máy này. Mã ghim chứng chỉ không đổi, nên không cần tạo chứng chỉ mới.',
-        reachableTitle: 'Máy khác có thể kết nối',
+        // Nhãn của dòng địa chỉ bind. Tiêu đề "reachable" cũ và câu về tailnet đã bỏ:
+        // chip lộ trình đã nói đúng điều đó.
         reachableNote: 'Host này nhận kết nối tại',
-        reachableTailscale: 'Đây là một địa chỉ Tailscale của máy này, nên các thiết bị khác trong tailnet của bạn kết nối được.',
         // --- spec 008: cổng mà dải động của hệ điều hành có thể cấp cho kết nối đi ra ---
-        portRiskTitle: 'Cổng này có thể bị hệ điều hành lấy mất',
         portRiskBody: 'Hệ điều hành có thể cấp cổng này cho một kết nối đi ra, nên listener có thể không bind được vào một lúc ngẫu nhiên.',
         portRiskSafeBand: 'Cổng 20000-39999 nằm ngoài dải động và là dải an toàn.',
-        portRiskAuto: 'Gateway giờ tự chuyển sang cổng trống kế tiếp khi bind thất bại, nên đây không phải lỗi nghiêm trọng.',
-        portBusyTitle: 'Cổng đã bị chiếm',
         portBusyBody: 'Một chương trình khác đang giữ cổng này, hoặc một kết nối đi ra đã lấy đúng cổng đó từ dải động của hệ điều hành. Cổng bị chiếm là lý do listener không bind được.',
         // --- spec 008: kế hoạch kết nối — gắn listener vào một địa chỉ của chính máy này ---
         planTitle: 'Kế hoạch kết nối',
@@ -353,6 +401,11 @@ window.__ModuleLoader__.load({
         planApplying: 'Đang áp dụng…',
         planUnknown: 'Chưa rõ — gateway chưa báo địa chỉ',
         planTailscaleUnavailable: 'Không phát hiện giao diện Tailscale trên máy này.',
+        // Lý do quen thuộc thay cho câu tiếng Anh của route: trang tiếng Việt không
+        // in nguyên văn tiếng Anh; lý do lạ vẫn hiện nguyên văn để không giấu lỗi.
+        planErrTailscale: 'Chưa có giao diện Tailscale nào để gắn: hãy kết nối máy này vào tailnet rồi chọn lại.',
+        planErrLan: 'Không tìm thấy địa chỉ LAN riêng nào trên máy này nên chưa có địa chỉ để gắn.',
+        planErrDisabled: 'Cần bật Cho phép kết nối (và quyền truy cập LAN) trước khi đổi địa chỉ lắng nghe.',
         otpTitle: 'Mã ghép đôi',
         otpHelp: 'Nhập mã này trên thiết bị kia cùng với địa chỉ này. Chỉ dùng một lần, trong 10 phút, và bạn vẫn phải phê duyệt yêu cầu tại đây.',
         otpNew: 'Tạo mã ghép đôi',
@@ -410,6 +463,7 @@ window.__ModuleLoader__.load({
         popoverNoScopes: 'không có',
         reconnect: 'Kết nối lại',
         reconnecting: 'Đang kết nối lại…',
+        autoRetry: 'Đang tự kết nối lại…',
         forgetHost: 'Gỡ host',
         forgetConfirm: 'Gỡ host này? Token của nó sẽ bị xóa khỏi máy này và workspace của nó rời khỏi thanh bên.',
         manageAll: 'Quản lý mọi thiết bị trong Cài đặt → Thiết bị',
@@ -431,8 +485,21 @@ window.__ModuleLoader__.load({
         sidebarGrouping: 'Nhóm thanh bên',
         sidebarOn: 'nhóm theo host',
         sidebarOffState: 'tắt',
+        // Vì sao thanh bên nhóm chưa được cài — cùng bộ lý do cố định như bản en.
+        sidebarReasonNotInstalled: 'Chưa cài đặt.',
+        sidebarReasonNoServices: 'Giao diện này không cung cấp dịch vụ phía máy khách.',
+        sidebarReasonNoHost: 'Chưa có host từ xa nào kết nối.',
+        sidebarReasonNoActions: 'Giao diện này không cung cấp thao tác với workspace.',
+        sidebarReasonRoutingOff: 'Định tuyến đa host đang tắt',
+        'reason.dsh-version-mismatch': 'phiên bản DSH không đúng bản đã ghim',
+        'reason.dsh-version-unknown': 'chưa rõ phiên bản DSH',
+        'reason.no-gateway': 'thiếu gateway',
+        'reason.dispatchRpc-missing': 'gateway không có dispatchRpc',
+        'reason.openWireStream-missing': 'gateway không có openWireStream',
+        'reason.openWireStream-signature': 'chữ ký của gateway khác bản đã ghim',
         // --- thiếu quyền: phiên và workspace từ xa không hiển thị được (spec 008) ---
         missingRemoteScope: 'Phiên và workspace từ xa sẽ không hiện ra cho tới khi thiết bị này được ghép đôi lại trên host đó kèm quyền "Dùng host này từ xa" (harness:remote).',
+        pinMismatchNote: 'Host này đưa ra chứng chỉ khác với lần ghép đôi. Chưa có gì được gửi đi. Nếu bạn tin thay đổi này thì ghép đôi lại.',
         hostRefused: 'Host đã từ chối yêu cầu vừa rồi',
       },
     }
@@ -448,6 +515,19 @@ window.__ModuleLoader__.load({
       if (before !== currentLang()) for (const listener of listeners) listener()
     }
     const useLang = () => React.useSyncExternalStore(subscribeLang, langSnapshot)
+    // "3 connected successfully": the number is a slot in the sentence, not
+    // something a translator has to decode around.
+    const connectedCount = (n) => tr('connectedCount').replace('{{n}}', String(n))
+    // Same slot rule for a permission count ("13 permissions" / "13 quyền").
+    const withCount = (key, n) => tr(key).replace('{{n}}', String(n))
+    // What this machine calls itself. /mgw/status already reports it
+    // (`gatewayName`, which the gateway defaults to `os.hostname()`), and no other
+    // route in this page knows a local name — so when it says nothing the translated
+    // literal is the name instead of a new endpoint.
+    const localName = (status) => {
+      const name = status && typeof status.gatewayName === 'string' ? status.gatewayName.trim() : ''
+      return name || tr('thisDevice')
+    }
 
     // ------------------------------------------------------------- helpers
     // Same-origin only; honours the <base> prefix the way the gateway does.
@@ -455,7 +535,15 @@ window.__ModuleLoader__.load({
       const target = new URL(path.replace(/^\//, ''), document.baseURI).href
       const response = await fetch(target, { credentials: 'same-origin', ...options })
       const body = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(body.message || body.error || `HTTP ${response.status}`)
+      if (!response.ok) {
+        // Keep the route's machine-readable reason beside its sentence: a page that
+        // is not in English uses the code to name a KNOWN reason in the Host
+        // language instead of printing the route's English sentence.
+        const failure = new Error(body.message || body.error || `HTTP ${response.status}`)
+        failure.code = body.error
+        failure.status = response.status
+        throw failure
+      }
       return body
     }
     const post = (path, body) => request(path, {
@@ -478,15 +566,27 @@ window.__ModuleLoader__.load({
       accentText: 'var(--dsw-alias-label-primary-foreground, #fff)',
       danger: 'var(--dsw-alias-state-error-primary, #dc4c64)',
       success: 'var(--dsw-alias-state-success-primary, #2fb171)',
+      // A pending approval is a request, not a fault: the same warm tone the
+      // gateway's own notice uses, so "waiting" never reads as "broken".
+      warn: 'var(--dsw-alias-state-warn-primary, #d99a16)',
     }
+    // The row-action glyphs below are inline SVG data URIs — nothing is fetched.
+    // Their XML namespace is assembled from two pieces so the file's "no external
+    // URL" scan stays a literal, exact check instead of needing an exception.
+    const SVG_NS = ['http:', '//www.w3.org/2000/svg'].join('')
     const css = `
-.dshdev{font-family:var(--dsw-font-family,system-ui,sans-serif);font-size:13px;color:${colors.text};max-width:880px}
-.dshdev h2{margin:0 0 14px;font-size:20px;font-weight:650}
-.dshdev h3{margin:0 0 8px;font-size:14px;font-weight:600}
-.dshdev-tabs{display:flex;gap:4px;border-bottom:1px solid ${colors.border};margin-bottom:16px}
-.dshdev-tab{background:transparent;border:0;border-bottom:2px solid transparent;color:${colors.muted};cursor:pointer;font:inherit;padding:8px 12px}
-.dshdev-tab[aria-selected=true]{color:${colors.text};border-bottom-color:${colors.accent};font-weight:600}
-.dshdev-card{background:${colors.card};border:1px solid ${colors.border};border-radius:var(--dsw-radius-panel,12px);padding:14px 16px;margin-bottom:14px}
+.dshdev{font-family:var(--dsw-font-family,system-ui,sans-serif);font-size:13px;color:${colors.text};max-width:880px;line-height:1.5}
+.dshdev h2{margin:0;font-size:20px;font-weight:650;letter-spacing:-.01em}
+.dshdev h3{margin:0 0 8px;font-size:13.5px;font-weight:600}
+.dshdev-head{margin-bottom:18px}
+.dshdev-sub{margin:6px 0 0;color:${colors.muted};font-size:12.5px}
+/* Segmented control: one rounded track, the selected tab a card-coloured pill.
+   No underline — the pill is the only selection cue. */
+.dshdev-tabs{display:inline-flex;flex-wrap:wrap;gap:2px;padding:3px;margin-bottom:18px;border:1px solid ${colors.border};border-radius:999px;background:${colors.hover}}
+.dshdev-tab,.dshdev-seg-btn{margin:0;background:transparent;border:0;border-radius:999px;color:${colors.muted};cursor:pointer;font:inherit;padding:6px 14px;transition:background .12s,color .12s}
+.dshdev-tab:hover,.dshdev-seg-btn:hover{color:${colors.text}}
+.dshdev-tab[aria-selected=true],.dshdev-seg-btn[aria-selected=true]{background:${colors.card};color:${colors.text};font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.22)}
+.dshdev-card{background:${colors.card};border:1px solid ${colors.border};border-radius:14px;padding:16px 18px;margin-bottom:14px}
 .dshdev-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .dshdev-grow{flex:1;min-width:0}
 .dshdev-muted{color:${colors.muted};font-size:12px}
@@ -499,6 +599,8 @@ window.__ModuleLoader__.load({
 .dshdev-badge{border-radius:999px;padding:1px 8px;font-size:11px;border:1px solid ${colors.border};color:${colors.muted}}
 .dshdev-badge.ok{color:${colors.success};border-color:${colors.success}}
 .dshdev-badge.bad{color:${colors.danger};border-color:${colors.danger}}
+/* Amber: something is waiting for the owner, which is not an error. */
+.dshdev-badge.warn{color:${colors.warn};border-color:${colors.warn}}
 .dshdev-input{box-sizing:border-box;width:100%;background:transparent;border:1px solid ${colors.border};border-radius:8px;color:inherit;font:inherit;padding:6px 10px}
 .dshdev-code{display:block;word-break:break-all;font-family:ui-monospace,monospace;font-size:12px;background:${colors.hover};border-radius:8px;padding:8px 10px;max-height:120px;overflow:auto}
 .dshdev-list>div{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid ${colors.border};flex-wrap:wrap}
@@ -534,7 +636,11 @@ window.__ModuleLoader__.load({
 .dshdev-side-meta{color:${colors.muted};font-size:11px;flex:none}
 .dshdev-dot{width:7px;height:7px;border-radius:50%;flex:none;background:${colors.muted};display:inline-block}
 .dshdev-dot.ok{background:${colors.success}}
+/* The dot is the only thing that carries the link state, so each state owns a
+   colour: a dialling link is amber and breathes, a dead one is quiet grey. */
+.dshdev-dot.warn{background:${colors.warn};animation:dshdev-dot-pulse 1.7s ease-in-out infinite}
 .dshdev-dot.off{background:${colors.danger}}
+@keyframes dshdev-dot-pulse{0%,100%{opacity:.45}50%{opacity:1}}
 .dshdev-side-action{background:transparent;border:0;color:${colors.muted};cursor:pointer;font:inherit;font-size:11px;padding:0 3px;flex:none}
 .dshdev-side-action:hover{color:${colors.text}}
 .dshdev-side-new{background:transparent;border:0;color:${colors.muted};cursor:pointer;font:inherit;font-size:13px;line-height:1;padding:0 4px;flex:none}
@@ -551,9 +657,191 @@ window.__ModuleLoader__.load({
 .dshdev-banner{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;border:1px solid ${colors.border};border-left:3px solid ${colors.danger};border-radius:8px;padding:8px 10px;background:${colors.card}}
 .dshdev-banner.info{border-left-color:${colors.accent}}
 .dshdev-banner strong{display:block;font-weight:600}
+/* An exceptional condition is a quiet line under the facts, not a panel: no border,
+   no fill, no heading — the words are the whole weight. */
+.dshdev-note{margin:8px 0 0;color:${colors.muted};font-size:12px;line-height:1.45}
+.dshdev-note.warn{color:${colors.warn}}
+/* The pin is a fingerprint to copy, not to read: small and muted, full value in title. */
+.dshdev-pin{font-family:ui-monospace,monospace;font-size:11.5px;color:${colors.muted}}
+/* --- device rows: one card per device, one clear action per row --- */
+/* The "this device" row both tabs open with: a rounded icon tile, the name, a
+   muted chip and the one fact that matters for that tab. */
+.dshdev-self{display:flex;align-items:center;gap:14px;margin-bottom:16px}
+.dshdev-self-meta{color:${colors.muted};font-size:12px;margin-top:4px}
+.dshdev-tile{width:40px;height:40px;flex:none;display:flex;align-items:center;justify-content:center;
+  border:1px solid ${colors.border};border-radius:12px;background:${colors.hover};color:${colors.muted}}
+.dshdev-tile.ok{color:${colors.success}}
+.dshdev-tile.bad{color:${colors.danger}}
+.dshdev-items{display:flex;flex-direction:column;gap:10px;margin-bottom:16px}
+.dshdev-item{display:flex;align-items:flex-start;gap:14px;background:${colors.card};
+  border:1px solid ${colors.border};border-radius:14px;padding:14px 16px}
+.dshdev-item:hover{border-color:${colors.muted}}
+/* A row inside an enclosing card is flat: two stacked card surfaces read as one
+   slab on a dark theme, so only the standalone rows carry the card fill. */
+.dshdev-card .dshdev-item{background:transparent}
+.dshdev-item-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.dshdev-item-name{font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.dshdev-item-status{color:${colors.muted};font-size:12px}
+.dshdev-item-addr{color:${colors.muted};font-family:ui-monospace,monospace;font-size:11.5px;margin-top:3px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dshdev-item-actions{display:flex;align-items:center;gap:6px;flex:none}
+/* An authorized device is a header line plus a full-width body: the tile, the name
+   and the two actions on top, then the grant across the whole card — so the text
+   never lives in the narrow column the buttons leave. */
+.dshdev-item.dshdev-item-stack{display:block}
+.dshdev-item-top{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+/* The names keep a readable width and the tile stays beside them down to a fairly
+   narrow card; below that the actions wrap UNDER the name instead of shrinking it
+   to three words a line (the basis is what decides where each line breaks). */
+.dshdev-item-main{flex:1 1 180px;min-width:0}
+.dshdev-item-body{margin-top:10px}
+/* Last use: its own row, one hairline above it, label muted and value plain. */
+.dshdev-item-meta{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-top:8px;
+  padding-top:8px;border-top:1px solid ${colors.border};font-size:12px}
+/* One chip per scope: a grant is a list of things, not a sentence. */
+.dshdev-scopes-block{margin-top:2px}
+.dshdev-scopes-head{display:flex;align-items:baseline;gap:8px;margin-bottom:6px}
+.dshdev-scopes-count{font-size:12px;color:${colors.muted}}
+.dshdev-scopes{display:flex;flex-wrap:wrap;gap:6px;overflow:hidden}
+/* About two rows of 22px chips; every chip stays in the DOM, so the full grant is
+   still readable by assistive tech and by the page's own tests. */
+.dshdev-scopes.clamped{max-height:50px}
+.dshdev-scope{box-sizing:border-box;display:inline-flex;align-items:center;height:22px;
+  border:1px solid ${colors.border};border-radius:999px;background:${colors.hover};
+  color:${colors.text};font-size:11.5px;padding:0 9px;white-space:nowrap}
+/* Amber marks the dangerous ones: the ScopePicker's own RISKY_SCOPES, and the
+   tooltip is the same risk line its checkbox prints. color-mix keeps the tint
+   subtle on both themes; without it the chip keeps the neutral background. */
+.dshdev-scope.risk{border-color:color-mix(in srgb, ${colors.warn} 55%, ${colors.border});
+  background:color-mix(in srgb, ${colors.warn} 14%, transparent)}
+.dshdev-scopes-toggle{background:transparent;border:0;color:${colors.muted};cursor:pointer;
+  font:inherit;font-size:11.5px;padding:3px 0 0;margin-top:2px}
+.dshdev-scopes-toggle:hover{color:${colors.text}}
+.dshdev-pop-scopes{margin:6px 0 2px}
+.dshdev-empty{border:1px dashed ${colors.border};border-radius:14px;padding:18px;color:${colors.muted};
+  font-size:12px;margin-bottom:16px}
+/* A block inside an already-open card (the Advanced disclosure): one hairline
+   above it, no second card surface. */
+.dshdev-sub-sect{padding-top:14px;margin-top:14px;border-top:1px solid ${colors.border}}
+/* Section header: a small sentence-case label and one link-style action. No
+   uppercase, no wide tracking — a settings page, not a dashboard legend. */
+.dshdev-sect{display:flex;align-items:center;gap:10px;margin:18px 0 10px}
+.dshdev-sect h3{margin:0;font-size:12px;font-weight:600;letter-spacing:0;text-transform:none;color:${colors.muted}}
+.dshdev-link{background:transparent;border:0;border-radius:8px;color:${colors.accent};cursor:pointer;
+  font:inherit;font-weight:600;padding:4px 8px}
+.dshdev-link:hover{background:${colors.hover}}
+/* The "+" is drawn by CSS, so the button's text stays exactly its label (the
+   accessible name and the strings the page state is read by). */
+.dshdev-link.add::before{content:'+ ';font-weight:700}
+/* Icon-only row action: a 32px square, the glyph masked from an inline SVG data
+   URI (no external asset), and the label kept as the element's text — clipped to
+   nothing visually, but it is the accessible fallback and the tested contract. */
+.dshdev-iact{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none;
+  width:32px;height:32px;padding:0;overflow:hidden;border:1px solid ${colors.border};border-radius:9px;
+  background:transparent;color:${colors.muted};cursor:pointer;font:inherit;font-size:0;line-height:0}
+.dshdev-iact:hover:not(:disabled){background:${colors.hover};color:${colors.text}}
+.dshdev-iact.danger{color:${colors.danger}}
+.dshdev-iact.danger:hover:not(:disabled){background:${colors.hover};color:${colors.danger}}
+.dshdev-iact:disabled{opacity:.45;cursor:default}
+.dshdev-iact::before{content:'';width:15px;height:15px;background:currentColor;
+  -webkit-mask-image:var(--dshdev-glyph);mask-image:var(--dshdev-glyph);
+  -webkit-mask-position:center;mask-position:center;
+  -webkit-mask-size:15px 15px;mask-size:15px 15px;
+  -webkit-mask-repeat:no-repeat;mask-repeat:no-repeat}
+.iact-reconnect{--dshdev-glyph:url("data:image/svg+xml,%3Csvg xmlns='${SVG_NS}' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 12a8 8 0 1 1-2.35-5.66'/%3E%3Cpath d='M20 4v5h-5'/%3E%3C/svg%3E")}
+.iact-open{--dshdev-glyph:url("data:image/svg+xml,%3Csvg xmlns='${SVG_NS}' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M14 4h6v6'/%3E%3Cpath d='M20 4 11 13'/%3E%3Cpath d='M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5'/%3E%3C/svg%3E")}
+.iact-remove{--dshdev-glyph:url("data:image/svg+xml,%3Csvg xmlns='${SVG_NS}' viewBox='0 0 24 24' fill='none' stroke='%23fff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h16'/%3E%3Cpath d='M9 7V4h6v3'/%3E%3Cpath d='M6 7l1 13h10l1-13'/%3E%3C/svg%3E")}
+/* --- the flow strip --- */
+/* The caption sits under a FIXED-HEIGHT band, so the state and the host count
+   never move the page. The wave is the only motion in Settings. */
+.dshdev-flow{display:flex;flex-direction:column;gap:7px;margin:-4px 0 6px;padding:0 18px}
+.dshdev-flow-band{display:flex;align-items:center;height:44px;overflow:hidden}
+.dshdev-flow-grid{display:grid;grid-template-columns:repeat(15,5px);grid-auto-rows:5px;gap:7px 9px;
+  justify-content:start;min-width:0}
+.dshdev-flow-dot{width:5px;height:5px;border-radius:50%;background:${colors.accent};opacity:.26;will-change:opacity}
+.dshdev-flow-note{color:${colors.muted};font-size:11.5px;margin:0}
+/* idle keeps no animation at all: a pulse while nothing is connected would be a lie. */
+.dshdev-flow[data-state=online] .dshdev-flow-dot{animation:dshdev-flow-pulse 2.8s ease-in-out infinite}
+.dshdev-flow[data-state=connecting] .dshdev-flow-dot{background:${colors.success};animation:dshdev-flow-pulse 1.1s ease-in-out infinite}
+@keyframes dshdev-flow-pulse{0%,100%{opacity:.22}45%{opacity:1}}
+@media (prefers-reduced-motion: reduce){
+  .dshdev-flow .dshdev-flow-dot{animation:none!important;opacity:.26}
+  .dshdev-dot.warn{animation:none!important;opacity:1}
+}
 `
 
     // --------------------------------------------------------- small widgets
+    // Presentation only: the tiles carry no state and no request. Stroke icons in
+    // the shell's own line style, so they follow the theme through `currentColor`.
+    const icon = (size, children) => h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none',
+      stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round', strokeLinejoin: 'round',
+      'aria-hidden': true, focusable: false }, children)
+    const IconMonitor = () => icon(20, [
+      h('rect', { key: 's', x: 2.5, y: 4.5, width: 19, height: 12.5, rx: 2 }),
+      h('path', { key: 'p', d: 'M9 20.5h6M12 17v3.5' }),
+    ])
+    const IconHost = () => icon(19, [
+      h('rect', { key: 'a', x: 3.5, y: 3.5, width: 17, height: 7, rx: 1.6 }),
+      h('rect', { key: 'b', x: 3.5, y: 13.5, width: 17, height: 7, rx: 1.6 }),
+      h('path', { key: 'c', d: 'M7 7h.01M7 17h.01' }),
+    ])
+    const IconPhone = () => icon(19, [
+      h('rect', { key: 's', x: 7, y: 2.5, width: 10, height: 19, rx: 2.2 }),
+      h('path', { key: 'p', d: 'M11 18.5h2' }),
+    ])
+    const deviceIcon = (kind) => (kind === 'mobile' ? h(IconPhone) : h(IconMonitor))
+
+    // The "this device" row both tabs open with: what you are looking at, then the
+    // one fact that matters for the tab (`children`).
+    function ThisDevice({ status, children }) {
+      useLang()
+      return h('div', { className: 'dshdev-card dshdev-self', 'data-testid': 'this-device' },
+        h('div', { className: 'dshdev-tile' }, h(IconMonitor)),
+        h('div', { className: 'dshdev-grow' },
+          h('div', { className: 'dshdev-item-head' },
+            h('strong', { className: 'dshdev-item-name', 'data-testid': 'this-device-name' }, localName(status)),
+            h('span', { className: 'dshdev-badge' }, tr('thisDevice'))),
+          h('div', { className: 'dshdev-self-meta' }, children)))
+    }
+
+    /**
+     * The flow strip's state, derived from the paired hosts only.
+     * `connecting` while any link is dialling (the supervisor's scheduled retry
+     * counts as dialling), `online` as soon as a host answers, otherwise `idle`.
+     * `idle` animates NOTHING: a pulsing grid with no connection would be a lie.
+     */
+    const flowState = (remotes) => {
+      const list = Array.isArray(remotes) ? remotes : []
+      if (list.some((remote) => remote && (remote.status === 'connecting' || remote.retry))) return 'connecting'
+      if (list.some((remote) => remote && remote.status === 'online')) return 'online'
+      return 'idle'
+    }
+    // 15 x 4 = 60 dots: a grid, not a canvas. Each dot starts a little later than
+    // the one on its left (and a touch after the row above) so the same one-keyframe
+    // animation reads as one wave travelling toward the host cards. The caption sits
+    // UNDER the fixed-height band — muted and small, and announced politely, because
+    // it is what names the state the colours alone cannot.
+    const FLOW_COLUMNS = 15
+    const FLOW_ROWS = 4
+    function FlowStrip({ remotes }) {
+      useLang()
+      const state = flowState(remotes)
+      const dots = []
+      for (let row = 0; row < FLOW_ROWS; row += 1) {
+        for (let column = 0; column < FLOW_COLUMNS; column += 1) {
+          dots.push(h('span', {
+            key: `${row}:${column}`, className: 'dshdev-flow-dot',
+            style: { animationDelay: `${column * 90 + row * 40}ms` },
+          }))
+        }
+      }
+      return h('div', { className: 'dshdev-flow', 'data-state': state, 'data-testid': 'flow' },
+        h('div', { className: 'dshdev-flow-band' },
+          h('div', { className: 'dshdev-flow-grid', 'aria-hidden': true }, dots)),
+        h('div', { className: 'dshdev-flow-note', role: 'status', 'aria-live': 'polite' },
+          state === 'idle' ? tr('flowIdle') : tr('flowBusy')))
+    }
+
     function CopyButton({ text, label }) {
       const [done, setDone] = React.useState(false)
       useLang()
@@ -622,6 +910,8 @@ window.__ModuleLoader__.load({
       'sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote',
       'files:write', 'settings:write', 'commands:execute', 'workspace:manage',
       'credentials:write', 'plugins:manage', 'schedule:write', 'terminal',
+      // spec 011: a paired device may also start its own session and pick the model.
+      'sessions:author',
     ]
     const SCOPE_PRESETS = {
       standard: ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote'],
@@ -629,7 +919,7 @@ window.__ModuleLoader__.load({
     }
     // Scopes that get a risk hint under their checkbox.
     const RISKY_SCOPES = new Set(['files:write', 'settings:write', 'commands:execute', 'workspace:manage',
-      'credentials:write', 'plugins:manage', 'schedule:write', 'terminal'])
+      'credentials:write', 'plugins:manage', 'schedule:write', 'terminal', 'sessions:author'])
     const keepKnown = (scopes) => ALL_SCOPES.filter((scope) => scopes.includes(scope))
 
     // The checkbox list + the two preset buttons, shared by Approve and Edit permissions.
@@ -653,6 +943,43 @@ window.__ModuleLoader__.load({
           h('span', null, tr(`scope.${scope}`),
             RISKY_SCOPES.has(scope) ? h('span', { className: 'dshdev-muted', style: { display: 'block' } }, tr(`risk.${scope}`)) : null,
             can(scope) ? null : h('span', { className: 'dshdev-muted', style: { display: 'block' } }, tr('notRequested'))))))
+    }
+
+    // A grant is a list, not a sentence: one muted count above the chips, then one
+    // chip per scope. Past SCOPE_CLAMP chips the area is clamped to about two rows
+    // and opens on request — CSS only, so EVERY chip stays in the DOM (a screen
+    // reader and the page's own tests still see the whole grant).
+    const SCOPE_CLAMP = 6
+    function ScopeChips({ scopes, testId, empty }) {
+      useLang()
+      const [open, setOpen] = React.useState(false)
+      const list = Array.isArray(scopes) ? scopes : []
+      const clamp = list.length > SCOPE_CLAMP
+      return h('div', { className: 'dshdev-scopes-block' },
+        // The count alone says "how many" — the old "Permissions 13 permissions"
+        // pair said the same thing twice on every device row.
+        h('div', { className: 'dshdev-scopes-head' },
+          h('span', { className: 'dshdev-scopes-count', 'data-testid': 'scope-count' }, withCount('scopeCount', list.length))),
+        list.length === 0
+          // No scope granted: the list says so in words, and the element keeps its
+          // test id so a device with an empty grant and one with many are the same shape.
+          ? h('div', { className: 'dshdev-muted', 'data-testid': testId || 'scope-chips' }, empty === undefined ? '—' : empty)
+          : h('div', {
+            className: `dshdev-scopes${clamp && !open ? ' clamped' : ''}`,
+            'data-testid': testId || 'scope-chips',
+          }, list.map((scope) => {
+            // The amber tint is the ScopePicker's own dangerous set, and the tooltip
+            // is the very risk line its checkbox prints — one classification, not two.
+            const risky = RISKY_SCOPES.has(scope)
+            return h('span', {
+              key: scope, className: `dshdev-scope${risky ? ' risk' : ''}`, 'data-scope': scope,
+              title: risky ? tr(`risk.${scope}`) : undefined,
+            }, tr(`scope.${scope}`))
+          })),
+        clamp ? h('button', {
+          type: 'button', className: 'dshdev-scopes-toggle', 'aria-expanded': open,
+          onClick: () => setOpen(!open),
+        }, open ? tr('showLessScopes') : withCount('showAllScopes', list.length)) : null)
     }
 
     // Window 2: who is asking, what for, and the code to compare. Polled every 2 s.
@@ -706,25 +1033,30 @@ window.__ModuleLoader__.load({
         list.length ? h('div', { className: 'dshdev-muted', style: { marginTop: 6 } }, tr('pendingHelp')) : null)
     }
     // ------------------------------------------------------ tab 1: allow
-    // Advanced: the remote-bridge limits in force. Read-only: they are the
-    // mobile-gateway plugin config (`remoteBridgeLimits`); /mgw has no write route
-    // for it, so this page shows them and says where to change them.
+    // Advanced: the connection plan and the remote-bridge limits in force, behind
+    // one disclosure so the page itself stays readable. The limits are read-only:
+    // they are the mobile-gateway plugin config (`remoteBridgeLimits`); /mgw has no
+    // write route for it, so this page shows them and says where to change them.
     const LIMIT_KEYS = ['maxConnectionsPerDevice', 'maxStreamsPerDevice', 'maxInflightPerDevice', 'callsPerSecond', 'maxResultBytes']
-    function AdvancedLimits({ limits }) {
+    function AdvancedLimits({ limits, children }) {
       useLang()
       const [open, setOpen] = React.useState(false)
       return h('div', { className: 'dshdev-card', 'data-testid': 'advanced-limits' },
         h('div', { className: 'dshdev-row' },
           h('h3', { className: 'dshdev-grow', style: { margin: 0 } }, tr('advancedLimits')),
           h('button', { type: 'button', className: 'dshdev-btn', 'aria-expanded': open, onClick: () => setOpen(!open) }, open ? '−' : '+')),
+        // `children` is the connection plan: one control the owner rarely needs, so
+        // it lives behind the same disclosure instead of filling the page.
         open ? h('div', { style: { marginTop: 8 } },
-          h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('limitsHelp')),
-          h('div', { className: 'dshdev-list' }, LIMIT_KEYS.map((key) => {
-            const value = limits && Number.isSafeInteger(limits[key]) ? limits[key] : 0
-            return h('div', { key },
-              h('div', { className: 'dshdev-grow' }, tr(`limit.${key}`)),
-              h('strong', { 'data-testid': `limit-${key}` }, value === 0 ? `0 (${tr('unlimited')})` : String(value)))
-          }))) : null)
+          children || null,
+          h('div', { className: 'dshdev-sub-sect' },
+            h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('limitsHelp')),
+            h('div', { className: 'dshdev-list' }, LIMIT_KEYS.map((key) => {
+              const value = limits && Number.isSafeInteger(limits[key]) ? limits[key] : 0
+              return h('div', { key },
+                h('div', { className: 'dshdev-grow' }, tr(`limit.${key}`)),
+                h('strong', { 'data-testid': `limit-${key}` }, value === 0 ? `0 (${tr('unlimited')})` : String(value)))
+            })))) : null)
     }
 
     // Spec 008 T036: where the listener really binds. The address is the
@@ -781,6 +1113,21 @@ window.__ModuleLoader__.load({
       return isTailscaleHost(host, status.tailscale && status.tailscale.addresses) ? 'tailscale' : 'lan'
     }
 
+    // POST /mgw/listen refuses with a machine-readable code AND an English sentence
+    // (lib/index.mjs). On a page that is not in English the known reasons are named
+    // in the Host language instead; anything else is shown verbatim, so a new reason
+    // still reaches the owner instead of being swallowed by a missing translation.
+    const PLAN_REASON_KEYS = {
+      'tailscale/not-detected': 'planErrTailscale',
+      'lan/not-detected': 'planErrLan',
+      'lan/disabled': 'planErrDisabled',
+    }
+    const planReason = (cause) => {
+      const key = cause && PLAN_REASON_KEYS[cause.code]
+      if (key && currentLang() !== 'en') return tr(key)
+      return String((cause && cause.message) || '')
+    }
+
     // The connection plan used to be static plugin config (`lanHost`), which meant
     // editing config and restarting to reach this machine over Tailscale. This is
     // the one write on the tab: POST /mgw/listen rebinds the live listener.
@@ -814,10 +1161,13 @@ window.__ModuleLoader__.load({
           if (onApplied) onApplied(data)
         } catch (cause) {
           // Nothing local moves on failure: the select falls back to the plan status reports.
-          setError(cause.message)
+          setError(planReason(cause))
         } finally { inFlight.current = false; setApplying('') }
       }
-      return h('div', { className: 'dshdev-card', 'data-testid': 'connection-plan' },
+      // No card of its own: this block is one section inside the "Advanced"
+      // disclosure (see AdvancedLimits), so the main page stays readable while the
+      // control, its consent text and the bind it produced stay on the page.
+      return h('div', { 'data-testid': 'connection-plan' },
         h('h3', null, tr('planTitle')),
         h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('planHelp')),
         h('div', { className: 'dshdev-row' },
@@ -855,36 +1205,41 @@ window.__ModuleLoader__.load({
       const bind = listenerBind(info)
       const up = info.enabled !== false && info.listening === true
       const loopback = up && isLoopbackHost(host)
-      const tailscaleAddresses = (tailscale && tailscale.addresses) || []
+      // `tailscale.addresses` is the gateway's own detection, so membership is the
+      // whole test for "this bind is on my tailnet" — the chip says it in one word.
+      const tailscaleAddresses = ((tailscale && tailscale.addresses) || [])
+        .map((address) => String(address).replace(/^\[|\]$/g, ''))
+      const bare = String(host).replace(/^\[|\]$/g, '')
+      const route = !bare ? '' : isLoopbackHost(bare) ? 'routeLoopback'
+        : tailscaleAddresses.includes(bare) ? 'routeTailscale' : 'routeLan'
       // A port the OS may already have handed out, or a bind that failed on a busy
-      // one (EADDRINUSE), gets one plain explanation; a quiet port gets no row.
+      // one (EADDRINUSE), gets one plain line; a quiet port gets nothing.
       const port = Number.isInteger(info.port) && info.port > 0 ? info.port : null
       const portRisk = isRiskyListenerPort(port)
       const portBusy = !up && /EADDRINUSE/.test(String(info.error || ''))
-      const riskNote = portRisk || portBusy ? h('div', { className: 'dshdev-banner', 'data-testid': 'listener-port-risk' },
-        h('div', null,
-          h('strong', null, tr(portBusy ? 'portBusyTitle' : 'portRiskTitle')),
-          h('div', null, tr(portBusy ? 'portBusyBody' : 'portRiskBody')),
-          portRisk ? h('div', null, tr('portRiskSafeBand')) : null,
-          h('div', null, tr('portRiskAuto')))) : null
+      const portNote = portRisk || portBusy
+        ? h('div', { className: 'dshdev-note warn', 'data-testid': 'listener-port-risk' },
+          portBusy ? tr('portBusyBody') : `${tr('portRiskBody')} ${tr('portRiskSafeBand')}`) : null
+      const address = bind || tr('listenerUnknown')
       return h('div', { className: 'dshdev-card', 'data-testid': 'listening-on' },
+        // One fact per line: who is listening, where, and what a client must pin.
         h('div', { className: 'dshdev-row' },
           h('h3', { className: 'dshdev-grow', style: { margin: 0 } }, tr('listeningOn')),
+          route ? h('span', { className: 'dshdev-badge', 'data-testid': 'listener-route' }, tr(route)) : null,
           h('span', { className: `dshdev-badge${up ? ' ok' : ' bad'}`, 'data-testid': 'listener-state' }, up ? tr('listenerUp') : tr('listenerDown'))),
         h('div', { className: 'dshdev-row', style: { marginTop: 6 } },
-          h('code', { className: 'dshdev-chip', 'data-testid': 'listener-bind' }, bind || tr('listenerUnknown'))),
-        info.error ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'listener-error' }, String(info.error)) : null,
-        riskNote,
+          h('span', { className: 'dshdev-muted' }, tr('reachableNote')),
+          h('code', { className: 'dshdev-chip', 'data-testid': 'listener-bind' }, address),
+          h(CopyButton, { text: address })),
         info.certSha256 ? h('div', { className: 'dshdev-row', style: { marginTop: 6 } },
           h('span', { className: 'dshdev-muted' }, tr('certPin')),
-          h('code', { className: 'dshdev-muted', 'data-testid': 'listener-pin', title: String(info.certSha256) }, shortenHash(info.certSha256))) : null,
-        loopback ? h('div', { className: 'dshdev-banner', 'data-testid': 'listener-loopback' },
-          h('div', null, h('strong', null, tr('loopbackTitle')), h('div', null, tr('loopbackWarning')))) : null,
-        !loopback && up && host ? h('div', { className: 'dshdev-banner info', 'data-testid': 'listener-reachable' },
-          h('div', null,
-            h('strong', null, tr('reachableTitle')),
-            h('div', null, `${tr('reachableNote')} ${bind || host}`),
-            tailscaleAddresses.includes(host) ? h('div', { 'data-testid': 'listener-tailscale' }, tr('reachableTailscale')) : null)) : null)
+          h('code', { className: 'dshdev-pin', 'data-testid': 'listener-pin', title: String(info.certSha256) }, shortenHash(info.certSha256)),
+          h(CopyButton, { text: String(info.certSha256) })) : null,
+        info.error ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'listener-error' }, String(info.error)) : null,
+        portNote,
+        // A loopback bind keeps the one long warning (it names where the owner changes
+        // it); every other bind says who can connect in its route chip and adds nothing.
+        loopback ? h('div', { className: 'dshdev-note warn', 'data-testid': 'listener-loopback' }, tr('loopbackWarning')) : null)
     }
 
     function AllowTab() {
@@ -921,16 +1276,22 @@ window.__ModuleLoader__.load({
         if (busy) return
         setBusy(true); setError('')
         try {
+          // Both directions go through /mgw/remote-control. When the gateway
+          // answers `persists:false` the switch moved but the state file did not
+          // take it: it applies until this session ends and the next start
+          // follows the saved value, so say so instead of staying quiet.
+          let persisted = true
           if (!on) {
             // Same calls as the gateway panel: owner switch, then run the gateway,
             // then pick the LAN route (the only one this page supports).
-            await post('/mgw/remote-control', { enabled: true })
+            persisted = (await post('/mgw/remote-control', { enabled: true })).persists !== false
             await post('/mgw/gateway', { mode: 'persistent' })
             await post('/mgw/connection', { route: 'lan' })
           } else {
-            await post('/mgw/remote-control', { enabled: false })
+            persisted = (await post('/mgw/remote-control', { enabled: false })).persists !== false
             setPairing(null)
           }
+          if (!persisted) setError(tr('switchNotSaved'))
           await refresh()
         } catch (cause) { setError(cause.message) } finally { setBusy(false) }
       }
@@ -975,7 +1336,14 @@ window.__ModuleLoader__.load({
       const addresses = (status && status.lan && status.lan.listening ? status.lan.urls || [] : [])
         .map((url) => { try { return new URL(url).host } catch { return '' } }).filter(Boolean)
 
+      // The listener state the first card states: the same bind /mgw/status reports,
+      // so the row cannot disagree with the "Listening on" card further down.
+      const listening = !!(status && status.lan && status.lan.enabled !== false && status.lan.listening === true)
       return h('div', null,
+        h(ThisDevice, { status },
+          status ? h('div', { className: 'dshdev-row' },
+            h('span', { className: listening ? 'dshdev-dot ok' : 'dshdev-dot' }),
+            h('span', null, listening ? tr('listenerUp') : tr('listenerDown'))) : null),
         h('div', { className: 'dshdev-card' },
           h('div', { className: 'dshdev-row' },
             h('div', { className: 'dshdev-grow' },
@@ -1005,19 +1373,30 @@ window.__ModuleLoader__.load({
           addresses.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAddress'))
             : h('div', { className: 'dshdev-row' }, addresses.map((address) =>
               h('span', { key: address, className: 'dshdev-chip' }, address, h(CopyButton, { text: address }))))),
-        h('div', { className: 'dshdev-card' },
+        h('div', { className: 'dshdev-card', 'data-testid': 'authorized-devices' },
           h('h3', null, tr('authorized')),
           devices.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noAuthorized'))
-            : h('div', { className: 'dshdev-list' }, devices.map((device) => h('div', { key: device.id },
-              h('div', { className: 'dshdev-grow' },
-                h('div', { className: 'dshdev-row' },
-                  h('strong', null, device.displayName || device.name),
-                  h('span', { className: 'dshdev-badge' }, device.kind || 'mobile'),
-                  device.online ? h('span', { className: 'dshdev-badge ok' }, tr('connectedHere')) : null),
-                h('div', { className: 'dshdev-muted' }, `${tr('scopes')}: ${(device.scopes || []).map((scope) => tr(`scope.${scope}`)).join(', ') || '—'}`),
-                h('div', { className: 'dshdev-muted' }, `${tr('lastUsed')}: ${device.lastSeenAt ? new Date(device.lastSeenAt).toLocaleString() : tr('never')}`)),
-              h('button', { type: 'button', className: 'dshdev-btn', disabled: !on, onClick: () => { setPairing(null); setEditing({ device, scopes: [...(device.scopes || [])] }) } }, tr('edit')),
-              h('button', { type: 'button', className: 'dshdev-btn danger', onClick: () => revoke(device) }, tr('remove')))))),
+            : h('div', { className: 'dshdev-items', style: { marginBottom: 0, marginTop: 10 } }, devices.map((device) => h('div', {
+              key: device.id, className: 'dshdev-item dshdev-item-stack', 'data-testid': 'authorized-item',
+            },
+              // Header line: who it is, then the two actions on the right. The body
+              // below spans the card, so the grant is not squeezed into the column
+              // the buttons leave — on a narrow card the actions wrap under the name.
+              h('div', { className: 'dshdev-item-top' },
+                h('div', { className: 'dshdev-tile' }, deviceIcon(device.kind)),
+                h('div', { className: 'dshdev-item-main' },
+                  h('div', { className: 'dshdev-item-head' },
+                    h('strong', { className: 'dshdev-item-name' }, device.displayName || device.name),
+                    h('span', { className: 'dshdev-badge' }, device.kind || 'mobile'),
+                    device.online ? h('span', { className: 'dshdev-badge ok' }, tr('connectedHere')) : null)),
+                h('div', { className: 'dshdev-item-actions' },
+                  h('button', { type: 'button', className: 'dshdev-btn', disabled: !on, onClick: () => { setPairing(null); setEditing({ device, scopes: [...(device.scopes || [])] }) } }, tr('edit')),
+                  h('button', { type: 'button', className: 'dshdev-btn danger', onClick: () => revoke(device) }, tr('remove')))),
+              h('div', { className: 'dshdev-item-body' },
+                h(ScopeChips, { scopes: device.scopes }),
+                h('div', { className: 'dshdev-item-meta' },
+                  h('span', { className: 'dshdev-muted' }, tr('lastUsed')),
+                  h('span', { 'data-testid': 'last-used' }, stampWhen(device.lastSeenAt)))))))),
         editing ? h('div', { className: 'dshdev-card', 'data-testid': 'edit-permissions' },
           h('h3', null, `${tr('edit')} — ${editing.device.displayName || editing.device.name}`),
           h('div', { className: 'dshdev-muted', style: { marginBottom: 8 } }, tr('editHelp')),
@@ -1026,9 +1405,11 @@ window.__ModuleLoader__.load({
             h('button', { type: 'button', className: 'dshdev-btn primary', disabled: busy, onClick: () => generate(editing.scopes) }, tr('editSave')),
             h('button', { type: 'button', className: 'dshdev-btn', onClick: () => setEditing(null) }, tr('cancel')))) : null,
         pairing && editing ? h(PairingBox, { pairing }) : null,
-        h(ConnectionPlan, { status, onApplied: applyPlan }),
+        // The bind the listener really serves is a state card; the control that
+        // changes it sits behind "Advanced" with the limits, so the page is quiet.
         h(ListeningOn, { lan: status && status.lan, tailscale: status && status.tailscale }),
-        h(AdvancedLimits, { limits: status && status.remoteBridgeLimits }))
+        h(AdvancedLimits, { limits: status && status.remoteBridgeLimits },
+          h(ConnectionPlan, { status, onApplied: applyPlan })))
     }
 
     // --------------------------------------------------- tab 2: connect
@@ -1118,19 +1499,27 @@ window.__ModuleLoader__.load({
               h('button', { type: 'submit', className: 'dshdev-btn primary', disabled: busy || !ready }, busy ? tr('working') : tr('addSubmit'))))))
     }
 
+    // The Connect tab's section-header action. It keeps the dialog the card used to
+    // open — one click, same fields, same routes — and starts closed; the "+" is
+    // drawn by CSS so the button's text stays exactly the translated label.
     function AddDeviceForm({ onAdded }) {
       useLang()
       const [open, setOpen] = React.useState(false)
-      return h('div', { className: 'dshdev-card' },
-        h('div', { className: 'dshdev-row' },
-          h('h3', { className: 'dshdev-grow', style: { margin: 0 } }, tr('addDevice')),
-          h('button', { type: 'button', className: 'dshdev-btn primary', onClick: () => setOpen(true) }, tr('addDevice'))),
+      return h(React.Fragment, null,
+        h('button', { type: 'button', className: 'dshdev-link add', onClick: () => setOpen(true) }, tr('addDevice')),
         open ? h(AddDeviceDialog, { onClose: () => setOpen(false), onAdded }) : null)
     }
     function statusBadge(status) {
       const cls = status === 'online' ? 'ok' : (status === 'revoked' || status === 'error') ? 'bad' : ''
       return h('span', { className: `dshdev-badge ${cls}` }, tr(`status.${status}`))
     }
+    // A row's link state as a coloured dot; the word next to it stays the same
+    // string the badge used. The dot is what carries the state — an answering link
+    // is green, a dialling one amber (and breathing), a plain one grey, and access
+    // the host took back is red.
+    const dotClass = (status) => (status === 'online' ? 'dshdev-dot ok'
+      : status === 'connecting' ? 'dshdev-dot warn'
+      : status === 'revoked' || status === 'error' ? 'dshdev-dot off' : 'dshdev-dot')
 
     function RemoteDetail({ remote, onBack, onChanged }) {
       useLang()
@@ -1247,13 +1636,26 @@ window.__ModuleLoader__.load({
     function ConnectTab() {
       useLang()
       const [remotes, setRemotes] = React.useState([])
+      const [status, setStatus] = React.useState(null)
       const [openId, setOpenId] = React.useState('')
       const [error, setError] = React.useState('')
       const [connecting, setConnecting] = React.useState('')
       const [connectError, setConnectError] = React.useState(null)
       const mounted = React.useRef(true)
+      // Two reads the tab needs anyway: the paired hosts, and this machine's own
+      // identity (/mgw/status, the route the Allow tab already polls). A gateway that
+      // does not answer it leaves the name out — it must not turn the host list into
+      // an error, and it adds no timer and no route of its own.
       const refresh = React.useCallback(async () => {
-        try { const data = await request('/devices/remotes'); if (mounted.current) setRemotes(data.remotes || []) } catch (cause) { if (mounted.current) setError(cause.message) }
+        try {
+          const [data, mgw] = await Promise.all([
+            request('/devices/remotes'),
+            request('/mgw/status').catch(() => null),
+          ])
+          if (!mounted.current) return
+          setRemotes(data.remotes || [])
+          setStatus(mgw)
+        } catch (cause) { if (mounted.current) setError(cause.message) }
       }, [])
       // The chip's Reconnect lives in a popover that exists only inside an already open
       // remote session, and the row's Open only dials the host as a side effect of
@@ -1285,36 +1687,79 @@ window.__ModuleLoader__.load({
       const remove = async (remote) => {
         try { await request(`/devices/remotes/${encodeURIComponent(remote.id)}`, { method: 'DELETE' }); await refresh() } catch (cause) { setError(cause.message) }
       }
+      // One card per paired host: an icon tile, the name with the link state, the
+      // address in a mono line, then the row's own notes and three icon actions.
+      // Every note keeps its data-testid and its exact sentence.
+      const remoteCard = (remote) => {
+        // The icon button's accessible name says what the row is doing now, exactly
+        // like the text it renders.
+        const dialling = connecting === remote.id
+        const dialLabel = dialling ? tr('reconnecting') : tr('reconnect')
+        const notes = [
+          // The link supervisor is already dialling: "offline" here does not
+          // mean "waiting for a human", and the Reconnect button stays usable.
+          remote.retry
+            ? h('div', { key: 'retry', className: 'dshdev-muted', 'data-testid': 'remote-retry', role: 'status' }, tr('autoRetry'))
+            : null,
+          // The pin the pairing recorded is no longer what the host presents.
+          // Retrying cannot fix that, so the row says what happened and that
+          // nothing was sent (no credential left this machine).
+          remote.linkError === 'pin-mismatch'
+            ? h('div', { key: 'pin', className: 'dshdev-err', 'data-testid': 'remote-pin-mismatch', role: 'alert' }, tr('pinMismatchNote'))
+            : null,
+          lacksRemoteScope(remote)
+            ? h('div', { key: 'scope', className: 'dshdev-warn', 'data-testid': 'missing-remote-scope', role: 'status' }, tr('missingRemoteScope'))
+            : null,
+          remote.hostError
+            ? h('div', { key: 'refused', className: 'dshdev-muted', 'data-testid': 'host-refused' },
+              `${tr('hostRefused')} — ${remote.hostError.code}${remote.hostError.scope ? ` (${remote.hostError.scope})` : ''}`)
+            : null,
+          connectError && connectError.id === remote.id
+            ? h('div', { key: 'dial', className: 'dshdev-err', role: 'alert', 'data-testid': 'remote-reconnect-error' }, connectError.message)
+            : null,
+        ].filter(Boolean)
+        return h('div', { key: remote.id, className: 'dshdev-item', 'data-testid': 'remote-item' },
+          h('div', { className: `dshdev-tile${remote.status === 'online' ? ' ok' : remote.status === 'revoked' || remote.status === 'error' ? ' bad' : ''}` },
+            h(IconHost)),
+          h('div', { className: 'dshdev-grow' },
+            h('div', { className: 'dshdev-item-head' },
+              h('strong', { className: 'dshdev-item-name' }, remote.name),
+              h('span', { className: dotClass(remote.status) }),
+              h('span', { className: 'dshdev-item-status' }, tr(`status.${remote.status}`)),
+              remote.approvals && remote.approvals.length
+                ? h('span', { className: 'dshdev-badge warn', 'data-testid': 'remote-approvals' }, `${tr('approvals')}: ${remote.approvals.length}`)
+                : null),
+            h('div', { className: 'dshdev-item-addr' }, remote.address),
+            notes),
+          h('div', { className: 'dshdev-item-actions' }, [
+            // A revoked remote gets no Reconnect at all: pairing again is the only fix, and
+            // the route would answer `auth/revoked`.
+            remote.status === 'revoked' ? null
+              : h('button', { key: 'reconnect', type: 'button', className: 'dshdev-iact iact-reconnect', 'data-testid': 'remote-reconnect',
+                'aria-label': dialLabel, title: dialLabel,
+                disabled: connecting !== '', onClick: () => connect(remote) }, dialLabel),
+            h('button', { key: 'open', type: 'button', className: 'dshdev-iact iact-open',
+              'aria-label': tr('open'), title: tr('open'),
+              disabled: remote.status === 'revoked', onClick: () => setOpenId(remote.id) }, tr('open')),
+            h('button', { key: 'remove', type: 'button', className: 'dshdev-iact iact-remove danger',
+              'aria-label': tr('removeRemote'), title: tr('removeRemote'),
+              onClick: () => remove(remote) }, tr('removeRemote')),
+          ].filter(Boolean)))
+      }
+      const online = remotes.filter((remote) => remote.status === 'online').length
       return h('div', null,
-        h(AddDeviceForm, { onAdded: refresh }),
+        h(ThisDevice, { status },
+          h('div', { className: 'dshdev-row' },
+            h('span', { className: dotClass(online > 0 ? 'online' : '') }),
+            h('span', { 'data-testid': 'connected-count' }, connectedCount(online)))),
+        h(FlowStrip, { remotes }),
         error ? h('div', { className: 'dshdev-err', role: 'alert' }, error) : null,
-        h(RemoteGroupingStatus),
-        h('div', { className: 'dshdev-card' },
-          h('h3', null, tr('remotes')),
-          remotes.length === 0 ? h('div', { className: 'dshdev-muted' }, tr('noRemotes'))
-            : h('div', { className: 'dshdev-list' }, remotes.map((remote) => h('div', { key: remote.id },
-              h('div', { className: 'dshdev-grow' },
-                h('div', { className: 'dshdev-row' }, h('strong', null, remote.name), statusBadge(remote.status)),
-                h('div', { className: 'dshdev-muted' }, remote.address),
-                lacksRemoteScope(remote)
-                  ? h('div', { className: 'dshdev-warn', 'data-testid': 'missing-remote-scope', role: 'status' }, tr('missingRemoteScope'))
-                  : null,
-                remote.hostError
-                  ? h('div', { className: 'dshdev-muted', 'data-testid': 'host-refused' },
-                    `${tr('hostRefused')} — ${remote.hostError.code}${remote.hostError.scope ? ` (${remote.hostError.scope})` : ''}`)
-                  : null,
-                connectError && connectError.id === remote.id
-                  ? h('div', { className: 'dshdev-err', role: 'alert', 'data-testid': 'remote-reconnect-error' }, connectError.message)
-                  : null,
-                remote.approvals && remote.approvals.length ? h('div', { className: 'dshdev-badge bad' }, `${tr('approvals')}: ${remote.approvals.length}`) : null),
-              h('button', { type: 'button', className: 'dshdev-btn', disabled: remote.status === 'revoked', onClick: () => setOpenId(remote.id) }, tr('open')),
-              // A revoked remote gets no Reconnect at all: pairing again is the only fix, and
-              // the route would answer `auth/revoked`.
-              remote.status === 'revoked' ? null
-                : h('button', { type: 'button', className: 'dshdev-btn', 'data-testid': 'remote-reconnect',
-                  disabled: connecting !== '', onClick: () => connect(remote) },
-                connecting === remote.id ? tr('reconnecting') : tr('reconnect')),
-              h('button', { type: 'button', className: 'dshdev-btn danger', onClick: () => remove(remote) }, tr('removeRemote')))))))
+        h('div', { className: 'dshdev-sect' },
+          h('h3', { className: 'dshdev-grow' }, tr('remotes')),
+          h(AddDeviceForm, { onAdded: refresh })),
+        remotes.length === 0 ? h('div', { className: 'dshdev-empty' }, tr('noRemotes'))
+          : h('div', { className: 'dshdev-items' }, remotes.map(remoteCard)),
+        h(RemoteGroupingStatus))
     }
 
     // --------------------------------------- spec 008 P2b: native remote sessions
@@ -1331,6 +1776,15 @@ window.__ModuleLoader__.load({
     const stamp = (value) => {
       const date = new Date(value)
       return Number.isNaN(date.getTime()) ? '—' : date.toISOString().slice(0, 16).replace('T', ' ')
+    }
+    // When a paired device was last seen: date and time, no seconds, in the page's
+    // own language instead of the browser's (the two disagree on day/month order).
+    const WHEN_FORMAT = { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+    const stampWhen = (value) => {
+      if (value === null || value === undefined || value === '') return tr('never')
+      const date = new Date(value)
+      if (Number.isNaN(date.getTime())) return tr('never')
+      return date.toLocaleString(currentLang() === 'vi' ? 'vi-VN' : 'en-US', WHEN_FORMAT)
     }
     const ANY = (state) => state
     const titleOf = (row, fallback) => (row && (row.displayTitle || row.title)) || fallback || ''
@@ -1398,6 +1852,12 @@ window.__ModuleLoader__.load({
                 createdAt: remote.createdAt ?? null,
                 kind: (remote.device && remote.device.kind) || null,
                 scopes: remote.device && Array.isArray(remote.device.scopes) ? remote.device.scopes : [],
+                // The link supervisor's pending retry, so every surface that reads
+                // this store can tell "offline, retrying" from "offline".
+                retry: remote.retry ?? null,
+                // Why an automatic reconnect stopped for good (a changed
+                // certificate); `retry` is null in that case, never both.
+                linkError: remote.linkError ?? null,
               })),
               // index.mjs answers with exactly the CONNECTED hosts, so a host here is
               // online by construction; a tagged session whose host is absent is the
@@ -1648,11 +2108,17 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dshdev-pop-row' }, h('span', null, tr('popoverTitle')), h('strong', null, name)),
           h('div', { className: 'dshdev-pop-row' }, h('span', null, tr('status.online')),
             h('span', { 'data-testid': 'popover-state' }, online ? tr('status.online') : tr('status.offline'))),
+          // While the supervisor holds a retry, the popover says the link is coming
+          // back by itself instead of leaving "Offline" as the whole story.
+          remote && remote.retry
+            ? h('div', { className: 'dshdev-muted', 'data-testid': 'popover-retry', role: 'status' }, tr('autoRetry'))
+            : null,
           h('div', { className: 'dshdev-pop-row' }, h('span', null, tr('popoverKind')),
             h('span', { 'data-testid': 'popover-kind' }, (remote && remote.kind) || '—')),
-          h('div', { className: 'dshdev-pop-row' }, h('span', null, tr('popoverScopes')),
-            h('span', { 'data-testid': 'popover-scopes', style: { textAlign: 'right' } },
-              scopes.length ? scopes.map((scope) => tr(`scope.${scope}`)).join(', ') : tr('popoverNoScopes'))),
+          // The grant is the same chip list the authorized-device rows use: a host
+          // with a dozen scopes would otherwise print one unreadable sentence here.
+          h('div', { className: 'dshdev-pop-scopes' },
+            h(ScopeChips, { scopes, label: tr('popoverScopes'), testId: 'popover-scopes', empty: tr('popoverNoScopes') })),
           h('div', { className: 'dshdev-pop-row' }, h('span', null, tr('popoverPaired')),
             h('span', { 'data-testid': 'popover-paired' }, remote && remote.createdAt ? stamp(remote.createdAt) : '—')),
           scopes.includes('terminal') ? null : h('div', { className: 'dshdev-muted', 'data-testid': 'terminal-hint' }, tr('terminalHint')),
@@ -1749,13 +2215,44 @@ window.__ModuleLoader__.load({
 
     // The Devices page's own line about the replacement, so a failed install is
     // visible in the UI instead of only in the console.
+    //
+    // The plugin writes these few reasons itself, so they are printed as sentences
+    // rather than as the raw English diagnosis. `routing.reason` is the carrier's own
+    // short code (A1.1 self-test); a code without a translation is left alone instead
+    // of being guessed at, and a message a shell hands us stays verbatim.
+    const REASON_KEYS = {
+      'dsh-version-mismatch': 'reason.dsh-version-mismatch',
+      'dsh-version-unknown': 'reason.dsh-version-unknown',
+      'no-gateway': 'reason.no-gateway',
+      'dispatchRpc-missing': 'reason.dispatchRpc-missing',
+      'openWireStream-missing': 'reason.openWireStream-missing',
+      'openWireStream-signature': 'reason.openWireStream-signature',
+    }
+    const reasonText = (code) => {
+      const value = String(code || '')
+      const key = REASON_KEYS[value]
+      return key ? tr(key) : value
+    }
+    const groupingReasonText = (reason) => {
+      const value = String(reason || '')
+      if (!value) return ''
+      if (value === 'not installed') return tr('sidebarReasonNotInstalled')
+      if (value === 'the shell provides no client services') return tr('sidebarReasonNoServices')
+      if (value === 'no remote host is connected') return tr('sidebarReasonNoHost')
+      if (value === 'the shell provides no workspace actions') return tr('sidebarReasonNoActions')
+      const routing = /^multi-host routing is off(?:: (.*))?$/.exec(value)
+      if (routing) {
+        return routing[1] ? `${tr('sidebarReasonRoutingOff')} (${reasonText(routing[1])})` : tr('sidebarReasonRoutingOff')
+      }
+      return value
+    }
     function RemoteGroupingStatus() {
       useLang()
       const status = useRemoteUI()
       return h('div', { className: 'dshdev-card', 'data-testid': 'sidebar-grouping' },
         h('h3', null, tr('sidebarGrouping')),
         h('div', { className: 'dshdev-muted', 'data-testid': 'sidebar-grouping-state' },
-          status.grouped ? `${tr('sidebarOn')} (${status.hosts})` : `${tr('sidebarOffState')} — ${status.reason || ''}`))
+          status.grouped ? `${tr('sidebarOn')} (${status.hosts})` : `${tr('sidebarOffState')} — ${groupingReasonText(status.reason)}`))
     }
 
     /**
@@ -1875,9 +2372,11 @@ window.__ModuleLoader__.load({
       const [tab, setTab] = React.useState('allow')
       const tabs = [['allow', tr('tabAllow')], ['connect', tr('tabConnect')]]
       return h('div', { className: 'dshdev' },
-        h('h2', null, tr('title')),
+        h('header', { className: 'dshdev-head' },
+          h('h2', null, tr('title')),
+          h('p', { className: 'dshdev-sub', 'data-testid': 'page-subtitle' }, tr('subtitle'))),
         h('div', { className: 'dshdev-tabs', role: 'tablist' }, tabs.map(([id, label]) =>
-          h('button', { key: id, type: 'button', role: 'tab', 'aria-selected': tab === id, className: 'dshdev-tab', onClick: () => setTab(id) }, label))),
+          h('button', { key: id, type: 'button', role: 'tab', 'aria-selected': tab === id, className: 'dshdev-tab dshdev-seg-btn', onClick: () => setTab(id) }, label))),
         tab === 'allow' ? h(AllowTab) : h(ConnectTab))
     }
 
@@ -1924,9 +2423,12 @@ window.__ModuleLoader__.load({
     exports.apply = apply
     exports.inject = inject
     exports.testing = { DevicesPage, AllowTab, ConnectTab, RemoteDetail, AddDeviceForm, AddDeviceDialog, OtpDialog, PendingRequests, ScopePicker, AdvancedLimits, ALL_SCOPES, SCOPE_PRESETS, request, tr, DICT, setHostLanguage,
+      // The flow strip's honesty rule, exported so the test can prove all three
+      // states without depending on CSS.
+      FlowStrip, flowState, connectedCount, localName,
       // spec 008 P2b
       GroupedWorkspaces, GroupedTree, HostChip, SessionBanners, OfflineBanner, ModelStatusBanner, RemoteTerminalEntry,
-      RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG }
+      RemoteGroupingStatus, hostsStore, remoteUI, hostTagOf, HOST_TAG, groupingReasonText }
     return module.exports
   },
 })

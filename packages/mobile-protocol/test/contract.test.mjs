@@ -124,6 +124,8 @@ const CONTRACT_RESPONSE_KINDS = new Set([
   'client-hello', 'pong', 'sessions', 'search', 'history', 'subscribed', 'unsubscribed',
   'sent', 'session-cancelled', 'approval-response', 'device-info', 'device-forgotten',
   'push-registered', 'push-removed',
+  // Revision 7 (spec 011): the four session-authoring rows, listed like every other one.
+  'workspaces', 'session-created', 'models', 'select-model',
 ])
 
 function isResponseKind(token) {
@@ -140,9 +142,22 @@ const contractOpResponses = Object.fromEntries(
   opRows.map((cells) => [firstCode(cells[0]), responseKind(cells[2])]),
 )
 
-test('OPS equals the §4 `type` column, in table order', () => {
+/**
+ * Spec 011 (revision 7): the §4 rows whose Notes name the authoring scope are the authoring
+ * ops. Read from the document, not restated here — a lost row or a dropped scope mention
+ * leaves this list short and fails the scope assertions below.
+ */
+const contractAuthoringOps = opRows
+  .filter((cells) => (cells[3] ?? '').includes('`sessions:author`'))
+  .map((cells) => firstCode(cells[0]))
+
+test('OPS is the §4 `type` column in table order', () => {
   assert.ok(contractOps.length > 0, 'no operations parsed from the contract')
-  assert.deepEqual([...OPS], contractOps)
+  // The document is the whole allowlist, revision 7 rows included: an extra, missing or
+  // reordered row fails here, so an op absent from §4 (or listed twice) still bites.
+  assert.deepEqual([...OPS], [...contractOps])
+  // The spec 011 export stays pinned to the document's authoring rows, by name.
+  assert.deepEqual([...protocol.AUTHORING_CLIENT_TYPES], contractAuthoringOps)
   assert.equal(Object.isFrozen(OPS), true)
 })
 
@@ -150,9 +165,11 @@ test('OPS holds only unique operation names', () => {
   assert.equal(new Set(OPS).size, OPS.length)
 })
 
-test('OP_RESPONSES equals the §4 response `kind` column', () => {
-  assert.equal(opRows.length, 14, 'the contract table is expected to list 14 operations')
+test('OP_RESPONSES is the §4 response `kind` column', () => {
+  assert.ok(opRows.length > 0, 'no operations parsed from the contract')
   assert.deepEqual({ ...OP_RESPONSES }, contractOpResponses)
+  // One response kind per op, no orphan entry.
+  assert.deepEqual(Object.keys(OP_RESPONSES).sort(), [...OPS].sort())
   assert.equal(Object.isFrozen(OP_RESPONSES), true)
 })
 
@@ -330,6 +347,7 @@ test('every export is frozen where it is a constant table', () => {
     'APPROVAL_OUTCOMES_CLIENT', 'APPROVAL_OUTCOMES_FINAL', 'SUBPROTOCOL_PREFIXES', 'OP_RESPONSES',
     'SERVER_PUSH_KINDS', 'PASSTHROUGH_ERROR_CODES', 'DEVICE_KINDS', 'SCOPES', 'DESKTOP_DEFAULT_SCOPES',
     'SCOPE_BY_TYPE', 'REMOTE_CLIENT_TYPES', 'REMOTE_SERVER_KINDS', 'DESKTOP_ONLY_SCOPES', 'SCOPE_PRESETS',
+    'AUTHORING_CLIENT_TYPES',
   ]) {
     assert.equal(Object.isFrozen(protocol[name]), true, `${name} must be frozen`)
   }
@@ -342,26 +360,40 @@ test('every export is frozen where it is a constant table', () => {
 const SPEC_008_SCOPES = [
   'harness:remote', 'commands:execute', 'workspace:manage', 'credentials:write', 'plugins:manage', 'schedule:write', 'terminal',
 ]
+/** Spec 011 (revision 7): explicit-only, but allowed on a `mobile` device. */
+const SPEC_011_SCOPES = ['sessions:author']
 
-test('SCOPES are the six spec 005 FR2 scopes plus the spec 008 scopes; DESKTOP_DEFAULT_SCOPES are the FR3 three', () => {
+test('SCOPES are the six spec 005 FR2 scopes, the spec 008 scopes, the spec 011 scope; DESKTOP_DEFAULT_SCOPES are the FR3 three', () => {
   assert.deepEqual([...protocol.SCOPES],
-    ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'files:write', 'settings:write', ...SPEC_008_SCOPES])
-  // Spec 008: these must be chosen at pair time, never defaulted.
-  for (const scope of SPEC_008_SCOPES) {
+    ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'files:write', 'settings:write',
+      ...SPEC_008_SCOPES, ...SPEC_011_SCOPES])
+  // Spec 008 and spec 011: these must be chosen at pair time, never defaulted.
+  for (const scope of [...SPEC_008_SCOPES, ...SPEC_011_SCOPES]) {
     assert.equal(protocol.DESKTOP_DEFAULT_SCOPES.includes(scope), false, `${scope} must not be a default`)
+  }
+  // Spec 011 crosses the desktop-only line on purpose: a `mobile` device may hold it.
+  for (const scope of SPEC_011_SCOPES) {
+    assert.equal(protocol.DESKTOP_ONLY_SCOPES.includes(scope), false, `${scope} must be grantable to a mobile device`)
   }
   assert.deepEqual([...protocol.DESKTOP_ONLY_SCOPES], SPEC_008_SCOPES)
   assert.deepEqual([...protocol.DEVICE_KINDS], ['mobile', 'desktop'])
   assert.deepEqual([...protocol.DESKTOP_DEFAULT_SCOPES], ['sessions:read', 'prompt:send', 'approval:respond'])
   // The spec restates the revision in the contract document; both must list every scope.
-  const specDir = path.join(path.dirname(path.dirname(path.dirname(findContract()))), '005-remote-desktop-client')
-  const spec = fs.readFileSync(path.join(specDir, 'spec.md'), 'utf8')
+  const specsRoot = path.dirname(path.dirname(path.dirname(findContract())))
+  const spec = fs.readFileSync(path.join(specsRoot, '005-remote-desktop-client', 'spec.md'), 'utf8')
+  const spec011 = fs.readFileSync(path.join(specsRoot, '011-mobile-session-authoring', 'spec.md'), 'utf8')
   const contractDoc = fs.readFileSync(findContract(), 'utf8')
   assert.match(contractDoc, /\*\*Revision 3/)
-  // The spec 008 scopes belong to spec 008, not to the six 005 scopes.
-  for (const scope of protocol.SCOPES.filter((name) => !SPEC_008_SCOPES.includes(name))) {
+  // The spec 008 and spec 011 scopes belong to their own specs, not to the six 005 scopes.
+  for (const scope of protocol.SCOPES.filter(
+    (name) => !SPEC_008_SCOPES.includes(name) && !SPEC_011_SCOPES.includes(name),
+  )) {
     assert.ok(spec.includes(`\`${scope}\``), `${scope} must appear in spec 005`)
     assert.ok(contractDoc.includes(`\`${scope}\``), `${scope} must appear in contract §3/§6`)
+  }
+  // Spec 011 owns its scope (the contract document gains it with revision 7).
+  for (const scope of SPEC_011_SCOPES) {
+    assert.ok(spec011.includes(`\`${scope}\``), `${scope} must appear in spec 011`)
   }
   for (const scope of protocol.DESKTOP_DEFAULT_SCOPES) assert.ok(protocol.SCOPES.includes(scope), scope)
 })
@@ -380,6 +412,15 @@ test('SCOPE_BY_TYPE only names contract ops and scopes, and covers the FR2 mappe
   for (const type of ['device-forget', 'push-register', 'push-remove']) {
     assert.equal(protocol.SCOPE_BY_TYPE[type], undefined, `${type} must stay unmapped (fail closed)`)
   }
+  // Spec 011 FR-002: exactly the §4 authoring rows — and nothing else — carry the scope.
+  for (const type of contractAuthoringOps) {
+    assert.equal(protocol.SCOPE_BY_TYPE[type], protocol.AUTHORING_SCOPE, `${type} must need the authoring scope`)
+  }
+  assert.deepEqual(
+    Object.keys(protocol.SCOPE_BY_TYPE).filter((type) => protocol.SCOPE_BY_TYPE[type] === protocol.AUTHORING_SCOPE).sort(),
+    [...contractAuthoringOps].sort(),
+  )
+  assert.equal(protocol.AUTHORING_SCOPE, 'sessions:author')
 })
 
 test('auth/forbidden-scope is an in-band-only contract error (spec 005 FR6)', () => {
@@ -401,7 +442,12 @@ test('remote-bridge frame types are additive: not §4 ops, every client type nee
     assert.equal(OPS.includes(type), false, `${type} must not join the §4 OPS`)
     assert.equal(protocol.SCOPE_BY_TYPE[type], 'harness:remote', `${type} must require harness:remote`)
   }
-  assert.equal(OPS.length, 14, 'the §4 table is unchanged by revision 4')
+  // Revision 4 adds no op: the allowlist is exactly the §4 table (revision 7's four rows are
+  // in it), so a bridge frame sneaking into the contract would break these counts.
+  assert.equal(OPS.length, contractOps.length)
+  for (const type of protocol.REMOTE_CLIENT_TYPES) {
+    assert.equal(contractOps.includes(type), false, `${type} must not appear in the §4 table`)
+  }
   assert.equal(protocol.REMOTE_STREAM_DEFAULT_CREDIT, 64)
   assert.equal(protocol.REMOTE_BINARY_CHUNK_BYTES, 256 * 1024)
 })
@@ -448,6 +494,25 @@ test('the d.ts declares the revision 4 surface', () => {
   for (const name of ['RemoteCallFrame', 'RemoteStreamOpenFrame', 'RemoteStreamCancelFrame', 'RemoteStreamCreditFrame',
     'RemoteResultFrame', 'RemoteFrame', 'RemoteStreamClosedFrame']) {
     assert.match(declaration, new RegExp(`export (interface|type) ${name}\\b`), `${name} must be declared`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Spec 011 — session authoring (revision 7, additive)
+// ---------------------------------------------------------------------------
+
+test('the d.ts declares the spec 011 authoring ops and scope', () => {
+  const declaration = fs.readFileSync(new URL('../index.d.ts', import.meta.url), 'utf8')
+  for (const op of contractAuthoringOps) {
+    assert.ok(declaration.includes(`| '${op}'`), `${op} must be declared as an Op`)
+    const kind = contractOpResponses[op]
+    assert.ok(declaration.includes(`| '${kind}'`), `${kind} must be declared as a ResponseKind`)
+  }
+  for (const name of ['AUTHORING_CLIENT_TYPES', 'AUTHORING_SCOPE']) {
+    assert.ok(declaration.includes(`export const ${name}`), `${name} must be declared`)
+  }
+  for (const scope of SPEC_011_SCOPES) {
+    assert.ok(declaration.includes(`| '${scope}'`), `${scope} must be declared as a Scope`)
   }
 })
 

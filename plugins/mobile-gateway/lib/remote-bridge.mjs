@@ -43,7 +43,9 @@
 // liguobao/ds-harness-remote (MIT) `harness-remote-bridge.ts` /
 // `remote-typert-gateway.ts`; see plugins/mobile-gateway/NOTICE-ds-harness-remote.
 
-import * as contract from '@dsh-ext/mobile-protocol'
+// Generated copy of the contract (see scripts/sync-mobile-protocol.mjs): the
+// bare package specifier would not resolve in an installed tarball.
+import * as contract from './vendor/mobile-protocol.mjs'
 
 export const REMOTE_SCOPE = 'harness:remote'
 

@@ -269,12 +269,16 @@ describe('SessionsStore', () => {
     assert.equal(store.snapshot().items.length, 1);
   });
 
-  it('keeps the id as the title fallback when projections carry no title', () => {
+  it('leaves a missing title EMPTY instead of substituting the wire id', () => {
+    // Updated with the device fix for the header showing `session-de1cb815-…`: a brand-new session has
+    // no Host title, and the id is a coordinate, not a name. The store now reports "no title" and the
+    // UI supplies a localized label (`sessionDisplayTitle`); the id is never rendered as content.
     const store = new SessionsStore({ now: () => NOW });
     store.setAll([{ sessionId: 'no-title', running: false, updatedAt: NOW }]);
     const summary = store.get('no-title');
     assert.equal(summary?.state, 'idle');
-    assert.equal(summary?.title, 'no-title');
+    assert.equal(summary?.title, '', 'no title reported => empty, never the id');
+    assert.notEqual(summary?.title, 'no-title');
   });
 
   it('maps a legacy unknown state to idle', () => {

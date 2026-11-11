@@ -1,0 +1,36 @@
+# 10 — a revoked device wipes the credential and returns to pairing (US1 §4, FR-009).
+#
+# SCENARIO: paired and connected; the fixture is armed with
+#           `POST /scenario/revoke-on-next-request {enabled:true}` so the very first authenticated
+#           request of this run (the `sessions` resync) kills the credential and closes 4401.
+# HARNESS:  `--cert-mode ok`. The orchestrator arms the revoke immediately before this flow.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: absence of `session-row-sess-alpha` (the list is gone, not merely re-rendered) plus the
+#        pair CTA copy. The pair CTA has no hook of its own (it is the same string as the empty
+#        state button), so it stays text-matched.
+#
+# EXIT CRITERIA:
+#   1. the app returns to the pairing state: no session row hook and the pair CTA is shown;
+#   2. reopening the app does not silently reconnect (the stored credential is gone — asserted on
+#      a second launch, which is what `launchApp` does again below);
+#   3. `GET /state` shows no live connection and the token set empty (orchestrator assertion).
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+# Revocation lands during the resync: the list never renders, the pair CTA does.
+- extendedWaitUntil:
+    visible: ".*(Pair a computer|Ghép đôi máy tính).*"
+    timeout: 30000
+- assertNotVisible:
+    id: "session-row-sess-alpha"
+
+# The credential is gone: a cold start stays unpaired (no reconnect, no session list).
+- launchApp
+- runFlow: subflows/unlock.yaml
+- assertVisible: ".*(Pair a computer|Ghép đôi máy tính).*"
+- assertNotVisible:
+    id: "session-row-sess-alpha"

@@ -178,7 +178,11 @@ export const plugin = {
   inject: ['webServer'],
   async apply(ctx, config = {}) {
     const webServer = ctx.webServer
-    const options = { dataDir: '', allowPublicRemotes: false, remoteSessions: true, ...config }
+    const options = {
+      dataDir: '', allowPublicRemotes: false, remoteSessions: true,
+      autoReconnect: true, reconnectDelaysMs: [1000, 2000, 5000, 10000, 30000], reconnectStableMs: 10000,
+      ...config,
+    }
     // Messages here never include tokens, pairing codes or request headers.
     const sink = typeof options.log === 'function' ? options.log : (line) => console.log('devices:', line)
     const log = (message) => { try { sink(`[${new Date().toISOString()}] ${message}`) } catch { /* logging must not throw */ } }
@@ -206,6 +210,142 @@ export const plugin = {
       }
     }
 
+    // Spec 008 link supervisor. A paired Host is a standing relationship, so the
+    // link is re-established without a human: once when the plugin applies, then
+    // with a bounded backoff whenever the Host drops it on its own (gateway
+    // reload, restart, network blip). `RemoteConnection` stays a plain transport;
+    // timers and policy live here. 4401 is never retried (the credential is gone),
+    // a close we asked for is not a failure at all, and a certificate that no longer
+    // matches the pin is terminal until the user pairs the host again.
+    const RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 30000]
+    // Every configured step is clamped into this band before jitter: under 100 ms a
+    // step is a spin, and over 5 min the remote group never comes back at all.
+    const MIN_RECONNECT_MS = 100
+    const MAX_RECONNECT_MS = 300_000
+    // How long a link must stay up before the backoff starts over. Without it a host
+    // that greets and drops is redialled at the first step forever.
+    const RECONNECT_STABLE_MS = 10_000
+    const autoReconnect = options.autoReconnect !== false
+    let tearingDown = false
+    const clampMs = (value, fallback) => {
+      const ms = typeof value === 'number' ? value : Number(value)
+      return Number.isFinite(ms) ? Math.min(MAX_RECONNECT_MS, Math.max(MIN_RECONNECT_MS, Math.round(ms))) : fallback
+    }
+    const reconnectDelays = () => {
+      const configured = Array.isArray(options.reconnectDelaysMs)
+        ? options.reconnectDelaysMs.filter((ms) => Number.isFinite(ms) && ms > 0).map((ms) => clampMs(ms, RECONNECT_DELAYS_MS[0]))
+        : []
+      // An empty or wholly invalid list is a configuration mistake, not a request
+      // for "no backoff": fall back to the default sequence instead of dialling flat out.
+      return configured.length ? configured : RECONNECT_DELAYS_MS
+    }
+    const reconnectStableMs = () => clampMs(options.reconnectStableMs, RECONNECT_STABLE_MS)
+    const clearStability = (entry) => {
+      if (!entry?.stability) return
+      clearTimeout(entry.stability)
+      entry.stability = null
+    }
+    // One unref'd timer per entry: it resets the sequence only if the link is STILL
+    // online when it fires, so a greeted-then-dropped link keeps climbing the backoff.
+    const armStability = (remote, entry) => {
+      clearStability(entry)
+      const timer = setTimeout(() => {
+        if (entry.stability === timer) entry.stability = null
+        if (live.get(remote.id) !== entry || entry.connection.state !== 'online') return
+        const was = entry.retryAttempt ?? 0
+        entry.retryAttempt = 0
+        if (was > 0) log(`remote ${remote.id}: link stable, retry sequence reset (was attempt ${was})`)
+      }, reconnectStableMs())
+      timer.unref?.()
+      entry.stability = timer
+    }
+    const cancelRedial = (entry) => {
+      if (!entry) return
+      clearStability(entry)
+      if (!entry.redial) return
+      clearTimeout(entry.redial.timer)
+      entry.redial = null
+    }
+    // 1s, 2s, 5s, 10s, 30s, then the last step forever; ±20% so hosts that were
+    // cut off together do not come back in lockstep.
+    const redialDelay = (attempt) => {
+      const delays = reconnectDelays()
+      const base = delays[Math.min(attempt, delays.length) - 1]
+      return Math.max(1, Math.round(base * (0.8 + Math.random() * 0.4)))
+    }
+    /**
+     * Why a failure stops the loop instead of scheduling the next step. `pin-mismatch`
+     * is the one that needs a reason on the row: the peer presented a certificate that
+     * is not the pin this pairing recorded, so retrying can only fail the same way.
+     * `auth/required` and the revoked credential are equally terminal.
+     * @returns {boolean} true when the caller must not schedule another dial
+     */
+    const terminalFailure = (remote, entry, error) => {
+      if (error?.code === 'pin-mismatch') {
+        cancelRedial(entry)
+        entry.linkError = 'pin-mismatch'
+        log(`remote ${remote.id}: certificate pin mismatch, automatic reconnect stopped`)
+        notifyHosts()
+        return true
+      }
+      if (error?.code === 'auth/required' || error?.code === 'auth/revoked') { cancelRedial(entry); return true }
+      return false
+    }
+    const scheduleRedial = (remote, entry) => {
+      if (!autoReconnect || tearingDown || entry.redial) return
+      // A terminal reason stays terminal until a new pairing (or a manual dial that
+      // succeeds) clears it; a timer would only repeat a failure we already know.
+      if (entry.linkError) return
+      // A removed or re-paired remote replaced its live entry: that entry's timer
+      // must never dial the new pairing (or a deleted record).
+      if (live.get(remote.id) !== entry) return
+      const record = store.get(remote.id)
+      if (!record || record.revoked) return
+      // The attempt number is the position in the sequence and stops at its last
+      // step, which then repeats forever: `retry.attempt` stays bounded too.
+      const attempt = Math.min((entry.retryAttempt ?? 0) + 1, reconnectDelays().length)
+      entry.retryAttempt = attempt
+      const delayMs = redialDelay(attempt)
+      const timer = setTimeout(() => {
+        entry.redial = null
+        if (tearingDown || live.get(remote.id) !== entry) return
+        const current = store.get(remote.id)
+        if (!current || current.revoked) return
+        if (entry.connection.state === 'online' || entry.connection.state === 'connecting') return
+        log(`remote ${remote.id}: redialling (attempt ${attempt})`)
+        entry.connection.connect().catch((error) => {
+          // A missing or revoked credential and a changed certificate are terminal;
+          // the state event above already scheduled a step, so it is cancelled here.
+          terminalFailure(remote, entry, error)
+        })
+      }, delayMs)
+      // A pending retry must never keep the Host process alive by itself.
+      timer.unref?.()
+      entry.redial = { attempt, nextAt: Date.now() + delayMs, timer }
+      log(`remote ${remote.id}: redial in ${delayMs} ms (attempt ${attempt})`)
+    }
+    const onLinkState = (remote, entry, state, detail) => {
+      if (state === 'online') {
+        const attempts = entry.retryAttempt ?? 0
+        // The sequence is NOT reset here: only a link that stays up for
+        // `reconnectStableMs` proves it (see armStability).
+        entry.linkError = null
+        cancelRedial(entry)
+        armStability(remote, entry)
+        if (attempts > 0) log(`remote ${remote.id}: link back online (attempt ${attempts})`)
+        return
+      }
+      // Any other state means the link is down, so a pending stability window no
+      // longer describes it.
+      clearStability(entry)
+      // `error` is a failed dial; `offline` WITH a detail is a close this side did
+      // not ask for (#onClose passes one only then). Both are retried.
+      if (state === 'error' || (state === 'offline' && detail)) { scheduleRedial(remote, entry); return }
+      // `offline` without a detail is our own close, `revoked` means the token is
+      // gone, `connecting` means a dial is already running: cancel, never retry.
+      cancelRedial(entry)
+    }
+
     const attach = (remote) => {
       let entry = live.get(remote.id)
       if (entry) return entry
@@ -216,9 +356,21 @@ export const plugin = {
         WebSocketImpl: options.WebSocketImpl,
         requestTimeoutMs: options.requestTimeoutMs,
       })
-      entry = { connection, state: 'offline', detail: null, approvals: new Map() }
-      connection.on('state', (state, detail) => { entry.state = state; entry.detail = detail ?? null; notifyHosts() })
+      entry = { connection, state: 'offline', detail: null, approvals: new Map(), redial: null, retryAttempt: 0, stability: null, linkError: null }
+      // A replaced entry (re-pair in place, DELETE, teardown) must be deaf: its
+      // socket, waiters and timers belong to the pairing that is gone, and a late
+      // `revoked` from it would otherwise wipe the token of the pairing that took
+      // its id over (or mark that row revoked) from a connection nobody is using.
+      const stale = () => live.get(remote.id) !== entry
+      connection.on('state', (state, detail) => {
+        if (stale()) return
+        entry.state = state
+        entry.detail = detail ?? null
+        onLinkState(remote, entry, state, detail ?? null)
+        notifyHosts()
+      })
       connection.on('approval', (frame) => {
+        if (stale()) return
         if (typeof frame.rpcId !== 'string') return
         // The card's ids are remote data: the WHOLE frame is validated before it
         // is buffered, so a hostile `approvalId` can never be echoed back on a
@@ -230,8 +382,14 @@ export const plugin = {
         entry.approvals.set(frame.rpcId, frame)
         while (entry.approvals.size > MAX_APPROVALS_PER_REMOTE) entry.approvals.delete(entry.approvals.keys().next().value)
       })
-      connection.on('resolved', (frame) => entry.approvals.delete(frame.rpcId))
+      connection.on('resolved', (frame) => {
+        if (stale()) return
+        entry.approvals.delete(frame.rpcId)
+      })
       connection.on('revoked', () => {
+        // The stale check above runs first in `stale`: a 4401 from a superseded
+        // socket says nothing about the pairing that now holds this id.
+        if (stale()) return
         // Contract §3/§6: 4401 = the credential is gone. Wipe it and say so; never auto-retry.
         store.wipeToken(remote.id)
         store.update(remote.id, { revoked: true })
@@ -248,7 +406,13 @@ export const plugin = {
       // is shown on that remote's row: a failing host contributes no merged rows,
       // which is otherwise indistinguishable from a host that simply has none.
       const hostError = hostRouter?.status().hosts.find((host) => host.hostId === remote.id)?.error ?? null
-      return { ...publicRemote(remote, entry, entry ? [...entry.approvals.values()] : []), hostError }
+      // `retry` tells "offline, coming back by itself" apart from plain offline;
+      // the page only needs the attempt number and when the next dial is due.
+      const retry = entry?.redial ? { attempt: entry.redial.attempt, nextAt: entry.redial.nextAt } : null
+      // A terminal reason (a changed certificate) is the opposite of a retry: the
+      // loop stopped, `retry` is null, and the row says why.
+      const linkError = entry?.linkError ?? null
+      return { ...publicRemote(remote, entry, entry ? [...entry.approvals.values()] : []), hostError, retry, linkError }
     }
 
     const requireRemote = (id) => {
@@ -259,7 +423,17 @@ export const plugin = {
     const connected = async (remote) => {
       if (remote.revoked) throw new RemoteInputError('the remote revoked this device; pair it again', 401, 'auth/revoked')
       const entry = attach(remote)
-      await entry.connection.connect()
+      // A human (or a route) asking now wins over a pending backoff step;
+      // connect() dedupes a dial already in flight.
+      cancelRedial(entry)
+      try {
+        await entry.connection.connect()
+      } catch (error) {
+        // This attempt may still fail the same way (a changed certificate is not
+        // fixable by dialling again), so it is what keeps the row's reason honest.
+        terminalFailure(remote, entry, error)
+        throw error
+      }
       return entry
     }
     const unwrap = (frame, kind) => {
@@ -509,7 +683,8 @@ export const plugin = {
         revoked: false,
       }
       if (existing) {
-        live.get(id)?.connection.close()
+        const previous = live.get(id)
+        if (previous) { cancelRedial(previous); previous.connection.close() }
         live.delete(id)
         store.update(id, record)
       } else store.add(record)
@@ -546,7 +721,8 @@ export const plugin = {
         revoked: false,
       }
       if (existing) {
-        live.get(id)?.connection.close()
+        const previous = live.get(id)
+        if (previous) { cancelRedial(previous); previous.connection.close() }
         live.delete(id)
         store.update(id, record)
       } else store.add(record)
@@ -622,7 +798,8 @@ export const plugin = {
           if (req.method === 'GET') { sendJson(res, 200, { remote: view(requireRemote(id)) }); return }
           if (req.method === 'DELETE') {
             requireRemote(id)
-            live.get(id)?.connection.close()
+            const entry = live.get(id)
+            if (entry) { cancelRedial(entry); entry.connection.close() }
             live.delete(id)
             store.remove(id)
             log(`removed remote ${id}`)
@@ -744,16 +921,29 @@ export const plugin = {
     const dispose = webServer.register({ kind: 'prefix', path: '/devices', handler })
     log(`routes registered: /devices (loopback-only, same-origin); data=${path.basename(dataDir)}; remotes=${store.list().length}`)
 
+    // Spec 008 link supervisor: every stored pairing is dialled once here, so a
+    // remote Host's workspace group returns after either side restarts instead of
+    // waiting for a human to press Reconnect. Fire-and-forget: a Host that is down
+    // costs one rejected promise, and its state event schedules the first backoff.
+    if (autoReconnect) {
+      for (const remote of store.list()) {
+        if (remote.revoked) continue
+        const entry = attach(remote)
+        entry.connection.connect().catch((error) => { terminalFailure(remote, entry, error) })
+      }
+    }
+
     const teardown = () => {
       // First: stop routing, so no merged stream or remote call starts against
       // connections that are about to be closed.
+      tearingDown = true
       hostRouter?.uninstall()
       hostListeners.clear()
       dispose?.()
       for (const session of pairings.values()) {
         if (session.state === 'connecting' || session.state === 'pending') { session.state = 'cancelled'; session.controller.abort() }
       }
-      for (const entry of live.values()) entry.connection.close()
+      for (const entry of live.values()) { cancelRedial(entry); entry.connection.close() }
       live.clear()
     }
     ctx.effect(() => teardown)

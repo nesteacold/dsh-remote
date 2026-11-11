@@ -17,6 +17,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -27,7 +28,7 @@ import plugin from '../lib/index.mjs'
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
 import { COMPANION_PRINCIPAL_KIND, COMPANION_ENDPOINTS } from '../lib/companion-access.mjs'
 import { createDeviceAccess, devicePrincipal, deviceAccessAvailable } from '../lib/device-peers.mjs'
-import { createPositiveDeviceGuard } from '../lib/allowlist.mjs'
+import { COMPANION_AUTHOR_DENIED_ENDPOINTS, createPositiveDeviceGuard } from '../lib/allowlist.mjs'
 import { hostEndpointAllowedForDevice } from '../lib/companion-access.mjs'
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -50,7 +51,9 @@ async function factory(t, options = {}) {
     res.writeHead(404).end()
   })
   server.on('upgrade', (req, socket, head) => { if (upgrade) upgrade.handler(req, socket, head); else socket.destroy() })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe: undici refuses whole classes of ports ("bad port"), and `listen(0)`
+  // returns whatever the OS picks; the helper re-binds until `fetch` accepts it.
+  await listenFetchSafe(server)
   const port = server.address().port
   const connection = createTestConnection()
   const ctx = {
@@ -241,9 +244,17 @@ test('U4: a device never reaches an unmapped endpoint through any router op (gua
   const ws = await connectToken(instance, layout.token, DEVICE)
   const before = instance.hostCalls.length
   // Ops outside the companion vocabulary never reach the Host (router layer)...
-  for (const type of ['session-create', 'workspaces', 'plugin-catalog', 'settings', 'commands', 'fork', 'queue-update', 'directories', 'host']) {
+  for (const type of ['plugin-catalog', 'settings', 'commands', 'fork', 'queue-update', 'directories', 'host']) {
     const reply = await ask(ws, { type })
     assert.equal(reply.code, 'op/forbidden', type)
+  }
+  // Spec 011: the authoring ops ARE part of the §4 vocabulary now, but this device
+  // was paired without `sessions:author`, so the SCOPE gate answers — still before
+  // any Host call, which is what this test is about.
+  for (const type of ['session-create', 'workspaces']) {
+    const reply = await ask(ws, { type })
+    assert.equal(reply.code, 'auth/forbidden-scope', type)
+    assert.equal(reply.scope, 'sessions:author', type)
   }
   // ...and the adapter guard of the device Peer refuses even a mapped router op
   // whose Host endpoint is NOT in the positive table (`history` page → session/page is mapped,
@@ -257,10 +268,20 @@ test('U5: the positive guard composes the denied list AND the positive table, an
   const guard = createPositiveDeviceGuard(hostEndpointAllowedForDevice)
   for (const key of Object.keys(COMPANION_ENDPOINTS)) {
     const [namespace, method] = key.split('/')
-    assert.equal(guard.hostEndpoint(namespace, method), true, key)
+    // Spec 011: the two endpoints the deny layer CAN lift need the scope that lifts
+    // them; every other mapped endpoint does not. A guard with no scopes at all
+    // (the default) therefore still refuses them.
+    const liftable = COMPANION_AUTHOR_DENIED_ENDPOINTS.includes(key)
+    assert.equal(guard.hostEndpoint(namespace, method), !liftable, key)
+    if (liftable) {
+      assert.equal(createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => ['sessions:author'])
+        .hostEndpoint(namespace, method), true, `${key} with sessions:author`)
+      assert.equal(createPositiveDeviceGuard(hostEndpointAllowedForDevice, () => ['harness:remote'])
+        .hostEndpoint(namespace, method), false, `${key} with harness:remote alone`)
+    }
   }
-  for (const [namespace, method] of [['session', 'create'], ['session', 'control'], ['workspace', 'follow'], ['settings', 'mutate'],
-    ['pluginManager', 'installBundle'], ['speech', 'catalog'], ['unknown', 'thing'], ['session', 'modelCatalog'], ['subagents', 'prompt']]) {
+  for (const [namespace, method] of [['session', 'control'], ['settings', 'mutate'],
+    ['pluginManager', 'installBundle'], ['speech', 'catalog'], ['unknown', 'thing'], ['subagents', 'prompt']]) {
     assert.equal(guard.hostEndpoint(namespace, method), false, `${namespace}/${method}`)
   }
   assert.equal(guard.fetchPath('/api/session/uploadFileBinary'), false)

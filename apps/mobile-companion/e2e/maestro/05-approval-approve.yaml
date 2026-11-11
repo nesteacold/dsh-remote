@@ -1,0 +1,55 @@
+# 05 — approve exactly what is shown: the receipt echoes the exact hash (US3 §1, FR-006, SC-004).
+#
+# SCENARIO: paired; `sess-alpha` has pending approval `apv-hash` (tool `shell.exec`).
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   biometric prompt only. Taps to decide from a visible card: 1 (the ≤ 3 bound).
+#
+# HOOKS (per-card, so a second pending card cannot make a selector ambiguous):
+#   approval-card-apv-hash     the card container
+#   approval-approve-apv-hash  "Allow once" for that card
+#   approval-reject-apv-hash   "Reject" for that card
+#   approval-state-apv-hash    the outcome / notice line for that card
+#
+# EXIT CRITERIA:
+#   1. the approval card renders tool name, reason and preview;
+#   2. "Allow once" and "Reject" are offered (a non-null `argsHash`);
+#   3. after the tap the card shows the resolved outcome and both buttons are gone (by hook);
+#   4. the fixture's receipt has `accepted: true` and `argsHash` **byte-identical** to the
+#      `argsHash` it pushed (asserted by the orchestrator from `GET /state`).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+  APPROVAL_ID: apv-hash
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- runFlow: subflows/open-session.yaml
+
+# The card, as the app renders it (approval.title, displayReason, argsPreview).
+- extendedWaitUntil:
+    visible:
+      id: "approval-card-${APPROVAL_ID}"
+    timeout: 20000
+- assertVisible: ".*(Approval needed: shell.exec|Cần phê duyệt: shell.exec).*"
+- assertVisible: ".*(Run the test suite|Chạy bộ kiểm thử).*"
+- assertVisible:
+    id: "approval-approve-${APPROVAL_ID}"
+- assertVisible:
+    id: "approval-reject-${APPROVAL_ID}"
+
+- tapOn:
+    id: "approval-approve-${APPROVAL_ID}"
+
+# Resolved card: the outcome line replaces the buttons.
+- extendedWaitUntil:
+    visible:
+      id: "approval-state-${APPROVAL_ID}"
+    timeout: 20000
+- assertVisible: ".*(Allowed once|Đã cho phép một lần).*"
+- assertNotVisible:
+    id: "approval-approve-${APPROVAL_ID}"
+- assertNotVisible:
+    id: "approval-reject-${APPROVAL_ID}"

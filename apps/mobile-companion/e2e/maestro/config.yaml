@@ -1,0 +1,32 @@
+# Maestro workspace for the DSH Companion device-validation flows (A040 / A041).
+#
+# Run everything (Android emulator with a dev build installed):
+#   maestro test e2e/maestro --env PAIR_QR=<paste-code>
+#
+# Or one flow at a time (each file states its own prerequisites in a header comment):
+#   maestro test e2e/maestro/05-approval-approve.yaml
+#
+# `config.yaml` only declares the flow set and the shared constants; every flow keeps its own
+# `appId` so a single file stays runnable on its own.
+
+appId: com.dshext.companion
+
+flows:
+  - "01-*.yaml"
+  - "02-*.yaml"
+  - "03-*.yaml"
+  - "04-*.yaml"
+  - "05-*.yaml"
+  - "06-*.yaml"
+  - "07-*.yaml"
+  - "08-*.yaml"
+  - "09-*.yaml"
+  - "10-*.yaml"
+  - "11-*.yaml"
+  - "12-*.yaml"
+  - "13-*.yaml"
+  - "14-*.yaml"
+  - "15-*.yaml"
+  - "16-*.yaml"
+  - "17-*.yaml"
+  - "18-*.yaml"

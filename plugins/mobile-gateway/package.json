@@ -13,24 +13,18 @@
     "PROTOCOL.md",
     "test/fixtures/transport-v1"
   ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Clarklevis1995/dsh-plugin-mobile-gateway.git"
-  },
-  "homepage": "https://github.com/Clarklevis1995/dsh-plugin-mobile-gateway#readme",
-  "bugs": {
-    "url": "https://github.com/Clarklevis1995/dsh-plugin-mobile-gateway/issues"
-  },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
-    "@dsh-ext/mobile-protocol": "file:../../packages/mobile-protocol",
     "qrcode": "^1.5.4",
     "selfsigned": "5.5.0",
     "werift": "0.25.2",
     "ws": "^8.18.0"
   },
   "scripts": {
-    "test": "node --test test/tool-images.test.mjs test/dsh-runtime-version.test.mjs && node --test test/network-addresses.test.mjs && node --test test/network-diagnostics.test.mjs && node --test test/logging.test.mjs test/redact.test.mjs test/log-scan.test.mjs && node test/wire-json.test.mjs && node test/setup-ip.test.mjs && node test/host-adapter.test.mjs && node test/dsh-022.test.mjs && node --test test/file-upload.test.mjs && node --test test/device-scopes.test.mjs test/scope-kind.test.mjs test/remote-bridge.test.mjs test/pairing-approval.test.mjs && node --test test/companion-access.test.mjs test/device-access-policy.test.mjs test/device-authorization.test.mjs test/dispatch-fence.test.mjs && node test/device-access-real.test.mjs && node test/speech-input.test.mjs && node test/plugin-management.test.mjs && node test/session-preset.test.mjs && node test/session-follower.test.mjs && node --test test/agent-team.test.mjs && node test/session-event-details.test.mjs && node test/gateway.test.mjs && node --test test/approval-replay.test.mjs && node --test test/approval-hash-unit.test.mjs test/approval-hash.test.mjs && node --test test/question-replay.test.mjs && node test/auth.test.mjs && node test/tls-pin.test.mjs && node test/allowlist.test.mjs && node test/remote-switch.test.mjs && node test/lan.test.mjs && node test/cloudflared-binary.test.mjs && node test/cloudflare-tunnel.test.mjs && node --test test/public-endpoint-check.test.mjs && node test/gateway-tools.test.mjs && node test/multi-gateway.test.mjs && npm run test:webrtc",
+    "prepack": "node scripts/sync-mobile-protocol.mjs",
+    "sync:protocol": "node scripts/sync-mobile-protocol.mjs",
+    "check:protocol": "node scripts/sync-mobile-protocol.mjs --check",
+    "test": "node scripts/sync-mobile-protocol.mjs --check && node --test test/tool-images.test.mjs test/dsh-runtime-version.test.mjs && node --test test/network-addresses.test.mjs test/connection-choice-ui.test.cjs && node --test test/network-diagnostics.test.mjs test/network-diagnostics-ui.test.cjs && node --test test/logging.test.mjs test/redact.test.mjs test/log-scan.test.mjs && node test/wire-json.test.mjs && node test/setup-ip.test.mjs && node test/host-adapter.test.mjs && node test/dsh-022.test.mjs && node --test test/file-upload.test.mjs && node --test test/device-scopes.test.mjs test/scope-kind.test.mjs test/remote-bridge.test.mjs test/pairing-approval.test.mjs && node --test test/companion-access.test.mjs test/device-access-policy.test.mjs test/device-authorization.test.mjs test/dispatch-fence.test.mjs && node test/device-access-real.test.mjs && node test/speech-input.test.mjs && node test/plugin-management.test.mjs && node test/session-preset.test.mjs && node test/session-follower.test.mjs && node --test test/agent-team.test.mjs && node test/session-event-details.test.mjs && node test/gateway.test.mjs && node --test test/approval-replay.test.mjs && node --test test/approval-hash-unit.test.mjs test/approval-hash.test.mjs && node --test test/client-no-egress.test.mjs && node --test test/devices-plugin-presence.test.mjs test/devices-section-visibility.test.cjs && node --test test/question-replay.test.mjs && node test/auth.test.mjs && node test/tls-pin.test.mjs && node test/allowlist.test.mjs && node --test test/device-authoring.test.mjs test/session-authoring-defaults.test.mjs test/session-authoring-adversarial.test.mjs && node test/remote-switch.test.mjs && node test/lan.test.mjs && node test/cloudflared-binary.test.mjs && node test/cloudflare-tunnel.test.mjs && node --test test/public-endpoint-check.test.mjs && node test/gateway-tools.test.mjs && node test/multi-gateway.test.mjs && npm run test:webrtc",
     "test:webrtc": "node --test test/webrtc/*.test.mjs",
     "test:security-real": "node test/run-security-real.mjs",
     "test:package": "node --test test/package-install.test.mjs",
@@ -38,15 +32,26 @@
   },
   "exports": {
     ".": "./lib/index.mjs",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
     }
   },
   "license": "MIT",
   "devDependencies": {
+    "@dsh-ext/mobile-protocol": "file:../../packages/mobile-protocol",
     "react": "18.3.1",
     "react-test-renderer": "18.3.1"
   },

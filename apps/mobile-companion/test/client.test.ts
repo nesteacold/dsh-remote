@@ -11,12 +11,19 @@ import { after, before, beforeEach, describe, it } from 'node:test';
 
 import { CLOSE_CODES, COMPANION_PROTOCOL_VERSION } from '@dsh-ext/mobile-protocol';
 
-import { classifyProtocolUnsupported, CompanionClient, DEFAULT_HANDSHAKE_TIMEOUT_MS } from '../src/core/client';
+import {
+  classifyProtocolUnsupported,
+  classifyUpgradeRefusal,
+  CompanionClient,
+  DEFAULT_HANDSHAKE_TIMEOUT_MS,
+} from '../src/core/client';
 import { CoreError } from '../src/core/errors';
+import { Reconnector } from '../src/core/reconnect';
 import { TransportEmitter, type Transport, type TransportListener } from '../src/core/transport';
 import { PinnedTransport } from '../src/platform/pinned-transport';
 import type { PinnedWsAdapter, PinnedWsEventName } from '../modules/pinned-ws';
 import { generateTestCertificate } from './support/certs';
+import { FakeClock } from './support/fake-clock';
 import { FakeGateway } from './support/fake-gateway';
 import { NodePinnedTransport, createNodePinnedTransportFactory } from './support/node-pinned-transport';
 import { ScriptedTransport } from './support/scripted-transport';
@@ -299,7 +306,7 @@ describe('CompanionClient over the fake gateway', () => {
     const reauthGateway = await FakeGateway.create({ tokens: ['tok-reauth'], closeAfterHello: 4003 });
     try {
       const client = makeClient();
-      const reauth = deferred<{ code: number }>();
+      const reauth = deferred<{ code: number | string }>();
       client.on('reauthRequired', (payload) => reauth.resolve(payload));
       client.connect({ url: reauthGateway.endpoint, certSha256: reauthGateway.certSha256, token: 'tok-reauth', ...TARGET });
       assert.equal((await reauth.promise).code, 4003);
@@ -1136,5 +1143,202 @@ describe('CompanionClient close + handshake deadline over the production PinnedT
 
   it('defaults the handshake deadline to 10 s', () => {
     assert.equal(DEFAULT_HANDSHAKE_TIMEOUT_MS, 10_000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Permanent HTTP upgrade refusals (device defect). With the fixture answering the upgrade with
+// 403, the pinned transport mapped the status to `remote/disabled` correctly but the refusal only
+// reached the client as a transport *error*, so it produced a retryable 1006 drop and the
+// reconnect loop hammered the host every 30 s forever. 401/403 are now terminal, exactly like
+// their in-band frames; every other status (5xx, unknown) keeps retrying as before.
+// ---------------------------------------------------------------------------
+
+describe('classifyUpgradeRefusal', () => {
+  it('treats 401/403 (by mapped code or raw status) as terminal and everything else as retryable', () => {
+    assert.equal(classifyUpgradeRefusal('remote/disabled', { status: 403 }), 'remote/disabled');
+    assert.equal(classifyUpgradeRefusal('auth/required', { status: 401 }), 'auth/required');
+    // A transport that keeps the raw status instead of mapping it is classified the same way.
+    assert.equal(classifyUpgradeRefusal('client/upgrade-failed', { status: 403 }), 'remote/disabled');
+    assert.equal(classifyUpgradeRefusal('client/upgrade-failed', { status: 401 }), 'auth/required');
+    assert.equal(classifyUpgradeRefusal('client/upgrade-failed', { status: 500 }), null);
+    assert.equal(classifyUpgradeRefusal('client/upgrade-failed', undefined), null);
+    assert.equal(classifyUpgradeRefusal('client/connect-failed', undefined), null);
+    assert.equal(classifyUpgradeRefusal('client/pin-mismatch', { observedSha256: 'a'.repeat(64) }), null);
+  });
+});
+
+describe('CompanionClient terminal upgrade refusals (401 / 403)', () => {
+  it('a 403 upgrade refusal stops the connection: gatewayDisabled, close 4004, retry false', async () => {
+    const fake = new FakePinnedModule();
+    const client = pinnedClient(fake, { handshakeTimeoutMs: 40 });
+    const states: string[] = [];
+    const disabled: Array<{ code: number | string }> = [];
+    const drops: Array<{ code: number; reason: string; retry: boolean }> = [];
+    const errors: string[] = [];
+    client.on('state', (state) => states.push(state));
+    client.on('gatewayDisabled', (payload) => disabled.push(payload));
+    client.on('disconnected', (payload) => drops.push(payload));
+    client.on('error', (error) => errors.push(error.code));
+
+    client.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-refused', ...TARGET });
+    const id = fake.lastId;
+    // Exactly the device trace: the host answers the WebSocket upgrade with HTTP 403.
+    fake.emit('onError', { id, code: 'client/upgrade-failed', message: 'refused', status: 403 });
+
+    assert.equal(client.state, 'gateway-disabled');
+    assert.deepEqual(disabled, [{ code: 'remote/disabled' }]);
+    assert.deepEqual(drops, [{ code: 4004, reason: 'gateway-disabled', retry: false }]);
+    assert.deepEqual(fake.closes, [{ id, code: 4004, reason: 'gateway-disabled' }]);
+    assert.equal(client.connected, false);
+
+    // One report, no error detour, and the (cleared) handshake deadline adds nothing later.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(drops.length, 1);
+    assert.equal(states.filter((state) => state === 'gateway-disabled').length, 1);
+    assert.deepEqual(errors, []);
+  });
+
+  it('a 401 upgrade refusal ends in re-authentication instead of retrying forever', async () => {
+    const fake = new FakePinnedModule();
+    const client = pinnedClient(fake, { handshakeTimeoutMs: 40 });
+    const reauth: Array<{ code: number | string }> = [];
+    const drops: Array<{ code: number; reason: string; retry: boolean }> = [];
+    const errors: string[] = [];
+    client.on('reauthRequired', (payload) => reauth.push(payload));
+    client.on('disconnected', (payload) => drops.push(payload));
+    client.on('error', (error) => errors.push(error.code));
+
+    client.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-stale', ...TARGET });
+    const id = fake.lastId;
+    fake.emit('onError', { id, code: 'client/upgrade-failed', message: 'refused', status: 401 });
+
+    assert.equal(client.state, 'reauth-required');
+    assert.deepEqual(reauth, [{ code: 'auth/required' }]);
+    // The existing re-auth outcome, made terminal: the same stored token would be refused again,
+    // so the loop is not fed — and the credential is kept (only `auth/revoked`/4401 wipes it).
+    assert.deepEqual(drops, [{ code: 4003, reason: 'reauth-required', retry: false }]);
+    assert.deepEqual(fake.closes, [{ id, code: 4003, reason: 'reauth-required' }]);
+    assert.deepEqual(errors, []);
+  });
+
+  it('a 403 host is not retried by the reconnect loop', async () => {
+    const fake = new FakePinnedModule();
+    const clock = new FakeClock();
+    const client = pinnedClient(fake, { handshakeTimeoutMs: 40 });
+    const attempts: number[] = [];
+    const reconnector = new Reconnector({
+      clock,
+      connect: () => {
+        attempts.push(clock.now());
+        client.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-off', ...TARGET });
+      },
+      onResync: () => undefined,
+    });
+    // The app's wiring (app-state.ts): only a retryable drop feeds the loop.
+    client.on('disconnected', (payload) => {
+      if (payload.retry) reconnector.handleDrop('disconnected');
+    });
+    reconnector.start();
+    await clock.advance(0);
+    assert.equal(attempts.length, 1);
+
+    fake.emit('onError', { id: fake.lastId, code: 'client/upgrade-failed', message: 'refused', status: 403 });
+    await clock.advance(60_000);
+
+    assert.equal(attempts.length, 1); // no second attempt against the permanently refused host
+    assert.equal(clock.pendingCount, 0); // and nothing scheduled for later
+    assert.equal(client.state, 'gateway-disabled');
+    reconnector.stop();
+    client.close();
+  });
+
+  it('a 5xx upgrade refusal and a generic connect failure stay retryable', async () => {
+    const fake = new FakePinnedModule();
+    const clock = new FakeClock();
+    const client = pinnedClient(fake, { handshakeTimeoutMs: 40 });
+    const attempts: number[] = [];
+    const drops: Array<{ code: number; retry: boolean }> = [];
+    const errors: string[] = [];
+    const reconnector = new Reconnector({
+      clock,
+      connect: () => {
+        attempts.push(clock.now());
+        client.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-500', ...TARGET });
+      },
+      onResync: () => undefined,
+    });
+    client.on('error', (error) => errors.push(error.code));
+    client.on('disconnected', (payload) => {
+      drops.push({ code: payload.code, retry: payload.retry });
+      if (payload.retry) reconnector.handleDrop('disconnected');
+    });
+
+    reconnector.start();
+    await clock.advance(0);
+    assert.equal(attempts.length, 1);
+
+    // 500: not a permanent refusal — the transport keeps `client/upgrade-failed` and the drop
+    // stays retryable, so the loop schedules the next attempt.
+    fake.emit('onError', { id: fake.lastId, code: 'client/upgrade-failed', message: 'refused', status: 500 });
+    assert.equal(client.state, 'closed');
+    assert.deepEqual(drops, [{ code: 1006, retry: true }]);
+    assert.equal(errors.includes('client/upgrade-failed'), true);
+    assert.equal(reconnector.snapshot.state, 'waiting');
+    await clock.advance(1_000);
+    assert.equal(attempts.length, 2);
+
+    // A generic connect failure (no status at all) is retryable in exactly the same way.
+    fake.emit('onError', { id: fake.lastId, code: 'client/connect-failed', message: 'network down' });
+    assert.deepEqual(drops.at(-1), { code: 1006, retry: true });
+    assert.equal(errors.includes('client/disconnected'), true);
+    assert.equal(reconnector.snapshot.state, 'waiting');
+    reconnector.stop();
+    client.close();
+  });
+
+  it('a pin mismatch keeps its own outcome (no gateway/re-auth detour)', async () => {
+    const fake = new FakePinnedModule();
+    const client = pinnedClient(fake, { handshakeTimeoutMs: 40 });
+    const disabled: unknown[] = [];
+    const reauth: unknown[] = [];
+    const drops: Array<{ code: number; reason: string; retry: boolean }> = [];
+    const errors: CoreError[] = [];
+    client.on('gatewayDisabled', (payload) => disabled.push(payload));
+    client.on('reauthRequired', (payload) => reauth.push(payload));
+    client.on('disconnected', (payload) => drops.push(payload));
+    client.on('error', (error) => errors.push(error));
+
+    client.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, pairingCode: PAIRING_CODE, ...TARGET });
+    fake.emit('onError', { id: fake.lastId, code: 'client/pin-mismatch', message: 'pin', observedSha256: 'b'.repeat(64) });
+
+    assert.equal(client.state, 'closed');
+    assert.deepEqual(disabled, []);
+    assert.deepEqual(reauth, []);
+    assert.equal(errors[0]?.code, 'client/pin-mismatch');
+    assert.deepEqual(drops, [{ code: 1006, reason: 'pin-mismatch', retry: true }]);
+  });
+
+  it('an in-band `remote/disabled` frame still ends in gatewayDisabled (unchanged)', () => {
+    const transport = new ScriptedTransport();
+    const client = scriptedClient(transport, { counter: { value: 0 } });
+    const disabled: Array<{ code: number | string }> = [];
+    const drops: Array<{ code: number; reason: string; retry: boolean }> = [];
+    client.on('gatewayDisabled', (payload) => disabled.push(payload));
+    client.on('disconnected', (payload) => drops.push(payload));
+
+    client.connect({ url: 'wss://127.0.0.1:1/ws', certSha256: PIN, token: 'tok-auth', ...TARGET });
+    transport.fireOpen();
+    transport.deliver({ kind: 'error', code: 'remote/disabled', message: 'remote control is off' });
+
+    assert.equal(client.state, 'gateway-disabled');
+    assert.deepEqual(disabled, [{ code: 'remote/disabled' }]);
+    assert.deepEqual(drops, [{ code: 4004, reason: 'gateway-disabled', retry: false }]);
+
+    // A late close or frame from the dead socket cannot report a second end.
+    transport.close(1006, 'late');
+    transport.deliver({ kind: 'event', sessionId: 's-running', event: { late: true } });
+    assert.equal(drops.length, 1);
+    assert.equal(client.state, 'gateway-disabled');
   });
 });

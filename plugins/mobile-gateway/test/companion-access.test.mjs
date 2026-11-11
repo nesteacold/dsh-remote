@@ -53,11 +53,14 @@ const principalOf = (deviceId = 'dev-1') => ({ kind: COMPANION_PRINCIPAL_KIND, d
 const ALL_MOBILE_SCOPES = [...contract.SCOPES].filter((scope) => scope !== 'harness:remote')
 const { DESKTOP_DEFAULT_SCOPES } = contract
 
-function makePolicy({ devices = {}, sessions = {} } = {}) {
+function makePolicy({ devices = {}, sessions = {}, workspaces } = {}) {
   const calls = { getDevice: 0, getSessionIds: 0 }
   const policy = createCompanionAccessPolicy({
     getDevice(id) { calls.getDevice += 1; return devices[id] },
     getSessionIds(id) { calls.getSessionIds += 1; return sessions[id] ?? [] },
+    // Omitted when the caller does not test workspace visibility, so the existing
+    // tests keep exercising the "no workspace fact" path.
+    ...(workspaces === undefined ? {} : { getWorkspaceIds: () => workspaces }),
   })
   return { policy, calls }
 }
@@ -69,16 +72,38 @@ const FULL = mobile(['sessions:read', 'prompt:send', 'approval:respond'])
 // Mapping
 // ---------------------------------------------------------------------------
 
-test('endpoint mapping: exactly the companion reads and prompt/cancel', () => {
+test('endpoint mapping: the companion reads, prompt/cancel and the spec 011 authoring set', () => {
   assert.deepEqual(Object.keys(COMPANION_ENDPOINTS).sort(), [
-    'session/cancel', 'session/events', 'session/follow', 'session/list',
-    'session/page', 'session/projections', 'session/prompt', 'session/search',
+    'session/cancel', 'session/create', 'session/events', 'session/follow', 'session/list',
+    'session/modelCatalog', 'session/page', 'session/projections', 'session/prompt',
+    'session/search', 'session/selectModel', 'workspace/follow',
   ])
   for (const key of Object.keys(COMPANION_ENDPOINTS)) {
     const [namespace, method] = key.split('/')
     assert.equal(hostEndpointAllowedForDevice(namespace, method), true, key)
     assert.equal(isCompanionEndpoint(namespace, method), true, key)
   }
+})
+
+test('endpoint mapping: spec 011 opens exactly four authoring endpoints, all on sessions:author', () => {
+  // FR-002/FR-003: the message types map onto these four Host endpoints and
+  // nothing else. `workspace/follow` is how the Host adapter lists workspaces
+  // (it publishes the baseline as a stream) and `session/modelCatalog` is the
+  // one catalog behind both `models` forms — no `workspace/list` or `llm/models`
+  // endpoint is needed, and no workspace write is opened (FR-004).
+  assert.deepEqual(
+    Object.entries(COMPANION_ENDPOINTS)
+      .filter(([, entry]) => entry.scope === contract.AUTHORING_SCOPE)
+      .map(([action]) => action)
+      .sort(),
+    ['session/create', 'session/modelCatalog', 'session/selectModel', 'workspace/follow'],
+  )
+  assert.equal(contract.AUTHORING_SCOPE, 'sessions:author')
+  assert.equal(COMPANION_ENDPOINTS['workspace/follow'].resource, 'global')
+  assert.equal(COMPANION_ENDPOINTS['session/create'].resource, 'global')
+  assert.equal(COMPANION_ENDPOINTS['session/modelCatalog'].resource, 'global')
+  // A session resource, so DSH refuses a session the device cannot address.
+  assert.equal(COMPANION_ENDPOINTS['session/selectModel'].resource, SESSION_RESOURCE_KIND)
 })
 
 test('endpoint mapping: every scope used is a contract scope and never harness:remote', () => {
@@ -97,11 +122,11 @@ test('endpoint mapping: every scope used is a contract scope and never harness:r
 
 test('unknown and dangerous endpoints are denied by the positive guard', () => {
   for (const [namespace, method] of [
-    ['session', 'create'], ['session', 'fork'], ['session', 'rename'], ['session', 'updateQueue'],
-    ['session', 'selectModel'], ['session', 'attachment'], ['session', 'canOpenWorkspacePath'],
-    ['session', 'openWorkspacePath'], ['session', 'modelCatalog'], ['session', 'state'],
+    ['session', 'fork'], ['session', 'rename'], ['session', 'updateQueue'],
+    ['session', 'attachment'], ['session', 'canOpenWorkspacePath'],
+    ['session', 'openWorkspacePath'], ['session', 'state'],
     ['settings', 'mutate'], ['pluginManager', 'installBundle'], ['commands', 'execute'],
-    ['permissions', 'set'], ['schedule', 'create'], ['workspace', 'create'], ['workspace', 'follow'],
+    ['permissions', 'set'], ['schedule', 'create'], ['workspace', 'create'],
     ['speech', 'transcribe'], ['fileUploads', 'upload'], ['goals', 'clear'], ['userQuestions', 'answer'],
     ['subagents', 'prompt'], ['subagents', 'interruptByParent'], ['remoteAccess', 'follow'], ['session', 'control'],
     ['*', '*'], ['session', '*'], ['session', ''], ['', 'list'], ['Session', 'list'], ['session', 'LIST'],
@@ -237,8 +262,9 @@ test('per-device isolation: another device\'s sessions are not visible', () => {
 
 test('unknown endpoint is denied even with full scopes and a visible session', () => {
   const { policy } = makePolicy({ devices: { 'dev-1': mobile(ALL_MOBILE_SCOPES) }, sessions: { 'dev-1': ['s1'] } })
-  for (const action of ['session/create', 'session/fork', 'settings/mutate', 'commands/execute', 'fileUploads/upload',
-    'subagents/prompt', 'session/attachment', 'workspace/follow', 'goals/get', 'event:api-session/unknown', 'nonsense']) {
+  for (const action of ['session/fork', 'settings/mutate', 'commands/execute', 'fileUploads/upload',
+    'subagents/prompt', 'session/attachment', 'workspace/create', 'session/rename', 'goals/get',
+    'event:api-session/unknown', 'nonsense']) {
     for (const resources of [[GLOBAL], [session('s1')]]) {
       const result = decide(policy, { principal: principalOf(), action, resources })
       assert.equal(result.kind, 'deny', `${action} ${resources[0].kind}`)
@@ -424,8 +450,108 @@ test('duplicate scopes in a stored record do not change the grant', () => {
 })
 
 // ---------------------------------------------------------------------------
-// Session id handling
+// Spec 011 — sessions:author (a paired device may create a session and pick a model)
 // ---------------------------------------------------------------------------
+
+const AUTHORING_ACTIONS = ['session/create', 'session/modelCatalog', 'workspace/follow']
+const CARVE_OUT_ENDPOINTS = [
+  'workspace/create', 'workspace/rename', 'workspace/archiveSession',
+  'session/fork', 'session/rename', 'session/updateQueue', 'session/attachment',
+  'session/canOpenWorkspacePath', 'commands/execute', 'settings/mutate',
+  'pluginManager/installBundle', 'schedule/create',
+]
+
+test('authoring positive matrix: sessions:author on EITHER device kind opens the four endpoints', () => {
+  for (const kind of COMPANION_DEVICE_KINDS) {
+    const { policy } = makePolicy({
+      devices: { 'dev-1': { kind, scopes: ['sessions:author'], revokedAt: null } },
+      sessions: { 'dev-1': ['s1'] },
+    })
+    const p = principalOf()
+    // The three global authoring calls: workspace list, model catalog, create.
+    for (const action of AUTHORING_ACTIONS) {
+      assert.equal(decide(policy, { principal: p, action, resources: [GLOBAL] }).kind, 'allow', `${kind} ${action}`)
+    }
+    // select-model is a SESSION call: allowed on a session the device may address.
+    assert.equal(decide(policy, { principal: p, action: 'session/selectModel', resources: [session('s1')] }).kind, 'allow', kind)
+    // ... and on no other session, exactly like session/prompt.
+    assert.equal(decide(policy, { principal: p, action: 'session/selectModel', resources: [session('s9')] }).kind, 'deny', kind)
+    // The scope grants nothing else: no read, no prompt, no list filtering.
+    for (const action of ['session/list', 'session/search', 'session/prompt', 'session/follow', 'session/events']) {
+      const resources = ['session/list', 'session/search'].includes(action) ? [GLOBAL] : [session('s1')]
+      assert.equal(decide(policy, { principal: p, action, resources }).kind, 'deny', `${kind} ${action}`)
+    }
+  }
+})
+
+test('authoring negative matrix: no scope, or harness:remote alone, grants none of the four', () => {
+  const cases = [
+    ['mobile without the scope', { kind: 'mobile', scopes: ['sessions:read', 'prompt:send', 'approval:respond'], revokedAt: null }],
+    ['desktop without the scope', { kind: 'desktop', scopes: [...DESKTOP_DEFAULT_SCOPES], revokedAt: null }],
+    ['desktop with harness:remote only', { kind: 'desktop', scopes: ['harness:remote'], revokedAt: null }],
+    ['mobile with harness:remote only', { kind: 'mobile', scopes: ['harness:remote'], revokedAt: null }],
+  ]
+  for (const [label, device] of cases) {
+    const { policy } = makePolicy({ devices: { 'dev-1': device }, sessions: { 'dev-1': ['s1'] } })
+    const p = principalOf()
+    for (const action of [...AUTHORING_ACTIONS, 'session/selectModel']) {
+      for (const resources of [[GLOBAL], [session('s1')]]) {
+        const result = decide(policy, { principal: p, action, resources })
+        assert.equal(result.kind, 'deny', `${label} ${action} ${resources[0].kind}`)
+        assert.equal(result.reason, 'scope-not-granted', `${label} ${action} ${resources[0].kind}`)
+      }
+    }
+    assert.equal(hostEndpointAllowedForDevice('workspace', 'follow'), true, 'the guard is positive, the policy decides')
+  }
+})
+
+test('authoring: select-model reuses the session/prompt resource rule (no second policy)', () => {
+  // Same resource kind, same enforcement: one mapping, one rule.
+  assert.equal(COMPANION_ENDPOINTS['session/selectModel'].resource, COMPANION_ENDPOINTS['session/prompt'].resource)
+  const { policy } = makePolicy({
+    devices: { 'dev-1': mobile(['sessions:author', 'sessions:read', 'prompt:send']) },
+    sessions: { 'dev-1': ['s1'] },
+  })
+  const p = principalOf()
+  for (const id of ['s1', 's2', '', '*']) {
+    const selectModel = decide(policy, { principal: p, action: 'session/selectModel', resources: [session(id)] })
+    const prompt = decide(policy, { principal: p, action: 'session/prompt', resources: [session(id)] })
+    assert.equal(selectModel.kind, prompt.kind, `[${id}] select-model vs prompt`)
+    if (selectModel.kind === 'deny') assert.equal(selectModel.reason, prompt.reason, `[${id}] reason`)
+  }
+  // A device it cannot address: allowed nowhere, on either action.
+  for (const action of ['session/selectModel', 'session/prompt']) {
+    assert.equal(decide(policy, { principal: p, action, resources: [session('s2')] }).kind, 'deny', action)
+    assert.equal(decide(policy, { principal: p, action, resources: [GLOBAL] }).kind, 'deny', `${action} global`)
+  }
+})
+
+test('authoring carve-outs stay denied for every device and every scope combination', () => {
+  const scopeSets = [
+    ['sessions:author'],
+    [...ALL_MOBILE_SCOPES],
+    [...contract.SCOPE_PRESETS.full],
+    ['sessions:author', 'sessions:read', 'prompt:send', 'settings:write', 'workspace:manage', 'harness:remote'],
+  ]
+  for (const scopes of scopeSets) {
+    for (const kind of COMPANION_DEVICE_KINDS) {
+      const { policy } = makePolicy({
+        devices: { 'dev-1': { kind, scopes: scopes.filter((scope) => kind === 'desktop' || scope !== 'harness:remote'), revokedAt: null } },
+        sessions: { 'dev-1': ['s1'] },
+      })
+      const p = principalOf()
+      for (const action of CARVE_OUT_ENDPOINTS) {
+        const [namespace, method] = action.split('/')
+        assert.equal(hostEndpointAllowedForDevice(namespace, method), false, `${action} guard`)
+        assert.equal(Object.hasOwn(COMPANION_ENDPOINTS, action), false, `${action} mapping`)
+        for (const resources of [[GLOBAL], [session('s1')]]) {
+          assert.equal(decide(policy, { principal: p, action, resources }).kind, 'deny', `${kind} ${action}`)
+        }
+      }
+    }
+  }
+})
+
 
 test('no sessions visible: only the global calls remain, no session resource is bound', () => {
   for (const ids of [[], undefined, null]) {
@@ -491,7 +617,7 @@ test('explain names a specific refusal and never throws on hostile requests', ()
     sessions: { 'dev-1': ['s1'] },
   })
   const explain = (request) => policy.explain(request)
-  assert.equal(explain({ principal: principalOf(), action: 'session/create', resources: [GLOBAL] }), 'endpoint-not-allowed')
+  assert.equal(explain({ principal: principalOf(), action: 'session/fork', resources: [GLOBAL] }), 'endpoint-not-allowed')
   assert.equal(explain({ principal: principalOf(), action: 'session/prompt', resources: [session('s1')] }), 'scope-not-granted')
   assert.equal(explain({ principal: principalOf(), action: 'session/follow', resources: [session('zzz')] }), 'resource-not-allowed')
   assert.equal(explain({ principal: principalOf('gone'), action: 'session/list', resources: [GLOBAL] }), 'device-revoked')
@@ -508,4 +634,78 @@ test('contract: policy kind constants are stable', () => {
   assert.equal(COMPANION_DEVICE_KIND, 'mobile')
   assert.deepEqual([...COMPANION_DEVICE_KINDS], ['mobile', 'desktop'])
   assert.equal(SESSION_RESOURCE_KIND, 'session')
+})
+
+// ---------------------------------------------------------------------------
+// Spec 011: `session/create` is decided against the TARGET WORKSPACE too.
+//
+// DSH's gateway resolves ONE resource per REGISTERED kind for every call
+// (`dsh-api-gateway/lib/index.js:36-58` `callResources()`: the method's own reader,
+// else `declaration.resolve`, else `defaultFieldId(descriptor, args, field)`), and
+// every resolved resource must be allowed. The workspace controller registers the
+// field kind `{ field: 'workspaceId' }` (`dsh-api-workspace-controller/lib/index.js:858`),
+// so a `session/create` request is decided on `global` AND on
+// `{kind:'workspace', id: workspaceId}`. Live 2026-11-10 a phone holding
+// sessions:author got `session/create: access denied (resource-not-allowed)`
+// because the per-workspace binding carried only `workspace/follow`.
+// ---------------------------------------------------------------------------
+const workspaceResource = (id) => ({ kind: 'workspace', id })
+
+test('session/create: an author device may create in a workspace it can see, and the call is decided on BOTH resources', () => {
+  const { policy } = makePolicy({
+    devices: { 'dev-1': { kind: 'mobile', scopes: [...DESKTOP_DEFAULT_SCOPES, 'sessions:author'] } },
+    sessions: { 'dev-1': ['s1'] },
+    workspaces: ['w1', 'w2'],
+  })
+  const request = { principal: principalOf(), action: 'session/create', resources: [GLOBAL, workspaceResource('w1')] }
+  assert.equal(decide(policy, request).kind, 'allow', 'a visible workspace must accept session/create')
+  // The workspace leg alone is what used to fail.
+  assert.equal(decide(policy, { ...request, resources: [workspaceResource('w2')] }).kind, 'allow')
+  // An id the policy was not told about has no binding: no wildcard exists.
+  assert.equal(decide(policy, { ...request, resources: [workspaceResource('w-other')] }).kind, 'deny')
+  // The workspace role carries exactly what the two capabilities need, nothing more.
+  const roles = policy.bindings(principalOf()).filter((binding) => binding.resource.kind === 'workspace')
+  assert.deepEqual([...new Set(roles.map((binding) => binding.role.actions))], [['workspace/follow', 'session/create']])
+})
+
+test('session/create: a device WITHOUT sessions:author gets no workspace binding and creates nothing', () => {
+  const { policy } = makePolicy({
+    devices: { 'dev-1': { kind: 'mobile', scopes: ['sessions:read', 'prompt:send'] } },
+    sessions: { 'dev-1': ['s1'] },
+    workspaces: ['w1'],
+  })
+  assert.equal(policy.bindings(principalOf()).filter((b) => b.resource.kind === 'workspace').length, 0,
+    'a device without the scope must not bind a workspace at all')
+  assert.equal(decide(policy, { principal: principalOf(), action: 'session/create', resources: [GLOBAL] }).kind, 'deny')
+  assert.equal(decide(policy, {
+    principal: principalOf(), action: 'session/create', resources: [GLOBAL, workspaceResource('w1')],
+  }).kind, 'deny', 'the workspace leg must not rescue a device without the capability')
+})
+
+test('session/create on a workspace resource grants NOTHING else: every hard-blocked op stays refused for an author device', () => {
+  const { policy } = makePolicy({
+    devices: { 'dev-1': { kind: 'desktop', scopes: [...ALL_MOBILE_SCOPES, 'sessions:author'] } },
+    sessions: { 'dev-1': ['s1'] },
+    workspaces: ['w1'],
+  })
+  const principal = principalOf()
+  const blocked = [
+    'workspace/create', 'workspace/rename', 'workspace/archiveSession',
+    'session/fork', 'session/rename', 'session/archive', 'session/updateQueue',
+    'session/attachment', 'settings/mutate', 'settings/update', 'commands/list', 'commands/execute',
+    'pluginManager/installBundle', 'schedule/create', 'schedule/edit', 'goals/edit',
+    'session/control', 'session/canOpenWorkspacePath',
+  ]
+  for (const action of blocked) {
+    for (const resources of [[GLOBAL], [workspaceResource('w1')], [GLOBAL, workspaceResource('w1')]]) {
+      assert.equal(decide(policy, { principal, action, resources }).kind, 'deny',
+        `${action} must stay refused on ${JSON.stringify(resources)}`)
+    }
+  }
+  // And the workspace role's action list is closed: it is exactly the two entries.
+  const actions = new Set()
+  for (const binding of policy.bindings(principal)) {
+    if (binding.resource.kind === 'workspace') for (const action of binding.role.actions) actions.add(action)
+  }
+  assert.deepEqual([...actions].sort(), ['session/create', 'workspace/follow'])
 })

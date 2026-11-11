@@ -69,12 +69,28 @@ describe('NodePinnedTransport + FakeGateway', () => {
     assert.equal(transport.send('{"type":"ping","requestId":"r0"}'), false);
     assert.equal(transport.framesSentBeforeOpen.length, 1);
     await waitFor(() => events.some((e) => e.type === 'open'));
+    // Contract §3.8: a pairing socket is admitted only by a valid proof, so this raw-transport
+    // test answers the challenge before it may send anything else.
+    await waitFor(() => (events.filter((e) => e.type === 'message')).length >= 1);
+    const challenge = JSON.parse(events.find((e) => e.type === 'message')?.data as string) as Record<string, unknown>;
+    assert.equal(challenge.kind, 'pairing-challenge');
+    assert.equal(challenge.certSha256, gateway.certSha256);
+    assert.equal(challenge.otpRequired, false);
+    assert.equal(
+      transport.send(JSON.stringify({ type: 'pairing-proof', clientNonce: 'transport-nonce-0123456789' })),
+      true,
+    );
+    // `pending` and (auto-approved) `paired` + `hello` follow the proof.
+    await waitFor(() => (events.filter((e) => e.type === 'message')).length >= 4);
+    const kinds = events.filter((e) => e.type === 'message')
+      .map((e) => (JSON.parse(e.data as string) as { kind?: string }).kind);
+    assert.deepEqual(kinds, ['pairing-challenge', 'pairing-pending', 'paired', 'hello']);
     assert.equal(transport.send('{"type":"client-hello","requestId":"r1","companionProtocol":1,"appVersion":"0.1.0","platform":"ios"}'), true);
     await waitFor(() => gateway.clientHellos.length > 0);
     assert.deepEqual(gateway.offeredPairingCodes.at(-1), 'pair-code-1');
     assert.deepEqual(gateway.offeredDeviceIds.at(-1), '11111111-2222-4333-8444-555555555555');
-    // Exactly one frame reached the server from this connection.
-    assert.equal(gateway.allReceivedFrames.length, framesBefore + 1);
+    // Exactly two frames reached the server from this connection: the proof and the client-hello.
+    assert.equal(gateway.allReceivedFrames.length, framesBefore + 2);
   });
 
   it('refuses an unknown pairing code with a 401 upgrade (no socket, no frame)', async () => {

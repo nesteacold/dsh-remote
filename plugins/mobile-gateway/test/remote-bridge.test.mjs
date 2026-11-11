@@ -16,6 +16,8 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
+import { settlesAt, waitFor } from './support/wait-for.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -139,7 +141,9 @@ async function factory(t, { gateway = fakeGateway(), config = {} } = {}) {
     if (upgrade) upgrade.handler(req, socket, head)
     else socket.destroy()
   })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe: see test/support/fetch-safe-listen.mjs — the OS may hand out a
+  // port undici refuses, which used to fail this suite for no product reason.
+  await listenFetchSafe(server)
   const port = server.address().port
   // The gateway writes its log lines with console.log (lib/logging.mjs); keep a
   // copy so the audit-line assertions can read them.
@@ -786,7 +790,12 @@ test('T6: stream credit — the Host sends no more than it was granted, then res
   ws.send(JSON.stringify({ type: 'remote-stream-open', streamId: 'sA', endpoint: 'session/follow', args: { request: { address: { sessionId: 's1' } } } }))
   // Default credit is 64: exactly 64 frames arrive, then the Host holds.
   await takeFrame(ws, (f) => f.kind === 'remote-frame' && f.streamId === 'sA' && f.seq === 63)
-  await delay(150)
+  // Same class as the cancel assertion below: the 64th granted frame can land a tick after the
+  // 63rd, so wait for the count the credit allows rather than betting on a sleep.
+  await waitFor(
+    () => framesOf(ws, (f) => f.kind === 'remote-frame' && f.streamId === 'sA').length === 64,
+    { label: 'all 64 credit frames to arrive' },
+  )
   const first = framesOf(ws, (f) => f.kind === 'remote-frame' && f.streamId === 'sA')
   assert.equal(first.length, 64, 'default credit is 64 frames')
   assert.deepEqual(first.map((f) => f.seq), [...Array(64).keys()])
@@ -799,7 +808,10 @@ test('T6: stream credit — the Host sends no more than it was granted, then res
   // 5 more credits → exactly 5 more frames.
   ws.send(JSON.stringify({ type: 'remote-stream-credit', streamId: 'sA', n: 5 }))
   await takeFrame(ws, (f) => f.kind === 'remote-frame' && f.streamId === 'sA' && f.seq === 68)
-  await delay(150)
+  await waitFor(
+    () => framesOf(ws, (f) => f.kind === 'remote-frame' && f.streamId === 'sA').length === 69,
+    { label: 'the five credited frames to arrive' },
+  )
   assert.equal(framesOf(ws, (f) => f.kind === 'remote-frame' && f.streamId === 'sA').length, 69)
   // Invalid credit grants nothing.
   for (const n of [0, -3, 1.5, 'many', null]) ws.send(JSON.stringify({ type: 'remote-stream-credit', streamId: 'sA', n }))
@@ -809,11 +821,17 @@ test('T6: stream credit — the Host sends no more than it was granted, then res
   // Cancel closes the Host iterator and reports closure once.
   ws.send(JSON.stringify({ type: 'remote-stream-cancel', streamId: 'sA' }))
   await takeFrame(ws, (f) => f.kind === 'remote-stream-closed' && f.streamId === 'sA')
-  await delay(100)
+  // The `remote-stream-closed` frame and the Host iterator's abort/return settle on different
+  // ticks, so a fixed sleep here was a bet on the scheduler: measured — T6 passed alone and failed
+  // once while `test:package` ran concurrently, because 100 ms was not enough under load. Wait for
+  // the STATE the assertions below are about; the assertions themselves are unchanged.
+  await waitFor(() => hostStream.signal.aborted && hostStream.returned, {
+    label: 'the Host iterator to abort and return after cancel',
+  })
   assert.equal(hostStream.signal.aborted, true)
   assert.equal(hostStream.returned, true)
   const produced = hostStream.produced
-  await delay(100)
+  await settlesAt(() => hostStream.produced, { label: 'the Host iterator output' })
   assert.equal(hostStream.produced, produced, 'no frames after cancel')
   assert.equal(framesOf(ws, (f) => f.kind === 'remote-stream-closed' && f.streamId === 'sA').length, 1)
 })
@@ -858,7 +876,9 @@ test('T6c: bufferedAmount above maxPayloadBytes/4 pauses the stream (unit, fake 
   await delay(150)
   assert.equal(sent.filter((f) => f.kind === 'remote-frame').length, 0, 'a congested socket gets no frames')
   ws.bufferedAmount = 0
-  await delay(100)
+  await waitFor(() => sent.filter((f) => f.kind === 'remote-frame').length > 0, {
+    label: 'frames to resume once the socket drains',
+  })
   const flowing = sent.filter((f) => f.kind === 'remote-frame').length
   assert.ok(flowing > 0, 'frames resume once the socket drains')
   ws.bufferedAmount = 250 // exactly the limit: still allowed
@@ -901,7 +921,8 @@ test('T6d: cancel and socket close abort the carrier signal BEFORE `remote-strea
   const channel = bridge.attach(ws, 'dev-abort')
 
   await channel.openStream({ streamId: 'c1', endpoint: 'session/follow', args: {} })
-  await delay(30)
+  // The carrier exists only after the deferred open resolves: wait for it, do not guess a delay.
+  await waitFor(() => carriers.length === 1, { label: 'the first carrier to be opened' })
   assert.equal(carriers.length, 1)
   assert.equal(carriers[0].signal.aborted, false, 'the stream is live before the cancel')
   // Synchronous assertion: the abort must be visible the moment cancel returns.
@@ -910,7 +931,7 @@ test('T6d: cancel and socket close abort the carrier signal BEFORE `remote-strea
   assert.deepEqual(closedAtAbort, [true], 'the close frame is emitted only after that abort')
 
   await channel.openStream({ streamId: 'c2', endpoint: 'session/follow', args: {} })
-  await delay(30)
+  await waitFor(() => carriers.length === 2, { label: 'the second carrier to be opened' })
   assert.equal(carriers.length, 2)
   assert.equal(carriers[1].signal.aborted, false)
   // A closed socket is not a client cancel: it aborts the Host side too, and reports
@@ -931,11 +952,14 @@ test('T7: revoking the device closes its streams (4401); a closed socket aborts 
   const closed = once(layout.ws, 'close')
   assert.equal((await instance.post(`devices/${layout.device.id}/revoke`)).status, 200)
   assert.equal((await closed)[0], CLOSE_CODES.revoked)
-  await delay(100)
+  // Same class as T6: wait for the state, never for a guessed interval.
+  await waitFor(() => hostStream.signal.aborted && hostStream.returned, {
+    label: 'the Host iterator to abort and return after revoke',
+  })
   assert.equal(hostStream.signal.aborted, true, 'the Host iterator is aborted on revoke')
   assert.equal(hostStream.returned, true)
   const produced = hostStream.produced
-  await delay(100)
+  await settlesAt(() => hostStream.produced, { label: 'the Host iterator output' })
   assert.equal(hostStream.produced, produced, 'the Host stops producing')
   // The old token no longer authenticates, so the bridge is unreachable.
   const revokedWs = openLan(instance, ['dsh-mobile-v1'], { Authorization: `Bearer ${layout.token}`, 'X-DSH-Device-ID': DESK })
@@ -953,7 +977,9 @@ test('T7: revoking the device closes its streams (4401); a closed socket aborts 
   const secondStream = instance.gateway.opened[1]
   second.ws.close()
   await once(second.ws, 'close')
-  await delay(150)
+  await waitFor(() => secondStream.signal.aborted && secondStream.returned, {
+    label: 'the second stream to abort and return after the socket closed',
+  })
   assert.equal(secondStream.signal.aborted, true, 'closing the socket aborts the stream')
   assert.equal(secondStream.returned, true)
 })
@@ -970,7 +996,9 @@ test('T7b: a re-pair that narrows the grant closes the bridge streams (4401)', a
   recordFrames(next)
   await once(next, 'open')
   assert.equal((await closed)[0], CLOSE_CODES.revoked)
-  await delay(100)
+  await waitFor(() => instance.gateway.opened[0].signal.aborted, {
+    label: 'the narrowed bridge stream to abort on re-pair',
+  })
   assert.equal(instance.gateway.opened[0].signal.aborted, true)
   // The new, narrower socket cannot use the bridge any more. It must negotiate
   // first: contract §3.7 refuses any operation before the accepted client-hello,

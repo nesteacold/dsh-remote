@@ -13,13 +13,15 @@
         "resourceClass": "default"
       },
       "env": {
-        "EXPO_NO_TELEMETRY": "1"
+        "EXPO_NO_TELEMETRY": "1",
+        "EXPO_PUBLIC_DSH_DEBUG_LOG": "0"
       }
     },
     "production": {
       "autoIncrement": true,
       "env": {
-        "EXPO_NO_TELEMETRY": "1"
+        "EXPO_NO_TELEMETRY": "1",
+        "EXPO_PUBLIC_DSH_DEBUG_LOG": "0"
       }
     },
     "diagnostic": {
@@ -30,6 +32,19 @@
       "env": {
         "EXPO_NO_TELEMETRY": "1",
         "EXPO_PUBLIC_DSH_DEBUG_LOG": "1"
+      }
+    },
+    "release-apk": {
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      },
+      "ios": {
+        "resourceClass": "default"
+      },
+      "env": {
+        "EXPO_NO_TELEMETRY": "1",
+        "EXPO_PUBLIC_DSH_DEBUG_LOG": "0"
       }
     }
   },

@@ -16,13 +16,27 @@ import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { AppController, createInstallScopedClientMsgId } from '../src/app-state';
-import { CoreError, Outbox, encodePairingPayload, type OutboxFrame, type PairingPayload } from '../src/core';
+import { CoreError, Outbox, encodePairingPayload, type OutboxFrame, type PairingPayload, type Transport } from '../src/core';
 import { getInstallId } from '../src/platform/install-id';
+import { PinnedTransport, type CreatePinnedTransportOptions } from '../src/platform/pinned-transport';
+import { CREDENTIAL_CLEANUP_FAILED } from '../src/platform/secure-store';
+import type { PinnedWsAdapter, PinnedWsEventName } from '../modules/pinned-ws';
 import { emitAppState, resetAppState } from './support/stubs/react-native.stub';
 import { resetLocalAuthentication } from './support/stubs/expo-local-authentication.stub';
 import { resetNotifications, scheduledNotifications } from './support/stubs/expo-notifications.stub';
-import { resetSecureStore, secureStoreEntries } from './support/stubs/expo-secure-store.stub';
+import { failTokenDeletes, resetSecureStore, secureStoreEntries } from './support/stubs/expo-secure-store.stub';
 import { FakeGateway } from './support/fake-gateway';
+// Spec 011 — the authoring decisions the UI derives from the snapshot, exercised through a real
+// pairing so the fixture really sends `hello.device.scopes`.
+import { parseWorkspaceItems } from '../src/app-state';
+import { reconnectInProgress } from '../src/app-state';
+import {
+  grantState,
+  newSessionAvailability,
+  shouldShowModelPill,
+  workspaceDetail,
+  workspaceLabel,
+} from '../src/ui/components/authoring';
 import { NodePinnedTransport } from './support/node-pinned-transport';
 import { waitFor } from './support/wait';
 
@@ -409,7 +423,358 @@ describe('AppController connection lifecycle (M5 / M6)', () => {
       controller.stop();
     }
   });
+
+  it('M6/F1: a native 401 ends in reauth-required, stops the retry loop and leaves an honest snapshot', async () => {
+    const code = pairCode('P');
+    gateway.addPairingCode(code);
+    /** The `pinned-ws` native module while the host refuses the upgrade with HTTP 401. */
+    const native = refusingUpgradeModule();
+    let refuse = false;
+    /** Set when the controller hands its reporter to the transport layer (F1 wiring). */
+    let sawListenerReporter = false;
+    const transport = (options: CreatePinnedTransportOptions = {}): Transport => {
+      if (typeof options.onListenerFailure === 'function') sawListenerReporter = true;
+      return refuse ? new PinnedTransport({ module: native.adapter, ...options }) : nodeTransport();
+    };
+    const controller = new AppController({ locale: () => 'en', transport });
+    try {
+      await controller.start();
+      // Pair while the gate is closed: the one-time socket succeeds, no bearer socket is opened.
+      const paired = await controller.pair(pairingPayload(gateway, code));
+      assert.equal(paired.ok, true, JSON.stringify(paired));
+      // From now on the host refuses this device's credential at the upgrade (401).
+      refuse = true;
+      await controller.unlock();
+      await waitFor(
+        () => controller.snapshot().connection === 'reauth-required' && controller.snapshot().banner === 'reauth',
+        { label: 'native 401 handled' },
+      );
+      assert.equal(native.refusedCount(), 1);
+      assert.equal(sawListenerReporter, true, 'the transport got the app listener-failure reporter');
+
+      const snapshot = controller.snapshot();
+      const host = snapshot.activeHost;
+      assert.ok(host !== null, 'a 401 keeps the pairing (only a revocation wipes it)');
+      // The whole snapshot: the banner is set (F4), and the retry loop is stopped rather than
+      // left `connecting` on a host that will refuse the same credential forever.
+      assert.deepEqual(snapshot, {
+        unlocked: true,
+        hosts: [host],
+        activeHost: host,
+        connection: 'reauth-required',
+        banner: 'reauth',
+        loading: true,
+        sessions: [],
+        hiddenOlderCount: 0,
+        needsDecision: {},
+        openSessionId: null,
+        openApprovals: [],
+        history: [],
+        historyHasMore: false,
+        // Spec 011 follow-up: the older-history affordance now follows the cursor, and its load state
+        // is explicit so a failure is shown rather than swallowed. Nothing was fetched here.
+        historyHasEarlier: false,
+        historyLoading: false,
+        historyError: null,
+        outgoing: [],
+        remoteControlOff: false,
+        updateRequired: null,
+        reconnect: { state: 'stopped', attempt: 0, lastDelayMs: null },
+        pairing: null,
+        pairingPending: null,
+        pinnedTransportUnavailable: false,
+        // Spec 011: the snapshot gained the authoring fields. In this state the credential was
+        // refused at the upgrade, so there is no live device (grantedScopes is UNKNOWN, not a
+        // grant) and nothing was fetched. This guard is updated rather than relaxed: the whole
+        // snapshot is still asserted exhaustively.
+        grantedScopes: [],
+        workspaces: [],
+        workspacesState: 'idle',
+        workspacesError: null,
+        models: [],
+        currentModel: null,
+        // Spec 011: the model catalog's own load state, added so a refusal is explainable instead of
+        // looking like "this host has no models". In this state nothing was fetched.
+        modelsState: 'idle',
+        modelsError: null,
+        lastError: null,
+        locale: 'en',
+      });
+      // The token is kept (a 401 is not a revocation), so unlocking again is possible.
+      assert.equal(secureStoreEntries().some(([key]) => key.startsWith('dsh-companion.token.')), true);
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it('Spec 011: granted scopes from hello.device.scopes enable New session, and it really creates', async () => {
+    const code = pairCode('G');
+    // The fixture only advertises scopes when the option is set — this is the granted path.
+    const granted = await FakeGateway.create({ pairingCodes: [code], deviceScopes: ['sessions:read', 'sessions:author'] });
+    const controller = new AppController({ locale: () => 'en', transport: nodeTransport });
+    try {
+      await controller.start();
+      const paired = await controller.pair(pairingPayload(granted, code));
+      assert.equal(paired.ok, true, JSON.stringify(paired));
+      await controller.unlock();
+      await waitFor(() => controller.snapshot().connection === 'ready', { label: 'ready' });
+
+      const snap = controller.snapshot();
+      assert.deepEqual([...snap.grantedScopes], ['sessions:read', 'sessions:author'], 'scopes come from hello');
+      assert.equal(grantState(snap.grantedScopes), 'granted');
+
+      await controller.listWorkspaces();
+      const loaded = controller.snapshot();
+      const workspace = loaded.workspaces[0];
+      assert.ok(workspace !== undefined, 'the fixture serves workspaces');
+      assert.deepEqual(
+        newSessionAvailability({
+          grantedScopes: loaded.grantedScopes,
+          workspaceId: workspace.id,
+          state: { status: loaded.workspacesState },
+          workspaceCount: loaded.workspaces.length,
+        }),
+        { enabled: true, reason: null },
+        'with the grant, a ready list and a chosen workspace the action is enabled',
+      );
+
+      // The enabled path really works: create, then the new session is openable (it is listed).
+      const created = await controller.createSession({ workspaceId: workspace.id });
+      assert.equal(created.ok, true);
+      const sessionId = created.ok ? created.value : '';
+      assert.match(sessionId, /^sess-created-/);
+      await waitFor(() => controller.snapshot().sessions.some((session) => session.id === sessionId), {
+        label: 'the created session is in the list the screen navigates from',
+      });
+
+      // The EXACT measured per-session `models` frame, through the real snapshot path:
+      //   { current: { provider, model }, routable, groups: [{ id, name, models: [{ id, name }] }], failures }
+      // (catalog.js + dsh-host-adapter.mjs:364-376). Assertions are the three things that were wrong
+      // or unproven before: the provider id comes from `group.id`, the human label comes from the
+      // catalog entry's `name` (because `current` carries no label), and the composer's pill gate agrees.
+      await controller.listModels('sess-alpha');
+      const withModels = controller.snapshot();
+      assert.equal(withModels.modelsState, 'ready');
+      assert.equal(withModels.modelsError, null);
+      assert.ok(withModels.models.length > 0, 'a real groups reply must parse non-empty');
+      assert.deepEqual(withModels.models[0], {
+        id: 'deepseek-v4-flash',
+        label: 'DeepSeek-V4-Flash',
+        provider: 'deepseek',
+      }, 'provider is inherited from group.id, label from the entry name');
+      assert.equal(withModels.models[1]?.provider, 'deepseek', 'every row carries the group provider id');
+      assert.equal(withModels.currentModel?.id, 'deepseek-v4-flash', 'current.model resolves');
+      assert.equal(withModels.currentModel?.label, 'DeepSeek-V4-Flash', 'label back-filled from the catalog');
+      assert.equal(
+        shouldShowModelPill({ currentModel: withModels.currentModel, hasCatalog: withModels.models.length > 0 }),
+        true,
+        'with a real catalog the composer pill is shown',
+      );
+    } finally {
+      controller.stop();
+      await granted.close();
+    }
+  });
+
+  it('Spec 011: scopes WITHOUT sessions:author are denied, and no authoring frame is sent', async () => {
+    const code = pairCode('D');
+    const denied = await FakeGateway.create({ pairingCodes: [code], deviceScopes: ['sessions:read', 'prompt:send'] });
+    const controller = new AppController({ locale: () => 'en', transport: nodeTransport });
+    try {
+      await controller.start();
+      assert.equal((await controller.pair(pairingPayload(denied, code))).ok, true);
+      await controller.unlock();
+      await waitFor(() => controller.snapshot().connection === 'ready', { label: 'ready' });
+
+      const snap = controller.snapshot();
+      assert.deepEqual([...snap.grantedScopes], ['sessions:read', 'prompt:send']);
+      assert.equal(grantState(snap.grantedScopes), 'denied');
+      assert.deepEqual(
+        newSessionAvailability({
+          grantedScopes: snap.grantedScopes,
+          workspaceId: 'ws-anything',
+          state: { status: 'ready' },
+          workspaceCount: 2,
+        }),
+        { enabled: false, reason: 'authoring.needScope' },
+        'the denial reason is shown, not the neutral one',
+      );
+      // The screen gates on `availability.enabled`, so nothing may have gone out on the wire.
+      const authoringFrames = denied.allReceivedFrames
+        .filter((frame) => /"type":"(workspaces|session-create|models|select-model)"/.test(frame));
+      assert.deepEqual(authoringFrames, [], 'a denied device sends no authoring request');
+    } finally {
+      controller.stop();
+      await denied.close();
+    }
+  });
+
+  it('Spec 011: an older gateway that reports no scopes is UNKNOWN, never denied', async () => {
+    const code = pairCode('U');
+    const legacy = await FakeGateway.create({ pairingCodes: [code] }); // no deviceScopes => absent
+    const controller = new AppController({ locale: () => 'en', transport: nodeTransport });
+    try {
+      await controller.start();
+      assert.equal((await controller.pair(pairingPayload(legacy, code))).ok, true);
+      await controller.unlock();
+      await waitFor(() => controller.snapshot().connection === 'ready', { label: 'ready' });
+
+      const snap = controller.snapshot();
+      assert.deepEqual([...snap.grantedScopes], [], 'no reported scopes');
+      assert.equal(grantState(snap.grantedScopes), 'unknown');
+      assert.deepEqual(
+        newSessionAvailability({
+          grantedScopes: snap.grantedScopes,
+          workspaceId: 'ws-anything',
+          state: { status: 'ready' },
+          workspaceCount: 2,
+        }),
+        { enabled: false, reason: 'authoring.scopeUnknown' },
+        'the neutral reason is shown, never the denial copy',
+      );
+    } finally {
+      controller.stop();
+      await legacy.close();
+    }
+  });
+
+  it('Spec 011: a workspace with no path renders from its name alone', () => {
+    // The gateway will return `{ id, name }` with no `path` for author-only devices.
+    const parsed = parseWorkspaceItems({ items: [{ id: 'ws-1', name: 'Author Only' }] });
+    assert.deepEqual(parsed, [{ id: 'ws-1', name: 'Author Only' }]);
+    const workspace = parsed[0];
+    assert.ok(workspace !== undefined);
+    assert.equal(workspaceLabel(workspace), 'Author Only', 'the row shows the name');
+    assert.equal(workspaceDetail(workspace), null, 'no path => no second line, and nothing is invented');
+    // A nameless row still renders (id as the label), so the picker never shows a blank row.
+    assert.equal(workspaceLabel({ id: 'ws-2' }), 'ws-2');
+    // End to end from the wire: a row carrying NEITHER name NOR path must still produce a visible
+    // label (the gateway now sends `name` as a human label and may send nothing else at all).
+    const bare = parseWorkspaceItems({ items: [{ id: 'ws-3' }] })[0];
+    assert.ok(bare !== undefined);
+    assert.equal(workspaceLabel(bare), 'ws-3', 'a bare row falls back to its id, never an empty row');
+    assert.equal(workspaceDetail(bare), null);
+    // And a name-only row is exactly what the gateway sends now: the human label is what is shown.
+    const named = parseWorkspaceItems({ items: [{ id: 'ws-4', name: 'DiskTree' }] })[0];
+    assert.ok(named !== undefined);
+    assert.equal(workspaceLabel(named), 'DiskTree', 'the human label is rendered as-is');
+  });
+
+  it('a healthy ready link is NOT reported as reconnecting', async () => {
+    const controller = await pairedController(pairCode('R'));
+    try {
+      await waitFor(() => controller.snapshot().connection === 'ready', { label: 'ready' });
+      // The retry loop's state object exists for the whole life of a connection; `'live'` is its
+      // healthy value. Reading non-nullness as "reconnecting" disabled "New session" forever on a
+      // perfectly healthy link (device defect), so the predicate is asserted explicitly here.
+      const snapshot = controller.snapshot();
+      assert.equal(snapshot.reconnect?.state, 'live', 'a ready link is watched by a live loop');
+      assert.equal(reconnectInProgress(snapshot.reconnect), false, 'live is NOT a reconnect in progress');
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it('Spec 011: forgetting a computer clears its workspaces, models and selected model', async () => {
+    const controller = await pairedController(pairCode('W'));
+    try {
+      await waitFor(() => controller.snapshot().connection === 'ready', { label: 'connection ready' });
+      // The fixture serves `workspaces`, so this exercises the real request -> snapshot path.
+      await controller.listWorkspaces();
+      const loaded = controller.snapshot();
+      assert.equal(loaded.workspacesState, 'ready');
+      assert.ok(loaded.workspaces.length > 0, 'the fixture must serve at least one workspace');
+      await controller.forget();
+      const after = controller.snapshot();
+      assert.deepEqual(after.workspaces, [], 'a forgotten computer keeps no workspaces');
+      assert.equal(after.workspacesState, 'idle');
+      assert.equal(after.workspacesError, null);
+      assert.deepEqual(after.models, []);
+      assert.equal(after.currentModel, null);
+      assert.deepEqual(after.grantedScopes, [], 'no live device => scopes are UNKNOWN, not inherited');
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it('F2: a revocation whose credential delete fails is reported, never hidden, and never resurrected', async () => {
+    const controller = await pairedController(pairCode('O'));
+    try {
+      const attemptsBefore = gateway.connectionAttempts;
+      failTokenDeletes(); // the store rejects every delete from now on
+      gateway.closeAll(4401, 'revoked');
+
+      await waitFor(() => controller.snapshot().banner === 'cleanup-failed', { label: 'cleanup failure reported' });
+      const revoked = controller.snapshot();
+      assert.equal(revoked.activeHost, null);
+      assert.deepEqual(revoked.hosts, []);
+      assert.equal(revoked.lastError?.code, CREDENTIAL_CLEANUP_FAILED);
+      // The credential could not be destroyed (that is the failure) but it is never used: the
+      // host record is gone, so nothing reconnects with it.
+      assert.equal(
+        secureStoreEntries().some(([key, value]) => key.startsWith('dsh-companion.token.') && /^tok-\d+$/.test(value)),
+        true,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(gateway.connectionAttempts, attemptsBefore);
+
+      // A restart must not resurrect a usable credential: the host list is what "paired" means,
+      // and it was dropped before the failed delete, so the orphaned token is never read.
+      const restarted = new AppController({ locale: () => 'en', transport: nodeTransport });
+      await restarted.start();
+      try {
+        assert.deepEqual(restarted.snapshot().hosts, []);
+        assert.equal(restarted.snapshot().activeHost, null);
+        await restarted.unlock();
+        assert.equal(gateway.connectionAttempts, attemptsBefore);
+      } finally {
+        restarted.stop();
+      }
+    } finally {
+      controller.stop();
+    }
+  });
 });
+
+/**
+ * A `pinned-ws` module whose socket is refused at the upgrade with HTTP 401, exactly what the
+ * native side reports after the TLS pin matched and the host rejected the credential.
+ */
+function refusingUpgradeModule(): { adapter: PinnedWsAdapter; refusedCount: () => number } {
+  const listeners = new Map<PinnedWsEventName, Set<(event: unknown) => void>>();
+  let refused = 0;
+  return {
+    adapter: {
+      connect: async (id: string) => {
+        refused += 1;
+        const event = {
+          id,
+          code: 'client/upgrade-failed',
+          message: 'The WebSocket upgrade was refused (HTTP 401)',
+          status: 401,
+        };
+        queueMicrotask(() => {
+          for (const listener of [...(listeners.get('onError') ?? [])]) listener(event);
+        });
+      },
+      send: async () => true,
+      close: async () => {
+        /* no socket to close */
+      },
+      addListener: (name: PinnedWsEventName, listener: (event: unknown) => void) => {
+        const set = listeners.get(name) ?? new Set<(event: unknown) => void>();
+        set.add(listener);
+        listeners.set(name, set);
+        return {
+          remove: () => {
+            set.delete(listener);
+          },
+        };
+      },
+    },
+    refusedCount: () => refused,
+  };
+}
 
 describe('AppController pairing lifecycle (M9)', () => {
   beforeEach(async () => {

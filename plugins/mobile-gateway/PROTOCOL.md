@@ -59,6 +59,14 @@ WebUI 中有两个互相独立的开关。它们是本机管理设置，iOS 客�
 - 从 Debug 模式重新开启鉴权时，所有无凭证连接会被关闭，close code 为 `4003`。
 - Debug 鉴权开关只影响 DSH 自带的本机监听，并且只在当前 DSH 进程中生效；独立局域网监听始终强制设备鉴权。
 
+#### 开关位置的持久化
+
+`POST /mgw/remote-control` 的开关位置保存在网关状态文件里（`gatewayStateFile`，默认是与设备文件同目录的 `*.gateway.json`），字段为可选的布尔值 `remoteControl`，与已保存的网关模式共用同一个 `version: 1` 文件。文件里没有该字段表示开关从未被移动过，启动仍按配置解析（见上一节）；该字段只由这个路由写入。
+
+启动时已保存的位置就是本次运行使用的开关，没有任何否决权，也不存在配置否决：插件拿到的是 schema 处理后的配置，开关的默认值 `false` 在插件读取之前就被填进去了（`Config({})` 得到 `{"enabled": false}`），所以「显式关闭」在插件能看到的层面上无法与「从未设置」区分，也不能表达「主人说了不」；对这种值做否决只会把每一个已保存的 `true` 在下次加载时悄悄丢掉，正是持久化要修的问题。反过来，配置里显式开启也不会覆盖已保存的 `false`：保存的关闭位置即使状态文件里的 `mode` 是 `persistent`，启动时也按 `disabled` 处理。管理界面的开关路由仍然是主人随时覆盖开关的地方，所以持久化改变的是启动时位置的来源，不是谁有权切换。真正限制监听的是运行时模式：模式为 `disabled` 时不存在监听器。旧配置 `gatewayEnabled` 同样没有否决权：解析器把「未设置」和显式 `false` 折成同一个 `false`，无法区分两者。
+
+`POST /mgw/remote-control` 的 200 应答新增顶层字段 `persists: true|false`（与 `POST /mgw/listen` 的 `persists` 同义）：`true` 表示位置已写入网关状态文件，`false` 表示写入失败。写入失败不影响本次运行：开关立即按请求生效，关闭时照常执行 kill switch；只是重新启动后会回到文件里已保存的位置。关闭时如果网关模式的写入也失败，`persists` 同样为 `false`——它只说「整个关闭动作没有全部落盘」，不改变 kill switch 仍然执行这一点。`persists` 只描述这一次文件写入：它不承诺 fsync 或崩溃后的持久性，也不防范第二个写入者覆盖同一个文件。
+
 #### 首次配对
 
 二维码与手动复制内容都严格使用**无 padding 的 Base64URL 字符串**。解码后的 UTF-8 内容是以下 JSON，而不是长期凭证：
@@ -1018,7 +1026,7 @@ WebUI 中的“任务”与“进行中的目标”分别对应 DSH 的 `todos` 
 
 | type | 参数 | 说明 |
 |---|---|---|
-| `workspaces` | — | 全部工作区（含每个的 `sessionIds`） |
+| `workspaces` | — | 全部工作区（含每个的 `sessionIds`）。已配对设备读取需 `sessions:author`（见 §19） |
 | `workspace-create` | `path` | 对**已存在目录**创建工作区（已归属→`created:false` 幂等） |
 | `directories` | `path?` | 浏览 server 目录（缺省 = home）；`crumbs` 面包屑 + `entries`（含 `hidden` 标记） |
 | `directory-create` | `path`, `name` | 在父目录下创建一个子文件夹 |
@@ -1048,9 +1056,9 @@ WebUI 中的“任务”与“进行中的目标”分别对应 DSH 的 `todos` 
 
 | type | 参数 | 说明 |
 |---|---|---|
-| `models` | `sessionId?` | **带 sessionId**：该会话的模型目录（`current` + `routable` + `groups`）；**不带**：全局模型目录（`groups` + `failures`，无需会话） |
+| `models` | `sessionId?` | **带 sessionId**：该会话的模型目录（`current` + `routable` + `groups`）；**不带**：全局模型目录（`groups` + `failures`，无需会话）。已配对设备读取需 `sessions:author`（见 §19） |
 | `providers` | — | 可配置 provider 列表（含 live/dormant 状态） |
-| `select-model` | `sessionId`, `provider`, `model`, `reasoningEffort?` | 切换**该会话**的模型/思考等级（写入会话日志） |
+| `select-model` | `sessionId`, `provider`, `model`, `reasoningEffort?` | 切换**该会话**的模型/思考等级（写入会话日志）。已配对设备写入需 `sessions:author`（见 §19） |
 | `default-model` | — | **默认**模型选择（新会话用，含 `reasoningEffort`） |
 | `save-default-model` | `provider`, `model`, `reasoningEffort?` | 修改**默认**模型 + 思考等级（全局） |
 
@@ -1357,6 +1365,14 @@ Host 的 `plugin-manager/changed` 转为 `plugins-changed`（含 `reason`），`
 失败返回 `kind:error`、`requestType:session-create` 和原始 `requestId`。
 客户端不应自动重试超时的创建请求，以免重复创建会话。
 
+已配对设备调用本操作需要 `sessions:author`（spec 011，见 §19）：没有该权限的设备收到 `auth/forbidden-scope`，
+请求不会到达 Host。`workspaceId` 必须是本 Host 已存在的工作区。
+
+**不持有 `workspace:manage` 的设备必须指名工作区**：`workspaceId` 省略、为空、只有空白或不是字符串时，
+一律返回 `remote/argument-denied`，请求不会到达 Host —— 否则会话会落在 Host 自己的默认工作目录，
+而那个目录并不是手机选择的。`cwd`（以及 `agentPreset`）只要出现就同样返回 `remote/argument-denied`。
+同时持有 `workspace:manage` 的设备（可以自己指定路径的那一类）以及管理端/本机 loopback 行为不变。
+
 
 ### Independent conversation and control connections
 
@@ -1508,3 +1524,98 @@ history. Older gateways without the capability continue using one connection.
 
 完整约束、官方 Host 对不同内容结构的授权限制、移动端共享层及 Android/iOS 实施步骤见
 [生图插件图片接入](docs/generated-images-mobile-integration.md)。
+
+---
+
+## 19. 会话作者权限（`sessions:author`，spec 011）
+
+已配对设备默认只有会话读取、发送 prompt、应答审批这类权限。要让它像 Clarklevis 移动端那样**先建会话、
+再挑模型**，配对时需要显式勾选一个新权限 `sessions:author`（`SCOPES` 之一）。
+
+它打开且仅打开以下四条操作（`SCOPE_BY_TYPE` 只把这四个 type 映射到该权限）：
+
+| type | 参数 | 说明 |
+|---|---|---|
+| `workspaces` | — | 列出本 Host 的工作区。已配对设备只收到 `{ workspaceId, name }`（见下） |
+| `session-create` | `requestId`, `workspaceId` | 在**已存在**的工作区里创建一个空会话，返回 `session-created` + `sessionId`。不持有 `workspace:manage` 的设备必须指名工作区 |
+| `models` | `sessionId`? | 模型目录：带 `sessionId` 为该会话目录，不带为全局目录 |
+| `select-model` | `sessionId`, `provider`, `model`, `reasoningEffort`? | 切换该会话的模型/思考等级 |
+
+`workspaces` 响应按设备授权收敛（评审 Minor 1）。持有 `sessions:author` 的设备只得到创建会话所需的身份：
+
+```json
+{ "kind": "workspaces", "items": [ { "workspaceId": "w1", "name": "proj" } ] }
+```
+
+- 每项只有 `workspaceId` 与 `name`。`name` 取 Host 的 `name`/`title`；两者都为空时取 `path` 的**最后一段**
+  （例如 `C:\Users\me\DXVK_Project` → `DXVK_Project`，默认工作区 → `default-workspace`）。实测真实 Host 上
+  每行的 `name` 都是空串、只有 `path`，所以这个回退是必需的；它只是标签，绝对不是路径。
+- 绝对路径 `path`、成员的 `sessionIds`、时间戳以及顶层 `archivedSessionIds` 都不下发：它们是 Host
+  文件系统结构与其它会话的标识，一个只能建会话的手机不需要。
+- 既没有 `name`/`title` 也没有 `path` 的行会被**跳过**：没有任何可显示标签的行只会渲染成裸 uuid。
+- **可见性由策略绑定决定（不是由这条投影决定）。** DSH 的 `workspace/follow` 会逐项询问
+  `remoteAccess.allows({kind:'workspace', id})`，而绑定没有通配符，所以网关把本 Host 的工作区 id 列表
+  （经 owner 适配器刷新）作为策略事实注入，为每个 id 生成一条 `workspace` 资源绑定、动作 `workspace/follow`。
+  少了这一步，调用成功但 `items` 为空 —— 这就是 "This computer has no workspaces" 的成因（2026-11-10 现场缺陷）。
+- 同时持有 `workspace:manage` 的设备（可以自己指定路径的那一类）仍收到 Host 的完整形状。
+- 管理端（owner loopback）不变，仍是 Host 原样返回。
+
+`models` 的两种形态权限不同：不带 `sessionId` 的全局目录只需要 `sessions:author`；带 `sessionId` 的单会话目录
+还要读取该会话 `session/follow` 的快照，因此**额外需要 `sessions:read`**，缺少该权限时这种形态会被拒绝。
+
+**子代理会话（spec 011，2026-11-10 现场测量）。** `sessionId` 可以指向一个**直接子代理**会话（真实 Host 上
+861 个会话里有 827 个是子代理）。DSH 不接受把子代理当成普通会话来寻址（会返回
+`session/agent-busy: "subagent Sessions require their durable parent address"`），所以网关自己解析它的
+**durable parent 地址**：从 `session/list` 取该会话的 `parentSessionId`（只取本设备有权列出的行），
+再以 `{kind:'subagent', parentSessionId, childSessionId, mode:'unknown'}` 读取快照。对设备来说：
+
+- 带 `sessionId` 的 `models` 对**根会话与子代理都返回同样的形状** `{current, routable, groups, failures}`；
+  设备**看不到**父会话 id，回包里没有任何父子关系字段（它本来也只能看到自己有权列出的会话）。
+- 父会话无法解析（例如该子代理已不在本设备可见列表里）时，**保持原样拒绝**：错误码仍是
+  `session/agent-busy`，不做盲目重试。
+- 不可寻址的会话（不在本设备可见集合内）仍然失败关闭：`remote-access/denied`，原因是
+  `session/follow: access denied (resource-not-allowed)`。
+- `select-model` **不能**用于子代理：`session/selectModel` 的请求体只有 `sessionId`，没有地址参数，
+  DSH 因此无法对子代理选择模型。这种情况返回稳定错误码 **`subagent/model-inherited`**，消息说明
+  “子代理继承启动它的父会话的模型，请在父会话上选择”，且不透露父会话 id。根会话的 `select-model`
+  行为完全不变。
+
+**`session-create` 的决策资源包含目标工作区（2026-11-10 现场测量）。** DSH 的网关为每次调用按**每一条注册
+过的资源种类**各求出一个资源，**每一个**都必须被允许（`dsh-api-gateway/lib/index.js:36-58`
+`callResources()`：方法自带 reader，否则 `declaration.resolve`，否则
+`defaultFieldId(descriptor, args, field)`）。工作区控制器注册的是字段种类
+`{ field: 'workspaceId' }`（`dsh-api-workspace-controller/lib/index.js:858`），因此一条
+`session-create` 会被同时判定在 `global` 与 `{kind:'workspace', id: <workspaceId>}` 上。
+
+所以对持有 `sessions:author` 的设备，每个工作区的绑定除了 `workspace/follow` 还必须带上
+**`session/create`** —— 少了它，即使 `global` 层允许，也会得到
+`session/create: access denied (resource-not-allowed)`（这正是设备上“New session”失败的原因）。
+该绑定动作被**刻意限定**：只有存在这样一个工作区绑定时才添加（即只有持有 `sessions:author` 的设备），
+列表里也只有这两项，`workspace/create`、`workspace/rename`、`session/fork`、`session/rename`、
+`session/archive`、`session/updateQueue` 以及 `settings/*`、`commands/*`、插件与定时任务族仍然一律拒绝；
+设备无权绑定的工作区 id 依然没有任何绑定（没有通配符），创建因此失败关闭。
+
+**新建会话立刻可用（无需重试）。** `session-create` 返回的 `sessionId` 在**同一个连接的下一次请求**上就可以
+寻址：网关在回复 `session-created` **之前**就把这个 id 记入本设备的可见会话集合（DSH 的逐会话判定据此
+生成绑定），所以客户端在建好会话后**立刻** `models`、`subscribe`、`message` 或 `select-model` 都会成功，
+不需要退避重试。这条只对“Host 刚刚为**这个**设备创建的会话”生效：设备本来无权寻址的 id 仍然没有绑定，
+依旧 `remote-access/denied`（`resource-not-allowed`）；而 Host 之后报告该会话被删除时，绑定会立刻消失
+（删除的 tombstone 规则照旧），后台按 `session/list` 的对账也照旧运行。
+
+规则：
+
+- **从不由默认授予。** 它既不在 `DESKTOP_DEFAULT_SCOPES` 里，也不在任何默认报价里：`desktop` 与 `mobile`
+  的默认配对报价都不包含它（契约中的 `NEVER_DEFAULT_SCOPES`），Records 与 OTP 流程若没有显式提到它，
+  设备就不会持有它。
+- 它**不是** desktop-only：`mobile` 设备可以持有（这是 spec 011 的显式决定），并且仍然只在显式勾选时授予。
+- 不在上表内的宿主端点不因本权限开放：`workspace/create`、`workspace/rename`、`workspace/archiveSession`、
+  `session/fork`、`session/rename`、`session/updateQueue`、`session/attachment`、
+  `session/canOpenWorkspacePath`、`commands/*`、`settings/*`、插件与定时任务族，对任何设备一律拒绝。
+- 授权是**双重**的：路由器按 type 检查权限（缺失 → `auth/forbidden-scope`，请求不到达 Host），
+  设备自己的非 owner Peer 再按同一权限检查宿主端点，两层都必须通过。
+- **`session-create` 必须指名工作区。** 不持有 `workspace:manage` 的设备若省略 `workspaceId`、留空、只给空白
+  或给非字符串，一律 `remote/argument-denied` 且不触达 Host：否则会话会落在 Host 自己的默认工作目录，
+  而那不是手机选择的目录。`cwd` 与 `agentPreset` 同理（出现即拒绝）。持有 `workspace:manage` 的设备与
+  管理端/loopback 行为不变。
+- 权限在配对时固定：要改变已配对设备的权限，需要在 Devices 页面重新生成配对码并重新配对。
+

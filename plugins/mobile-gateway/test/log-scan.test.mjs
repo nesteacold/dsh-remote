@@ -28,6 +28,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -151,14 +152,9 @@ async function startGateway() {
   })
   server.on('upgrade', (req, socket, head) => (upgrade ? upgrade.handler(req, socket, head) : socket.destroy()))
   // WHATWG fetch refuses a handful of "bad ports"; an ephemeral listener that
-  // lands on one would fail the harness, not the gateway. Re-listen instead.
-  const FETCH_BAD_PORTS = new Set([1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566,
-    6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080])
-  for (;;) {
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-    if (!FETCH_BAD_PORTS.has(server.address().port)) break
-    await new Promise((resolve) => server.close(resolve))
-  }
+  // lands on one would fail the harness, not the gateway. The shared helper
+  // re-binds until `fetch` accepts the port (test/support/fetch-safe-listen.mjs).
+  await listenFetchSafe(server)
   const ctx = {
     webServer: {
       port: server.address().port,

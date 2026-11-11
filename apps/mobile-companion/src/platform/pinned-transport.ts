@@ -24,6 +24,7 @@ import {
   TRANSPORT_ERROR,
   TransportEmitter,
   redactString,
+  type ListenerFailureReporter,
   type Transport,
   type TransportConnectOptions,
   type TransportEvent,
@@ -131,6 +132,14 @@ export interface PinnedTransportOptions {
    * throwing hook is swallowed so it can never change what the transport does.
    */
   trace?: (line: string) => void;
+  /**
+   * Optional listener-failure reporter for both boundaries this transport owns: the native
+   * `pinned-ws` wrapper (`boundary: 'native'`, stage = the fixed event name) and the transport
+   * emitter (`boundary: 'transport'`, stage = the fixed event kind). A throw is reported so it is
+   * no longer invisible; the socket is NOT closed for it (an unrelated listener bug must not
+   * disconnect). Absent by default.
+   */
+  onListenerFailure?: ListenerFailureReporter;
 }
 
 /** Default mapping of an HTTP upgrade refusal to the contract vocabulary (contract §3, §6). */
@@ -152,7 +161,7 @@ export function defaultUpgradeMapping(status: number): { code: string; message: 
  * connection through its factory), routing every event by the native socket id.
  */
 export class PinnedTransport implements Transport {
-  private readonly emitter = new TransportEmitter();
+  private readonly emitter: TransportEmitter;
   private readonly options: PinnedTransportOptions;
   private module: PinnedWsAdapter | null | undefined;
   private id: string | null = null;
@@ -192,6 +201,7 @@ export class PinnedTransport implements Transport {
 
   constructor(options: PinnedTransportOptions = {}) {
     this.options = options;
+    this.emitter = new TransportEmitter(options.onListenerFailure);
   }
 
   on(listener: TransportListener): () => void {
@@ -236,7 +246,7 @@ export class PinnedTransport implements Transport {
       onMessage: (event: PinnedWsMessageEvent) => this.onNativeMessage(id, event),
       onClose: (event: PinnedWsCloseEvent) => this.onNativeClose(id, event),
       onError: (event: PinnedWsErrorEvent) => this.onNativeError(id, event),
-    });
+    }, this.options.onListenerFailure);
 
     try {
       const result = module.connect(id, url, {
@@ -531,11 +541,11 @@ export class PinnedTransport implements Transport {
 }
 
 /**
- * The construction options the app's factory may pass. It only ever sets `trace`; every other
- * option stays inside the module so production keeps one behaviour (module lookup, upgrade
- * mapping, socket ids) and only the diagnostics can differ.
+ * The construction options the app's factory may pass. It only ever sets `trace` and
+ * `onListenerFailure`; every other option stays inside the module so production keeps one
+ * behaviour (module lookup, upgrade mapping, socket ids) and only diagnostics can differ.
  */
-export type CreatePinnedTransportOptions = Pick<PinnedTransportOptions, 'trace'>;
+export type CreatePinnedTransportOptions = Pick<PinnedTransportOptions, 'trace' | 'onListenerFailure'>;
 
 /** The factory the app hands to `CompanionClient` (one transport per connection). */
 export const createPinnedTransport = (options: CreatePinnedTransportOptions = {}): Transport =>

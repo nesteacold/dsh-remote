@@ -47,7 +47,9 @@
 // Nothing here touches a real ctx, peer or the network: the factory receives
 // its facts through injected functions, so it is unit-testable and the
 // integrator decides when to register it.
-import * as contract from '@dsh-ext/mobile-protocol'
+// Generated copy of the contract (see scripts/sync-mobile-protocol.mjs): the
+// bare package specifier would not resolve in an installed tarball.
+import * as contract from './vendor/mobile-protocol.mjs'
 
 /** Principal kind a paired companion device runs as (never `owner`). */
 export const COMPANION_PRINCIPAL_KIND = 'dsh-ext-mobile-device'
@@ -64,15 +66,36 @@ export const COMPANION_DEVICE_KIND = 'mobile'
 
 /** Resource kind DSH's session controller registers for Session ids. */
 export const SESSION_RESOURCE_KIND = 'session'
+/**
+ * DSH filters a `workspace/follow` baseline item-by-item through
+ * `remoteAccess.allows({ kind: 'workspace', id })` (`dsh-api-workspace-controller`,
+ * `follow()`), so a Workspace is visible ONLY when this policy carries a binding
+ * for that exact kind and id — `sameResource()` has no wildcard. Without such a
+ * binding a device receives an empty `items` list while the call itself succeeds,
+ * which is what "This computer has no workspaces" was.
+ */
+export const WORKSPACE_RESOURCE_KIND = 'workspace'
 
 const SCOPE_SESSIONS = 'sessions:read'
 const SCOPE_PROMPT = 'prompt:send'
+/** Spec 011: list workspaces/models, create a session, pick its model. Read from
+ * the contract's own authoring mapping so the name is never a second literal. */
+const SCOPE_AUTHOR = contract.AUTHORING_SCOPE
 
 /**
  * The positive endpoint table. `resource` says what the Gateway resolves for
  * the call: `global` (names no session) or `session` (one session id).
  * `scope` is the pairing scope that unlocks it (spec 005, contract SCOPES).
  * `harness:remote` is intentionally absent: it belongs to the 008 bridge.
+ *
+ * Spec 011 (FR-003) added the four authoring endpoints. They are the exact Host
+ * endpoints the mobile message handlers reach through `lib/dsh-host-adapter.mjs`
+ * — `workspace/follow` is how that adapter lists workspaces (the Host publishes
+ * its workspace baseline as a stream), and both `models` forms read
+ * `session/modelCatalog`. Nothing else about a workspace or a session was opened:
+ * `workspace/create|rename|archiveSession`, `session/fork|rename|updateQueue`,
+ * `session/attachment`, `session/canOpenWorkspacePath`, `session/control` and the
+ * plugin/schedule/settings families stay unmapped (FR-004).
  */
 export const COMPANION_ENDPOINTS = Object.freeze({
   // Session list / search: global call, then each row filtered per session.
@@ -86,6 +109,16 @@ export const COMPANION_ENDPOINTS = Object.freeze({
   // Sending input and stopping a turn.
   'session/prompt': Object.freeze({ scope: SCOPE_PROMPT, resource: SESSION_RESOURCE_KIND }),
   'session/cancel': Object.freeze({ scope: SCOPE_PROMPT, resource: SESSION_RESOURCE_KIND }),
+  // Spec 011: the authoring surface. `workspace/follow` is the reason the
+  // workspace list needs no new Host endpoint — the adapter reads the baseline.
+  'workspace/follow': Object.freeze({ scope: SCOPE_AUTHOR, resource: 'global', itemFilter: true, itemKind: WORKSPACE_RESOURCE_KIND }),
+  'session/create': Object.freeze({ scope: SCOPE_AUTHOR, resource: 'global' }),
+  // Both `models` forms (Host-wide and per-session) read this one catalog;
+  // the per-session form also opens `session/follow`, so addressing is enforced.
+  'session/modelCatalog': Object.freeze({ scope: SCOPE_AUTHOR, resource: 'global' }),
+  // A session resource, exactly like `session/prompt`: a session the device
+  // cannot address is refused by DSH itself, before the Host service runs.
+  'session/selectModel': Object.freeze({ scope: SCOPE_AUTHOR, resource: SESSION_RESOURCE_KIND }),
 })
 
 /**
@@ -97,6 +130,13 @@ export const COMPANION_UNSUPPORTED_ENDPOINTS = Object.freeze({
   'subagents/interruptByParent': 'resource resolution of childSessionId/parentSessionId not verified (would resolve to global)',
   'session/control': 'global whole-Host live stream; per-item session filtering of a stream is not proven (itemFilter applies to list/search only)',
   'remoteAccess/follow': 'always allowed by DSH for every Peer; not part of this mapping',
+  'workspace/create': 'spec 011 FR-004: creating a workspace is not part of session authoring',
+  'workspace/rename': 'spec 011 FR-004: renaming a workspace is not part of session authoring',
+  'workspace/archiveSession': 'spec 011 FR-004: archiving a session into a workspace is not part of session authoring',
+  'session/fork': 'spec 011 FR-004: forking is not part of session authoring',
+  'session/rename': 'spec 011 FR-004: renaming is not part of session authoring',
+  'session/updateQueue': 'spec 011 FR-004: queue control is not part of session authoring',
+  'session/canOpenWorkspacePath': 'spec 011 FR-004: probing Host paths is not part of session authoring',
 })
 
 /** Forwarded session notifications a device may receive, per visible session (read roles). */
@@ -144,8 +184,14 @@ const usableSessionId = (id) => typeof id === 'string' && id.length > 0
 function actionsFor(scopes, resource) {
   const actions = []
   for (const [action, entry] of Object.entries(COMPANION_ENDPOINTS)) {
-    if (scopes.has(entry.scope) && (entry.resource === resource || (resource === SESSION_RESOURCE_KIND && entry.itemFilter))) {
-      actions.push(action)
+    if (!scopes.has(entry.scope)) continue
+    if (entry.resource === resource) { actions.push(action); continue }
+    // An endpoint whose result is filtered PER ITEM also needs its action on the
+    // item's own resource, because DSH asks `allows({kind, id})` for every item and
+    // matches the action of the invocation (`workspace/follow`, `session/list`).
+    if (entry.itemFilter) {
+      const itemKind = entry.itemKind ?? SESSION_RESOURCE_KIND
+      if (itemKind === resource) actions.push(action)
     }
   }
   return actions
@@ -161,11 +207,19 @@ function actionsFor(scopes, resource) {
  *   - `getSessionIds(deviceId)`: the EXACT session ids this device may see
  *     (an iterable of strings). No wildcard exists in DSH bindings, so the
  *     integrator must enumerate; an empty list means no session access.
+ *   - `getWorkspaceIds()`: optionally, the EXACT workspace ids of this Host (an
+ *     iterable of strings), for the same no-wildcard reason. DSH filters the
+ *     `workspace/follow` baseline through `allows({kind:'workspace', id})`, so a
+ *     device holding `sessions:author` sees only the workspaces bound here; an
+ *     omitted fact means no workspace is visible.
  * @returns {{ bindings(principal): object[], explain(request): string }}
  */
 export function createCompanionAccessPolicy(facts) {
   if (!isRecord(facts) || typeof facts.getDevice !== 'function' || typeof facts.getSessionIds !== 'function') {
     throw new TypeError('createCompanionAccessPolicy requires { getDevice, getSessionIds } functions')
+  }
+  if (facts.getWorkspaceIds !== undefined && typeof facts.getWorkspaceIds !== 'function') {
+    throw new TypeError('createCompanionAccessPolicy: getWorkspaceIds must be a function when provided')
   }
 
   // Roles are plain values; one per resource kind. They carry every action the
@@ -213,6 +267,33 @@ export function createCompanionAccessPolicy(facts) {
           if (!usableSessionId(id) || seen.has(id)) continue
           seen.add(id)
           bindings.push({ role, resource: { kind: SESSION_RESOURCE_KIND, id } })
+        }
+      }
+
+      // `workspace/follow` is filtered item by item: one binding per workspace id
+      // of this Host, otherwise DSH's baseline arrives with `items: []`.
+      const workspaceActions = actionsFor(scopes, WORKSPACE_RESOURCE_KIND)
+      if (workspaceActions.length > 0 && facts.getWorkspaceIds !== undefined) {
+        // `session/create` is decided against the TARGET WORKSPACE, not only the
+        // global resource: the gateway's `callResources()` collects one resource per
+        // REGISTERED kind (dsh-api-gateway `lib/index.js:36-58`, via
+        // `defaultFieldId`), and the workspace controller registers the field kind
+        // `{ field: 'workspaceId' }` (dsh-api-workspace-controller `lib/index.js:858`).
+        // A `session/create` request carries `workspaceId`, so the workspace resource
+        // must carry this action too — otherwise creation is refused with
+        // `session/create: access denied (resource-not-allowed)` even though the
+        // global action is granted (measured live 2026-11-10).
+        //
+        // Scoped to `sessions:author` on purpose: a workspace binding only exists for
+        // a device that holds it, and nothing else is added, so a device without the
+        // scope still creates nothing.
+        const actions = scopes.has(SCOPE_AUTHOR) ? [...workspaceActions, 'session/create'] : workspaceActions
+        const role = roleFor(WORKSPACE_RESOURCE_KIND, actions)
+        const seen = new Set()
+        for (const id of facts.getWorkspaceIds() ?? []) {
+          if (!usableSessionId(id) || seen.has(id)) continue
+          seen.add(id)
+          bindings.push({ role, resource: { kind: WORKSPACE_RESOURCE_KIND, id } })
         }
       }
       return bindings

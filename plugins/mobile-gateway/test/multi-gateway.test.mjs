@@ -2,6 +2,7 @@ import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { createRequire } from 'node:module'
@@ -37,9 +38,17 @@ function assertWindowsAcl(target) {
 
 async function start(name, overrides = {}) {
   let management, upgrade, dispose
-  const server = http.createServer((req, res) => management.handler(req, res))
+  // The 404 branch is also what the helper's fetch-safe probe sees: the plugin
+  // registers its route only after `apply` below, so a probe before that must not
+  // reach the (still undefined) management handler.
+  const server = http.createServer((req, res) => {
+    if (management) management.handler(req, res)
+    else res.writeHead(404).end()
+  })
   server.on('upgrade', (req, socket, head) => upgrade.handler(req, socket, head))
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe: undici refuses whole classes of ports ("bad port"), and `listen(0)`
+  // returns whatever the OS picks; the helper re-binds until `fetch` accepts it.
+  await listenFetchSafe(server)
   const port = server.address().port
   const config = {
     deviceFile: path.join(temp, `${name}-devices.json`),

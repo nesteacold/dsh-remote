@@ -6,3 +6,4 @@ export * from './install-id';
 export * from './biometrics';
 export * from './notifications';
 export * from './pinned-transport';
+export * from './random';

@@ -2,6 +2,7 @@ import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -48,7 +49,9 @@ async function gateway(t, enabled = true) {
     else { res.writeHead(404); res.end() }
   })
   server.on('upgrade', (req, socket, head) => upgrade.handler(req, socket, head))
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe: undici refuses whole classes of ports ("bad port"), and `listen(0)`
+  // returns whatever the OS picks; the helper re-binds until `fetch` accepts it.
+  await listenFetchSafe(server)
   const ctx = {
     webServer: {
       port: server.address().port,

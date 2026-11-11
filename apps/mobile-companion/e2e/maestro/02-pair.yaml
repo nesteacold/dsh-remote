@@ -1,0 +1,39 @@
+# 02 — pair by pasting the one-time code (A021, US1 §1, SC-001).
+#
+# SCENARIO: fresh install state; `PAIR_QR` = a **fresh, unused** code from the fixture
+#           (`POST /pairing/new` right before the run — codes are single-use, ≤ 5 min).
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   the biometric prompt (subflows/unlock.yaml).
+#
+# EXIT CRITERIA:
+#   1. the pair screen is reached from the empty state;
+#   2. the code is accepted and the app lands on the session list (the `session-row-sess-alpha`
+#      hook appears — a hook, not the row title, decides "paired");
+#   3. the fixture recorded exactly one consumed pairing code and one live connection
+#      (`GET /state`: `consumedPairingCodes.length === 1`, `openConnections === 1`) — asserted by
+#      the orchestrator, not by this flow.
+
+appId: com.dshext.companion
+env:
+  PAIR_QR: ${PAIR_QR}
+---
+- launchApp:
+    clearState: true
+    clearKeychain: true
+    permissions:
+      camera: deny
+
+- runFlow: subflows/unlock.yaml
+- assertVisible: ".*(Pair a computer|Ghép đôi máy tính).*"
+
+- runFlow: subflows/pair-paste.yaml
+
+# Pairing succeeded when the session list replaces the pair screen: the fixture's running row.
+# Spec 011 P1-A: pairing lands on the Workspace home tab, so open the Conversations list first.
+- tapOn:
+    id: "tab-conversations"
+- extendedWaitUntil:
+    visible:
+      id: "session-row-sess-alpha"
+    timeout: 30000
+- assertNotVisible: ".*(Could not pair|Không ghép đôi được).*"

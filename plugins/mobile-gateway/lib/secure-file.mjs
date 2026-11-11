@@ -11,9 +11,13 @@
 //
 // A secret that can be SERVED (the TLS identity key: its reader can impersonate
 // the pinned listener) cannot live with best-effort. `assertOwnerOnly` reads the
-// real ACL and throws a typed error instead of letting the caller serve the key.
+// real DACL and throws a typed error instead of letting the caller serve the key.
 // The exit code of `icacls /grant:r` is not evidence — it does not remove a
 // pre-existing EXPLICIT grant to another principal — so the DACL is inspected.
+// On Windows that inspection is structural, never textual: one non-interactive
+// PowerShell child process reports every ACE as `AccessControlType|SID|IsInherited`
+// and the verdict compares SIDs, because a display name is localized and
+// `HOST\neste`, `DOMAIN\neste` and a look-alike of `\SYSTEM` are not one principal.
 import { execFile, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -25,6 +29,17 @@ const execFileAsync = promisify(execFile)
 const SECRET_FILE_MODE = 0o600
 const SECRET_DIRECTORY_MODE = 0o700
 const ICACLS_TIMEOUT_MS = 10_000
+const DACL_TIMEOUT_MS = 10_000
+
+// One ACE line of the DACL probe: `AccessControlType|SID|IsInherited`.
+const SID_SOURCE = 'S-\\d+-\\d+(?:-\\d+)*'
+const SID_PATTERN = new RegExp(`^${SID_SOURCE}$`)
+const ACE_LINE_PATTERN = new RegExp(`^(Allow|Deny)\\|(${SID_SOURCE})\\|(True|False)$`)
+// The SIDs that may hold an Allow ACE besides the current user's own (policy in
+// `windowsAclViolation`).
+const TRUSTED_SIDS = new Set(['S-1-5-18', 'S-1-5-32-544'])
+// Any PowerShell error inside a probe is a non-zero exit, never a partial answer.
+const STRICT_POWERSHELL = "$ErrorActionPreference = 'Stop'; "
 
 let logger
 const defaultLogger = (message) => { globalThis.console?.error?.(`mobile-gateway: ${message}`) }
@@ -72,55 +87,111 @@ function posixViolation(target) {
   return null
 }
 
-/**
- * The access-control entries of an `icacls <path>` listing: one
- * `{ principal, flags }` per ACE line. The first line repeats the target path
- * before the principal, so it is stripped; the localized summary line matches no
- * `:(...)` suffix and is ignored.
- */
-function aclEntries(output, target) {
-  const entries = []
-  const prefixes = [target, target.replace(/[\\/]+$/, '')].filter(Boolean)
-  for (const line of String(output).split(/\r?\n/)) {
-    const trimmed = line.trim()
-    const flags = trimmed.match(/:((?:\([^)]*\))+)\s*$/)
-    if (!flags) continue
-    let principal = trimmed.slice(0, flags.index).trim()
-    for (const prefix of prefixes) {
-      if (principal.toLowerCase().startsWith(prefix.toLowerCase())) {
-        principal = principal.slice(prefix.length).replace(/^[\\/]+/, '').trim()
-        break
-      }
-    }
-    entries.push({ principal, flags: flags[1] })
-  }
-  return entries
+// A listing line echoed in a refusal stays short and free of control characters:
+// it is a DACL entry, never file contents.
+function preview(line) {
+  const text = String(line).replace(/[\u0000-\u001f\u007f]+/g, ' ').trim()
+  return text.length > 120 ? `${text.slice(0, 117)}...` : text
 }
 
 /**
- * Owner-only verdict for an `icacls <path>` listing (Windows). Every entry must
- * belong to the current user (or SYSTEM) and no inherited entry may remain.
- * Principals are compared by their short name because the display name is
- * localized; a localized SYSTEM name is therefore refused rather than guessed
- * (fail closed, never fail open).
+ * A PowerShell single-quoted literal for `target`. An embedded `'` is doubled —
+ * the only escape a single-quoted string has — so a file name containing `'`,
+ * `$`, a backtick or `;` cannot end the literal early and inject a command.
+ */
+export function powerShellLiteral(target) {
+  return `'${String(target).replaceAll("'", "''")}'`
+}
+
+/**
+ * The DACL probe: one line per ACE, `AccessControlType|SID|IsInherited`, every
+ * principal translated to its SID. `-ErrorAction Stop` turns an unreadable path
+ * into a non-zero exit instead of an empty (and clean-looking) listing, and
+ * `$ErrorActionPreference = 'Stop'` turns a failure INSIDE the pipeline (an
+ * identity that cannot be translated) into a non-zero exit as well, so a partial
+ * listing can never be mistaken for the whole DACL.
+ */
+function daclScript(target) {
+  const acl = `(Get-Acl -LiteralPath ${powerShellLiteral(target)} -ErrorAction Stop).Access`
+  const ace = "'{0}|{1}|{2}' -f $_.AccessControlType, $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value, $_.IsInherited"
+  return `${STRICT_POWERSHELL}${acl} | ForEach-Object { ${ace} }`
+}
+
+// Arguments always go through as an array; no shell string is ever built.
+function runPowerShell(script) {
+  return execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true, timeout: DACL_TIMEOUT_MS, stdio: 'pipe', encoding: 'utf8',
+  })
+}
+
+let cachedUserSid = null
+
+/**
+ * The SID of the account this process runs as, resolved once and never by name:
+ * `HOST\neste` and `DOMAIN\neste` are different principals, and a bare `SYSTEM`
+ * is not LOCAL SYSTEM. A failure here is a refusal at every call site.
+ * @throws when it cannot be resolved
+ */
+function currentUserSid() {
+  if (cachedUserSid) return cachedUserSid
+  const output = String(runPowerShell(`${STRICT_POWERSHELL}[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value`))
+  // The shell may prepend a byte-order mark; it is not an ACE.
+  const sid = output.replace(/^\uFEFF/, '').trim()
+  if (!SID_PATTERN.test(sid)) throw new Error(`the current user SID could not be resolved (${preview(sid) || 'no output'})`)
+  cachedUserSid = sid
+  return sid
+}
+
+/**
+ * Owner-only verdict for the structured DACL listing read by the Windows probe.
+ *
+ * POLICY — the path is acceptable only if EVERY parsed ACE is either a `Deny`,
+ * or an `Allow` whose SID is one of:
+ *   - the current user's own SID,
+ *   - `S-1-5-18` (LOCAL SYSTEM),
+ *   - `S-1-5-32-544` (BUILTIN\Administrators).
+ * Administrators is allowed on purpose: an administrator can take ownership of
+ * anything on this machine anyway, so a grant to it adds no exposure a local
+ * administrator does not already have — and the user-writable directories real
+ * secrets live in (the DSH data/profile root) inherit that ACE, so refusing it
+ * would make this check unusable.
+ * Everything else is a refusal, never a pass: an `Allow` for any other SID, a
+ * line that is not exactly `AccessControlType|SID|IsInherited`, or an empty
+ * listing (`ownerOnlyViolation` turns a failed probe into the same refusal).
+ * `IsInherited` is parsed and validated but not itself refused — an inherited
+ * ACE of one of those three grants nothing extra. An unrecognized entry is never
+ * skipped, so one trusted ACE cannot mask a permissive entry beside it.
+ * @param {string} listing one line per ACE, as produced by the probe
+ * @param {string} currentSid this process's SID — names are never compared
  * @returns {string|null} refusal reason, `null` when it is owner-only
  */
-export function windowsAclViolation(output, target, user = currentUser()) {
-  const entries = aclEntries(output, target)
-  if (entries.length === 0) return 'its access control list could not be read'
-  for (const entry of entries) {
-    if (/\(I\)/i.test(entry.flags)) return `an inherited entry for ${entry.principal} remains`
+export function windowsAclViolation(listing, currentSid) {
+  const text = String(listing ?? '').replace(/^\uFEFF/, '')
+  const lines = text.split(/\r?\n/)
+  // Only the terminator of the last line is dropped: a blank line INSIDE the
+  // listing is an unrecognized entry and therefore a refusal.
+  if (lines.at(-1) === '') lines.pop()
+  if (lines.length === 0) return 'its access control list is empty'
+  for (const [index, line] of lines.entries()) {
+    const ace = line.match(ACE_LINE_PATTERN)
+    if (!ace) {
+      return `its access control list has an unrecognized entry (line ${index + 1}: ${preview(line) || 'blank'})`
+    }
+    const [, accessType, sid] = ace
     // A deny entry grants nothing; only allowed principals are checked.
-    if (/\(DENY\)/i.test(entry.flags)) continue
-    // A mandatory-integrity label restricts access, it never grants any: printing
-    // one must not turn a correctly restricted secret into a refusal.
-    if (/^mandatory label\\/i.test(entry.principal)) continue
-    const name = entry.principal.split('\\').pop() || entry.principal
-    if (name.toLowerCase() === user.toLowerCase()) continue
-    if (name.toLowerCase() === 'system') continue
-    return `access is granted to ${entry.principal}`
+    if (accessType === 'Deny') continue
+    if (sid === currentSid) continue
+    if (TRUSTED_SIDS.has(sid)) continue
+    return `access is granted to ${sid} (line ${index + 1})`
   }
   return null
+}
+
+function failureDetail(error) {
+  if (error?.code) return error.code
+  if (error?.signal) return `signal ${error.signal}`
+  if (typeof error?.status === 'number') return `exit ${error.status}`
+  return error?.message ?? 'error'
 }
 
 /**
@@ -133,12 +204,9 @@ export function ownerOnlyViolation(target) {
   try {
     const resolved = path.resolve(target)
     if (process.platform !== 'win32') return posixViolation(resolved)
-    const listing = execFileSync('icacls', [resolved], {
-      windowsHide: true, timeout: ICACLS_TIMEOUT_MS, stdio: 'pipe', encoding: 'utf8',
-    })
-    return windowsAclViolation(listing, resolved)
+    return windowsAclViolation(runPowerShell(daclScript(resolved)), currentUserSid())
   } catch (error) {
-    return `its access control list could not be read [${error?.code ?? error?.message ?? 'error'}]`
+    return `its access control list could not be read [${failureDetail(error)}]`
   }
 }
 
@@ -158,11 +226,18 @@ export class SecretFilePermissionError extends Error {
  * below this never degrades to a warning: the caller is about to serve the file.
  * @param {string} target path to verify
  * @param {(target: string) => (string|null)} [check] test-only override returning
- *   a refusal reason; the bundle never passes one
+ *   a refusal reason (a thrown error refuses too); the bundle never passes one
  * @returns {true}
  */
 export function assertOwnerOnly(target, check = ownerOnlyViolation) {
-  const reason = check(target)
+  let reason
+  try {
+    reason = check(target)
+  } catch (error) {
+    // A probe that throws (a failed child process, an unreadable path) is the
+    // same refusal as a reported reason — never a raw error the caller might miss.
+    reason = `its access control list could not be read [${failureDetail(error)}]`
+  }
   if (reason) throw new SecretFilePermissionError(target, reason)
   return true
 }

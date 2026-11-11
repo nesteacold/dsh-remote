@@ -51,12 +51,12 @@ function pluginInstallArgs(packageSpec = currentPackageSpec()) {
 
 function printHelp() {
   console.log(`Usage:
-  dsh-plugin-mobile-gateway setup [--ip <public IPv4>] [--port 3080] [--email <address>] [--yes]
-  dsh-plugin-mobile-gateway init
-  dsh-plugin-mobile-gateway setup-helper
-  dsh-plugin-mobile-gateway remove-helper [--yes]
-  dsh-plugin-mobile-gateway status
-  dsh-plugin-mobile-gateway remove [--yes]
+  @dsh-ext/mobile-gateway setup [--ip <public IPv4>] [--port 3080] [--email <address>] [--yes]
+  @dsh-ext/mobile-gateway init
+  @dsh-ext/mobile-gateway setup-helper
+  @dsh-ext/mobile-gateway remove-helper [--yes]
+  @dsh-ext/mobile-gateway status
+  @dsh-ext/mobile-gateway remove [--yes]
 
 DISABLED in this release (FR-011/R9): every command above except --help exits
 non-zero without changing anything. Remote access outside the LAN goes through
@@ -404,7 +404,7 @@ Setup completed.
 3. The iOS client should connect to wss://${ip}/ws/mobile.
 
 Check later with:
-  sudo npx dsh-plugin-mobile-gateway status`)
+  sudo npx @dsh-ext/mobile-gateway status`)
 }
 
 function status() {

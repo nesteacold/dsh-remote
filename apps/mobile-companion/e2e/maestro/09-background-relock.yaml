@@ -1,0 +1,43 @@
+# 09 — background lock closes the authenticated socket; re-unlock opens exactly one (M5, FR-003).
+#
+# WHY IT MATTERS: `_layout.tsx` calls `controller.lock()` on `AppState === 'background'`, which
+# stops the retry loop, releases the token-bearing closure and closes the client. The UI must show
+# the gate again, and the fixture must go back to **one** live socket after re-unlock — never two
+# (an orphaned socket would keep authenticating with a credential the app believes it released).
+#
+# PREQUISITES: paired; a screen lock enrolled (the gate re-locks).
+# HARNESS:     `--cert-mode ok`.
+# MANUAL:      the biometric prompt on re-unlock.
+#
+# HOOKS: `session-row-sess-alpha` for "the list is back" / "the list is gone". The gate button has
+#        no hook (one button, `unlock.button`), so it stays text-matched.
+#
+# EXIT CRITERIA:
+#   1. after backgrounding, the app is locked again (no session row hook, `DSH Companion` visible);
+#   2. re-unlock returns to the session list (the row hook is back);
+#   3. `GET /state` shows `openConnections === 1` and `peakOpenConnections <= 2` for the whole run
+#      (orchestrator assertion): the old socket was closed before the new one was opened.
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- assertVisible:
+    id: "session-row-sess-alpha"
+
+# Background the app: this fires AppState 'background' -> controller.lock().
+- pressKey: home
+- launchApp:
+    stopApp: false
+
+# The gate is back: the credential is no longer usable until re-authentication.
+- assertVisible: "DSH Companion"
+- assertNotVisible:
+    id: "session-row-sess-alpha"
+- assertVisible: "^Unlock$|^Mở khoá$"
+
+- runFlow: subflows/unlock.yaml
+- extendedWaitUntil:
+    visible:
+      id: "session-row-sess-alpha"
+    timeout: 30000

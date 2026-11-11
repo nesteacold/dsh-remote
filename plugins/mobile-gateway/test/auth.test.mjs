@@ -17,6 +17,7 @@
 //    helper route is gone (T031): both verbs are 404, only the cross-origin gate
 //    still answers (403) in front of routing.
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -231,8 +232,9 @@ function upgradeOutcome(url, protocols, headers) {
     lanPort: 0,
     tlsCertificateDir: path.join(temp, 'tls'),
   })
-  server.listen(0, '127.0.0.1')
-  await once(server, 'listening')
+  // fetch-safe: undici refuses whole classes of ports ("bad port"), and `listen(0)`
+  // returns whatever the OS picks; the helper re-binds until `fetch` accepts it.
+  await listenFetchSafe(server)
   webServer.port = server.address().port
   const base = `http://127.0.0.1:${webServer.port}`
   const wsUrl = `ws://127.0.0.1:${webServer.port}/ws/mobile`

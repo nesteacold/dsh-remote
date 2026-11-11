@@ -13,3 +13,16 @@
         # FR2: outbound pairing is limited to private/loopback/Tailscale addresses.
         # Set true only to pair with a Host that has a public wss:// endpoint.
         allowPublicRemotes: false
+        # Spec 008 link supervisor: dial every stored remote at start-up and again
+        # after an unexpected drop (1s, 2s, 5s, 10s, 30s, then 30s, ±20% jitter).
+        # false = dial only when a route or the user asks (the old behaviour).
+        autoReconnect: true
+        # Backoff sequence in ms; the last value repeats forever. Every entry is
+        # clamped to an integer in [100, 300000] ms before the ±20% jitter, and an
+        # empty or invalid list falls back to the default below.
+        reconnectDelaysMs: [1000, 2000, 5000, 10000, 30000]
+        # How long a link must stay online before the backoff starts over, so a host
+        # that greets and immediately drops keeps climbing the sequence instead of
+        # being redialled at the first step forever. Clamped like the delays
+        # ([100, 300000] ms; default 10000).
+        reconnectStableMs: 10000

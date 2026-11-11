@@ -15,6 +15,8 @@ app/                    Expo Router screens
   index.tsx             A022 sessions: 3 tabs, search, needs-decision badge (FlashList)
   pair.tsx              A021 QR scan (expo-camera) + manual paste + every US1 error state
   session/[id].tsx      A023 history, approval cards (≤ 3 taps), composer, cancel
+  s/[id].tsx            A025 deep-link landing: dshcompanion://s/<id> -> /session/<id>
+  s/index.tsx           A025 deep-link landing without an id -> /
 src/core/               Pure TypeScript protocol core — no react-native / expo / node imports
   protocol.ts           re-exports @dsh-ext/mobile-protocol + app-local client codes
   errors.ts             CoreError (contract code | client/* code | passthrough host code)
@@ -139,26 +141,40 @@ process (`selfsigned`); no certificate or key is ever written to disk or committ
 
 ## Current limitations
 
-- **The pinned-ws native code is uncompiled.** A030's Kotlin and Swift sources have never been
-  built here: this machine has no Android SDK and no macOS/Xcode, so `modules/pinned-ws/android`
-  and `modules/pinned-ws/ios` are checked by review only. The JS half (module surface, transport
-  adapter, error mapping) is covered by `test/pinned-transport.test.ts`; the first device build
-  (A040/A041) is the first real compile.
-- `npx expo prebuild --platform android --no-install` completes here (verified in an isolated
-  copy with a real `node_modules` copy; a junction-based copy hung the Expo CLI) and writes the
-  expected manifest and `res/xml/network_security_config.xml`. This is project generation only,
-  not a native compile: the Android SDK is not installed (A040/A041 do the first real build).
-  The A031 mods are also covered by `test/config-plugin.test.ts` and
-  `npx expo config --type introspect`.
-- **A033 is verified against a fixture, not against Xcode.** No `ios/` project has ever been
-  generated or built on this machine (no macOS/Xcode): the `InfoPlist.strings` registration
-  (`PBXVariantGroup` + `Resources` build phase, written by the plugin's `ios.xcodeproj` mod) is
-  exercised in `test/config-plugin.test.ts` on a realistic fixture `project.pbxproj` parsed and
-  written with the same `xcode` library Expo uses, including idempotency and the
-  duplicate-registration cleanup. Xcode's own resolution of that project, and the localised
-  permission prompt on a device, remain unverified until A041.
-- Remote push (APNs/FCM) is not wired: notifications are **local only**, raised from the live
-  connection (US6, D3).
-- Android build needs the Android SDK (not installed on this machine); iOS needs macOS/EAS.
-- The app must run as a **dev build** (not Expo Go): Expo Go has no `pinned-ws` module, and the
-  app deliberately refuses to connect without it.
+Updated 2026-11-10 — the Android side is now built, installed and exercised on an emulator, so
+several earlier caveats no longer apply. `specs/002-companion-app/tasks.md` carries the measured
+device evidence; this list is the short version.
+
+- **Android is real; iOS is not.** The Kotlin module compiles (`:dsh-ext-pinned-ws:compileDebugKotlin`),
+  EAS has produced release APKs, and on an Android 36 emulator the app has been verified for:
+  pairing over pinned TLS, session list + filters, opening a session, sending a prompt (frame on
+  the wire and the prompt applied by the gateway), the approval card with an **exact `argsHash`**
+  decision plus a `hash-mismatch` refusal that keeps the request pending, a wrong certificate
+  leaking **no** credential (`tlsHandshakesCompleted=0`, no upgrade, pairing code unused),
+  revocation (retry stops, the stored token is wiped, the banner explains it), re-pairing
+  afterwards, transient-drop recovery, the lock/unlock gate, and deep links (both documented URL
+  forms, including a link that arrives while locked).
+  **Swift has still never been compiled** — no macOS/Xcode here — so `modules/pinned-ws/ios` is
+  review-only and A033's `InfoPlist.strings` registration is exercised against a fixture
+  `project.pbxproj`, not Xcode. iOS is a distribution blocker, not a caveat.
+- **Remote push (APNs/FCM) is not wired**: notifications are **local only**, raised from the live
+  connection (US6, D3). Measured consequence: backgrounding the app closes the authenticated socket
+  (the credential boundary), so an approval push cannot arrive and no notification can fire while
+  the app is in the background. Local notifications are therefore **not** a substitute for remote
+  push.
+- **A physical phone over the LAN is unproven.** All device evidence is an emulator, mostly with
+  `adb reverse`; firewall/routing behaviour on a real network is still an acceptance test.
+- **No dev-client/Expo Go path for the transport**: the app must run as a build that contains the
+  `pinned-ws` module (Expo Go has none) and it deliberately refuses to connect without it.
+- **Build profiles** (`eas.json`): `preview` (internal APK), `diagnostic` (APK, JS file tracing ON —
+  diagnostics only), `release-apk` (APK, tracing OFF), `production` (AAB for the store, tracing OFF).
+  On artifact size: the store AAB measures 75,878,033 B ≈ **72.36 MiB** and is under the ≤100 MiB
+  budget, while the *universal* release APK is 114,432,681 B ≈ 109.1 MiB — over it, purely because
+  the APK embeds four ABIs' native libraries. Inside the AAB, `arm64-v8a` is 25.93 MiB and
+  `armeabi-v7a`/`x86`/`x86_64` add ≈73 MiB; the `x86`/`x86_64` slices exist for emulators only, and a
+  store install downloads just its own ABI. An arm64-only build would be ≈40.8 MiB if a single-ABI
+  APK is ever wanted, but no such profile is defined today because the budget is already met.
+- **Android SDK on this machine is a partial install**: `platforms;android-37.0`,
+  `build-tools;37.0.0`, platform-tools and an emulator are present, which is enough to compile the
+  Kotlin module and drive a device, but a full local `assembleRelease` still hits a Windows
+  long-path limit in the C++/CMake step — use EAS for APKs.

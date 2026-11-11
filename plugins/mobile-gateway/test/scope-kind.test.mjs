@@ -16,6 +16,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -29,6 +30,14 @@ import { CLOSE_CODES, OP_RESPONSES, SCOPES, SCOPE_BY_TYPE } from '@dsh-ext/mobil
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const UUID = 'desk0000-0000-4000-8000-000000000001'
 
+/**
+ * These tests reach the management listener with `fetch`, but undici refuses whole
+ * classes of ports outright ("bad port": 6000, 10080, 5060, …) before it connects —
+ * and `listen(0)` returns whatever the OS picks. `listenFetchSafe` binds, proves
+ * the port with the same `fetch`, and re-binds on a refusal; see
+ * test/support/fetch-safe-listen.mjs. (The TLS listener is reached with `ws`, which
+ * has no such blocklist, so it may use any port.)
+ */
 async function factory(t, config = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-005-gateway-'))
   const listeners = {}
@@ -37,19 +46,20 @@ async function factory(t, config = {}) {
   let upgrade
   let dispose = () => {}
   const hostCalls = []
-  const server = http.createServer((req, res) => {
-    if (management && (req.url === management.path || req.url.startsWith(`${management.path}/`))) {
-      management.handler(req, res)
-      return
-    }
-    res.writeHead(404).end()
+  const { server, port } = await listenFetchSafe(() => {
+    const candidate = http.createServer((req, res) => {
+      if (management && (req.url === management.path || req.url.startsWith(`${management.path}/`))) {
+        management.handler(req, res)
+        return
+      }
+      res.writeHead(404).end()
+    })
+    candidate.on('upgrade', (req, socket, head) => {
+      if (upgrade) upgrade.handler(req, socket, head)
+      else socket.destroy()
+    })
+    return candidate
   })
-  server.on('upgrade', (req, socket, head) => {
-    if (upgrade) upgrade.handler(req, socket, head)
-    else socket.destroy()
-  })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-  const port = server.address().port
   const ctx = {
     webServer: {
       port,
@@ -65,6 +75,13 @@ async function factory(t, config = {}) {
         if (request.namespace === 'session' && request.method === 'search') return { items: [], hasMore: false }
         if (request.namespace === 'session' && request.method === 'prompt') return { accepted: true }
         if (request.namespace === 'session' && request.method === 'cancel') return { accepted: true }
+        // Spec 011: the authoring ops are served to a `sessions:author` device, so
+        // the fake Host has to answer what their handlers read.
+        if (request.namespace === 'session' && request.method === 'modelCatalog') {
+          return { default: { provider: 'p', model: 'm' }, routableProviders: ['p'], groups: [], failures: [] }
+        }
+        if (request.namespace === 'session' && request.method === 'create') return { sessionId: 's-new' }
+        if (request.namespace === 'session' && request.method === 'selectModel') return { provider: 'p', model: 'm' }
         return {}
       },
       async stream(request) {
@@ -77,7 +94,7 @@ async function factory(t, config = {}) {
               assistantStream: { revision: 0 } }
           } else {
             yield { type: 'baseline', value: request.namespace === 'workspace'
-              ? { items: [], archivedSessionIds: [] } : { projections: {} } }
+              ? { items: [{ workspaceId: 'w1' }], archivedSessionIds: [] } : { projections: {} } }
           }
           while (!request.signal.aborted) await delay(10)
         })()
@@ -258,7 +275,9 @@ test('T1: every mapped type is served with its scope and refused without it', as
       const requestId = `scope-${index}-${type}`
       const reply = await request(ws, { requestId, type, sessionId: 's1', companionProtocol: 1,
         appVersion: '1.0.0', platform: 'ios', query: 'q', rpcId: 'rpc-x', approvalId: 'approval-x',
-        argsHash: 'h', outcome: 'rejected', text: 'hi', clientMsgId: `m-${index}-${type}` })
+        argsHash: 'h', outcome: 'rejected', text: 'hi', clientMsgId: `m-${index}-${type}`,
+        // Spec 011: the authoring frames' own arguments.
+        workspaceId: 'w1', provider: 'p', model: 'm' })
       // The `client-hello` exchange itself is not scope-gated: it is what makes
       // the connection ready (contract §3.6/§5a), so it is served before any
       // scope decision — otherwise a device whose grant lacks sessions:read
@@ -288,13 +307,24 @@ test('T2: a type outside the companion vocabulary is refused for a scoped device
   const instance = await factory(t)
   const layout = await pairDevice(instance, 'desktop', UUID, { kind: 'desktop' })
   const { ws } = await connectToken(instance, layout.token, UUID)
-  for (const type of ['workspaces', 'plugin-catalog', 'not-an-op']) {
+  for (const type of ['plugin-catalog', 'not-an-op']) {
     const before = instance.hostCalls.length
     const reply = await request(ws, { type, path: '/tmp' })
     assert.equal(reply.kind, 'error', `${type} must be refused`)
     assert.equal(reply.code, 'op/forbidden', `${type} must stay outside the companion allowlist: ${JSON.stringify(reply)}`)
     assert.equal(reply.requestType, type)
     assert.equal(instance.hostCalls.length, before, `${type} must not reach the Host`)
+  }
+  // Spec 011: `workspaces` is part of the §4 vocabulary now, but only for a device
+  // that holds `sessions:author` — this desktop offer did not include it, so the
+  // SCOPE gate answers instead of the type allowlist, still before any Host call.
+  {
+    const before = instance.hostCalls.length
+    const reply = await request(ws, { type: 'workspaces' })
+    assert.equal(reply.kind, 'error')
+    assert.equal(reply.code, 'auth/forbidden-scope', JSON.stringify(reply))
+    assert.equal(reply.scope, 'sessions:author')
+    assert.equal(instance.hostCalls.length, before, 'workspaces must not reach the Host without the scope')
   }
   // Push has no scope and is refused by its own branch — never by silence.
   for (const type of ['push-register', 'push-remove']) {

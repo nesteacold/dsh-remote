@@ -283,3 +283,139 @@ await assert.rejects(() => badHost.sessions.history({ sessionId: 's1' }), { code
   assert.equal(returned, true)
   assert.equal(caller.signal.aborted, false)
 }
+
+// ---------------------------------------------------------------------------
+// Spec 011: a sessionId may name a DIRECT SUBAGENT Session (live: 827 of 861).
+//
+// DSH's `validateAddress()` refuses an ordinary `{kind:'session'}` address for a
+// subagent header with `session/agent-busy: "subagent Sessions require their
+// durable parent address"`, and accepts `{kind:'subagent', parentSessionId,
+// childSessionId, mode}` (skipping the mode comparison when `mode:'unknown'`).
+// This fake reproduces exactly that rule, so these tests fail if the adapter goes
+// back to hard-coding a root address.
+// ---------------------------------------------------------------------------
+{
+  const ROOT = 'session-root'
+  const CHILD = 'child-1'
+  const FOREIGN = 'foreign-session'
+  const SUBAGENT_IDS = new Set([CHILD])
+  const parents = new Map([[CHILD, ROOT]])
+  const agentBusy = () => Object.assign(
+    new Error('subagent Sessions require their durable parent address'),
+    { code: 'session/agent-busy' },
+  )
+  let listItems = [
+    { sessionId: ROOT },
+    { sessionId: CHILD, parentSessionId: ROOT, origin: 'subagent' },
+  ]
+  let listCalls = 0
+  const followCalls = []
+  const selectModelCalls = []
+  const snapshotFor = (id) => ({
+    type: 'snapshot', header: { version: 4, id }, cursor: 9, records: [], hasMore: false,
+    projections: { asOfSeq: 9, values: { modelSelection: { lastUsed: null, next: { provider: 'deepseek', model: `chat-${id}` } } } },
+  })
+  const subagentGateway = {
+    async invoke(call) {
+      if (call.namespace === 'session' && call.method === 'modelCatalog') {
+        return {
+          default: { provider: 'deepseek', model: 'chat' }, routableProviders: ['deepseek'],
+          groups: [{ id: 'deepseek', name: 'DeepSeek', models: [{ id: 'chat', name: 'Chat' }] }], failures: [],
+        }
+      }
+      if (call.namespace === 'session' && call.method === 'list') {
+        listCalls += 1
+        return { items: listItems }
+      }
+      if (call.namespace === 'session' && call.method === 'selectModel') {
+        selectModelCalls.push(call.args)
+        const { sessionId } = call.args.request
+        // DSH: `resolveAgent(sessionId)` refuses a subagent child outright.
+        if (SUBAGENT_IDS.has(sessionId)) {
+          throw Object.assign(new Error(`session "${sessionId}" is owned by subagent routing`), { code: 'session/agent-busy' })
+        }
+        return { selected: { provider: 'deepseek', model: call.args.request.model } }
+      }
+      throw new Error(`unexpected invoke ${call.namespace}/${call.method}`)
+    },
+    async stream(call) {
+      assert.equal(call.namespace, 'session')
+      assert.equal(call.method, 'follow')
+      const address = call.args.request.address
+      followCalls.push(address)
+      if (address.kind === 'subagent') {
+        // DSH verifies the child really belongs to that parent.
+        if (parents.get(address.childSessionId) !== address.parentSessionId) {
+          throw Object.assign(new Error('subagent does not belong to the supplied parent'), { code: 'subagent/unauthorized' })
+        }
+        return (async function* () { yield snapshotFor(address.childSessionId) })()
+      }
+      // The rule under test: a subagent cannot be addressed as an ordinary Session.
+      if (SUBAGENT_IDS.has(address.sessionId)) throw agentBusy()
+      if (address.sessionId === FOREIGN) {
+        throw Object.assign(
+          new Error('remote access: session/follow: access denied (resource-not-allowed)'),
+          { code: 'remote-access/denied' },
+        )
+      }
+      return (async function* () { yield snapshotFor(address.sessionId) })()
+    },
+  }
+  const subagentHost = createDshHostAdapter(subagentGateway, peer)
+
+  // T1 — a ROOT session keeps today's exact address and frame.
+  followCalls.length = 0
+  listCalls = 0
+  const rootModels = await subagentHost.sessions.models({ sessionId: ROOT })
+  assert.deepEqual(followCalls, [{ kind: 'session', sessionId: ROOT }],
+    'a root session must still be addressed exactly as before')
+  assert.equal(listCalls, 0, 'a root session must not pay for a subagent lookup')
+  assert.equal(rootModels.current.model, `chat-${ROOT}`)
+  assert.deepEqual(Object.keys(rootModels).sort(), ['current', 'failures', 'groups', 'routable'],
+    'the per-session wire shape must not change')
+
+  // T2 — a SUBAGENT id resolves to its durable parent and returns a catalog.
+  followCalls.length = 0
+  const childModels = await subagentHost.sessions.models({ sessionId: CHILD })
+  assert.deepEqual(followCalls.map((address) => address.kind), ['session', 'subagent'],
+    'subagent first fails as a root address, then succeeds through the parent')
+  assert.deepEqual(followCalls[1], {
+    kind: 'subagent', parentSessionId: ROOT, childSessionId: CHILD, mode: 'unknown',
+  }, 'the durable address carries the resolved parent and mode "unknown"')
+  assert.equal(childModels.current.model, `chat-${CHILD}`)
+  assert.deepEqual(Object.keys(childModels).sort(), ['current', 'failures', 'groups', 'routable'])
+  // Requirement 3: the reply never names the parent session.
+  assert.equal(JSON.stringify(childModels).includes(ROOT), false, 'the parent id must not reach the device')
+
+  // T3 — an id the device cannot address still fails closed, with DSH's own code.
+  await assert.rejects(() => subagentHost.sessions.models({ sessionId: FOREIGN }),
+    { code: 'remote-access/denied', message: /resource-not-allowed/ })
+
+  // T4 — an unresolvable subagent keeps the original refusal (never a blind retry).
+  listItems = [{ sessionId: ROOT }]
+  followCalls.length = 0
+  await assert.rejects(() => subagentHost.sessions.models({ sessionId: CHILD }),
+    { code: 'session/agent-busy', message: /durable parent address/ })
+  assert.equal(followCalls.filter((address) => address.kind === 'subagent').length, 0,
+    'no subagent address is attempted when the parent is unknown')
+  listItems = [
+    { sessionId: ROOT },
+    { sessionId: CHILD, parentSessionId: ROOT, origin: 'subagent' },
+  ]
+
+  // T5 — select-model on a root session is unchanged.
+  selectModelCalls.length = 0
+  const selected = await subagentHost.sessions.selectModel({ sessionId: ROOT, provider: 'deepseek', model: 'chat' })
+  assert.deepEqual(selected, { selected: { provider: 'deepseek', model: 'chat' } })
+  assert.deepEqual(selectModelCalls, [{ request: { sessionId: ROOT, provider: 'deepseek', model: 'chat' } }],
+    'the root select-model request is byte-identical')
+
+  // T6 — select-model on a subagent reports inheritance, not a busy agent, and
+  // still does not disclose the parent id.
+  const inherited = await subagentHost.sessions.selectModel({ sessionId: CHILD, provider: 'deepseek', model: 'chat' })
+    .then(() => null, (error) => error)
+  assert.equal(inherited?.code, 'subagent/model-inherited',
+    `a subagent must not surface session/agent-busy (got ${inherited?.code})`)
+  assert.match(inherited.message, /inherits the model/)
+  assert.equal(inherited.message.includes(ROOT), false, 'the refusal must not name the parent session')
+}

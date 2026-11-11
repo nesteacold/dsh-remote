@@ -21,12 +21,15 @@ const source = fs.readFileSync(path.join(here, '../lib/client.js'), 'utf8')
 
 console.log('client')
 
-function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure } = {}) {
+function load({ locale = 'en-US', status, devices = [], remotes = [], pending, fail = {}, sessions, listenFailure, controlPersists } = {}) {
   let api
   const calls = []
   const state = {
     status: status ?? { remoteControl: { enabled: false, accepting: false }, lan: { listening: false, urls: [] } },
     devices, remotes, pending: pending ?? [], pairing: null,
+    // POST /mgw/remote-control answers `persists` (the real route reports whether
+    // the switch position reached the state file); a test can make the save fail.
+    controlPersists: controlPersists ?? true,
     // POST /mgw/listen: one queued failure, and an optional gate a test holds to
     // observe the in-flight state before the rebind answers.
     listenFailure: listenFailure ?? null, listenGate: null,
@@ -65,7 +68,7 @@ function load({ locale = 'en-US', status, devices = [], remotes = [], pending, f
     if (route === '/mgw/remote-control') {
       state.status = { ...state.status, remoteControl: { enabled: body.enabled, accepting: state.status.remoteControl.accepting },
         lan: body.enabled ? { listening: true, urls: ['wss://192.168.1.20:3081/ws/mobile'] } : { listening: false, urls: [] } }
-      return reply(state.status)
+      return reply({ ...state.status, persists: state.controlPersists })
     }
     if (route === '/mgw/gateway') { state.status.remoteControl.accepting = body.mode !== 'disabled'; return reply({ gatewayMode: body.mode }) }
     if (route === '/mgw/connection') return reply({ pairingRoute: body.route })
@@ -181,7 +184,7 @@ const { SCOPES: CONTRACT_SCOPES, SCOPE_PRESETS: CONTRACT_PRESETS, DESKTOP_ONLY_S
 // Order of the checkboxes in the UI (safe scopes first), as the contract lists the full desktop set.
 const ALL = ['sessions:read', 'prompt:send', 'approval:respond', 'files:read', 'harness:remote',
   'files:write', 'settings:write', 'commands:execute', 'workspace:manage',
-  'credentials:write', 'plugins:manage', 'schedule:write', 'terminal']
+  'credentials:write', 'plugins:manage', 'schedule:write', 'terminal', 'sessions:author']
 
 const text = (renderer) => JSON.stringify(renderer.toJSON())
 async function mount(element) {
@@ -257,6 +260,30 @@ await check('toggle on: remote-control, gateway (persistent), connection (lan); 
   page.unmount()
 })
 
+await check('toggle: a switch the gateway could not save shows one notice; a saved one shows none', async () => {
+  // The owner's OFF must stick. When the gateway answers `persists:false` the
+  // switch still applied, but the state file did not take it — say so inline.
+  const unsaved = load({ controlPersists: false,
+    status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: ['wss://192.168.1.20:3081/ws/mobile'] } } })
+  const page = await mount(React.createElement(unsaved.api.testing.AllowTab))
+  await flush()
+  const toggle = () => find(page, (node) => node.props.role === 'switch')[0]
+  assert.equal(toggle().props['aria-checked'], true)
+  await click(toggle())
+  await flush()
+  assert.equal(toggle().props['aria-checked'], false, 'the switch still moves even when the save failed')
+  assert.match(text(page), /could not save it/, 'the owner must learn the switch was not saved')
+
+  // A switch the gateway did save adds no notice.
+  const saved = load()
+  const other = await mount(React.createElement(saved.api.testing.AllowTab))
+  await flush()
+  await click(find(other, (node) => node.props.role === 'switch')[0])
+  await flush()
+  assert.doesNotMatch(text(other), /could not save it/, 'a saved switch adds no notice')
+  page.unmount(); other.unmount()
+})
+
 await check('every fetch is same-origin with credentials, and honours the document base', async () => {
   const ui = load()
   const page = await mount(React.createElement(ui.api.testing.DevicesPage))
@@ -326,6 +353,16 @@ await check('authorized devices: shows name/kind/scopes/last used/Connected here
   await flush()
   const rendered = text(page)
   for (const expected of ['Work PC', 'desktop', 'See sessions and history', 'Send prompts', 'Connected here', 'Last used']) assert.match(rendered, new RegExp(expected))
+  // The grant is a chip list now, not the run-on "Permissions: a, b" sentence that
+  // squeezed the row into a few words per line. Every scope is still there.
+  assert.doesNotMatch(rendered, /Permissions: /, 'no comma sentence')
+  const chips = find(page, (node) => typeof node.props['data-scope'] === 'string')
+  assert.deepEqual(chips.map((node) => node.props['data-scope']), ['sessions:read', 'prompt:send'], 'one chip per scope, in the granted order')
+  assert.equal(chips[0].children.join(''), 'See sessions and history', 'the chip carries the scope label')
+  // Last use keeps its own row (label + the value), never glued to the grant.
+  const when = find(page, (node) => node.props['data-testid'] === 'last-used')[0].children.join('')
+  assert.match(when, /2023/, 'the last use is a date')
+  assert.match(when, /\d{1,2}:\d{2}/, 'with a time, not just a day')
   await click(button(page, 'Edit permissions'))
   assert.match(text(page), /device must pair again/)
   const boxes = () => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
@@ -572,6 +609,62 @@ await check('connect tab: the row Reconnect renders in vi too, and the two dicti
   page.unmount()
 })
 
+await check('connect tab: a remote with a pending automatic retry says so (en and vi); a plain offline one stays quiet', async () => {
+  // The link supervisor dials by itself after a drop; "offline" alone reads like a
+  // dead pairing, so the row names the retry that is already scheduled and keeps
+  // the manual Reconnect button as it is.
+  const retry = { attempt: 2, nextAt: Date.now() + 1500 }
+  const remotes = [
+    { id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'offline', approvals: [], retry },
+    { id: 'r2', name: 'Other', address: '192.168.1.31:3081', status: 'offline', approvals: [], retry: null },
+  ]
+  const ui = load({ remotes })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  const notes = () => find(page, (node) => node.props['data-testid'] === 'remote-retry')
+  assert.equal(notes().length, 1, 'only the row with a scheduled retry')
+  assert.equal(notes()[0].children.join(''), DICT.en.autoRetry)
+  assert.notEqual(DICT.vi.autoRetry, DICT.en.autoRetry, 'a real translation, not a copy')
+  assert.match(DICT.vi.autoRetry, /tự kết nối lại/)
+  const reconnects = () => find(page, (node) => node.type === 'button' && node.props['data-testid'] === 'remote-reconnect')
+  assert.equal(reconnects().length, 2, 'the manual Reconnect button stays')
+  await act(async () => { ui.setLocale('vi') })
+  assert.equal(notes()[0].children.join(''), DICT.vi.autoRetry, 'the Vietnamese note renders too')
+  page.unmount()
+})
+
+await check('connect tab: a remote whose certificate changed says so in danger (en and vi); no retry note, no noise otherwise', async () => {
+  // The supervisor stops retrying on `pin-mismatch` (a retry cannot fix a changed
+  // certificate), so the row has to say what happened and that nothing was sent.
+  const remotes = [
+    { id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'error', approvals: [], retry: null, linkError: 'pin-mismatch' },
+    { id: 'r2', name: 'Other', address: '192.168.1.31:3081', status: 'offline', approvals: [], retry: null, linkError: null },
+  ]
+  const ui = load({ remotes })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  const notes = () => find(page, (node) => node.props['data-testid'] === 'remote-pin-mismatch')
+  assert.equal(notes().length, 1, 'only the row whose pin no longer matches')
+  assert.equal(notes()[0].children.join(''), DICT.en.pinMismatchNote)
+  assert.equal(notes()[0].props.role, 'alert', 'a danger note, not a hint')
+  assert.match(DICT.en.pinMismatchNote, /different certificate/)
+  assert.match(DICT.en.pinMismatchNote, /Nothing was sent/)
+  assert.match(DICT.en.pinMismatchNote, /Pair it again/)
+  assert.notEqual(DICT.vi.pinMismatchNote, DICT.en.pinMismatchNote, 'a real translation, not a copy')
+  assert.match(DICT.vi.pinMismatchNote, /chứng chỉ khác/)
+  assert.match(DICT.vi.pinMismatchNote, /ghép đôi lại/)
+  assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
+  // A terminal reason is not a retry: the two notes never coexist.
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'remote-retry').length, 0)
+  // The manual Reconnect stays available: a human may still ask once.
+  assert.equal(find(page, (node) => node.props['data-testid'] === 'remote-reconnect').length, 2)
+  await act(async () => { ui.setLocale('vi') })
+  assert.equal(notes()[0].children.join(''), DICT.vi.pinMismatchNote, 'the Vietnamese note renders too')
+  page.unmount()
+})
+
 const ONLINE = { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } }
 const checkboxes = (page) => find(page, (node) => node.type === 'input' && node.props.type === 'checkbox' && node.props.onChange)
 const ticked = (page) => checkboxes(page).map((node, index) => (node.props.checked ? ALL[index] : null)).filter(Boolean)
@@ -723,6 +816,22 @@ await check('listening on: a loopback bind shows the real bind + pin and warns t
   assert.equal(byTestId(page, 'listener-state')[0].children.join(''), DICT.en.listenerUp)
   assert.ok(rendered.includes(DICT.en.listeningOn))
   assert.equal(byTestId(page, 'listener-loopback').length, 1, 'a loopback bind is called out')
+  // The route is one chip in the header, and the warning is a quiet line: no box,
+  // no bold heading, and the address is not printed a second time inside it.
+  const route = byTestId(page, 'listener-route')[0]
+  assert.equal(route.children.join(''), DICT.en.routeLoopback, 'the header names the route in one word')
+  assert.equal(route.props.className, 'dshdev-badge')
+  const loopbackNote = byTestId(page, 'listener-loopback')[0]
+  assert.match(String(loopbackNote.props.className), /dshdev-note/, 'a note, not a banner')
+  assert.equal(loopbackNote.findAll((node) => node.type === 'strong').length, 0, 'no bold heading')
+  const card = byTestId(page, 'listening-on')[0]
+  assert.equal(card.findAll((node) => typeof node.type === 'string'
+    && /dshdev-banner/.test(String(node.props.className || ''))).length, 0, 'no callout box in the card')
+  assert.equal(flatText(card).split('wss://127.0.0.1:3081/ws/mobile').length - 1, 1,
+    'the address is stated once — the note no longer repeats it')
+  // The address and the pin each carry a copy button at the same weight.
+  assert.equal(byTestId(page, 'listening-on')[0].findAll((node) => node.type === 'button'
+    && node.props.className === 'dshdev-btn').length, 2, 'copy the address, copy the pin')
   // The warning says where the owner changes it and that a certificate is not needed.
   assert.match(rendered, /Settings → Plugins/)
   assert.match(rendered, /mobile-gateway row/)
@@ -735,11 +844,13 @@ await check('listening on: a loopback bind shows the real bind + pin and warns t
   assert.ok(shown.length < PIN.length, 'the pin is truncated')
   assert.ok(shown.startsWith(PIN.slice(0, 17)) && shown.endsWith(PIN.slice(-11)), `truncated pin: ${shown}`)
   assert.equal(pin.props.title, PIN, 'the full pin is still available (it is what a client pins)')
-  assert.equal(byTestId(page, 'listener-reachable').length, 0, 'no "reachable" note on loopback')
+  // The old "reachable" prose is gone everywhere: the route chip carries that fact.
+  assert.doesNotMatch(rendered, /Reachable from other machines/, 'no "reachable" heading')
+  assert.doesNotMatch(rendered, /this machine's Tailscale addresses/, 'no tailnet sentence')
   page.unmount()
 })
 
-await check('listening on: a non-loopback bind shows the address and, when it is a Tailscale address, says so', async () => {
+await check('listening on: a non-loopback bind shows the address and, when it is a Tailscale address, the route chip says so', async () => {
   const lan = { ...LAN_UP, host: '100.64.1.2', urls: ['wss://100.64.1.2:3081/ws/mobile'] }
   const ui = load({ status: { ...ONLINE, lan, tailscale: { addresses: ['100.64.1.2'], urls: lan.urls } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
@@ -748,20 +859,43 @@ await check('listening on: a non-loopback bind shows the address and, when it is
   const { DICT } = ui.api.testing
   assert.equal(byTestId(page, 'listener-loopback').length, 0, 'no loopback warning off loopback')
   assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://100.64.1.2:3081/ws/mobile')
-  const [note] = byTestId(page, 'listener-reachable')
-  assert.ok(note, 'a neutral note replaces the warning')
-  assert.match(rendered, /100\.64\.1\.2/, 'the note names the host')
-  assert.ok(rendered.includes(DICT.en.reachableTitle))
-  assert.ok(rendered.includes(`${DICT.en.reachableNote} wss://100.64.1.2:3081/ws/mobile`))
-  assert.ok(rendered.includes(DICT.en.reachableTailscale), 'the bind host is a Tailscale address')
+  // The invariant the removed paragraph carried: the page still tells the owner this
+  // bind is a Tailscale address. The route chip is now the one place that says it.
+  assert.equal(byTestId(page, 'listener-route')[0].children.join(''), DICT.en.routeTailscale,
+    'the header chip names the tailnet instead of describing it')
+  assert.ok(rendered.includes(DICT.en.routeTailscale), 'the chip says "Tailscale" on the page')
+  // ...and the prose that restated the chip is gone: no heading, no tailnet sentence.
+  assert.doesNotMatch(rendered, /Reachable from other machines/, 'the "reachable" heading is gone')
+  assert.doesNotMatch(rendered, /this machine's Tailscale addresses/, 'the tailnet sentence is gone')
+  assert.equal(byTestId(page, 'listener-reachable').length, 0, 'no "reachable" block')
+  assert.equal(byTestId(page, 'listener-tailscale').length, 0, 'no tailnet line')
+  // One statement per fact: the address row states the URL, and no note repeats it.
+  assert.equal(flatText(byTestId(page, 'listening-on')[0]).split('wss://100.64.1.2:3081/ws/mobile').length - 1, 1,
+    'the URL is printed once')
+  // The card is the chips plus two lines; the only note left is the port warning
+  // (3081 sits in a dynamic range), not a re-statement of who can connect.
+  const notes = page.root.findAll((node) => typeof node.type === 'string'
+    && /(^| )dshdev-note( |$)/.test(String(node.props.className || '')))
+  assert.deepEqual(notes.map((node) => node.props['data-testid']), ['listener-port-risk'],
+    'no note restates the route chip')
   page.unmount()
-  // A bind that is neither loopback nor a local Tailscale address gets no Tailscale claim.
-  const other = load({ status: { ...ONLINE, lan, tailscale: { addresses: ['100.64.1.2'], urls: [] } } })
+  // A bind that is neither loopback nor a local Tailscale address gets no Tailscale
+  // claim and no note at all: the "LAN" chip is the whole statement. (30081 is in
+  // the safe port band, so the port note stays quiet too.)
+  const quietLan = { ...LAN_UP, host: '192.168.1.20', port: 30081, urls: ['wss://192.168.1.20:30081/ws/mobile'] }
+  const other = load({ status: { ...ONLINE, lan: quietLan, tailscale: { addresses: ['100.64.1.2'], urls: [] } } })
   const otherPage = await mount(React.createElement(other.api.testing.AllowTab))
   await flush()
-  assert.equal(byTestId(otherPage, 'listener-reachable').length, 1)
+  assert.equal(byTestId(otherPage, 'listener-reachable').length, 0, 'a plain LAN bind states nothing twice')
   assert.equal(byTestId(otherPage, 'listener-tailscale').length, 0)
-  assert.ok(!text(otherPage).includes(other.api.testing.DICT.en.reachableTailscale))
+  assert.equal(byTestId(otherPage, 'listener-route')[0].children.join(''), other.api.testing.DICT.en.routeLan,
+    'a plain LAN bind is not claimed as a tailnet address')
+  assert.doesNotMatch(text(otherPage), /this machine's Tailscale addresses/)
+  // ...and the card is silent: no note of any kind in that normal case — the
+  // Tailscale bind above is the only one that used to add a sentence.
+  const otherCard = otherPage.root.findAll((node) => typeof node.type === 'string'
+    && /(^| )dshdev-note( |$)/.test(String(node.props.className || '')))
+  assert.equal(otherCard.length, 0, 'a normal non-loopback bind renders no note')
   otherPage.unmount()
 })
 
@@ -775,6 +909,7 @@ await check('listening on: listener down shows the off state, the error verbatim
   assert.equal(byTestId(page, 'listener-state')[0].children.join(''), DICT.en.listenerDown)
   assert.equal(byTestId(page, 'listener-error')[0].children.join(''), 'EADDRINUSE: 127.0.0.1:3081', 'shown verbatim')
   assert.equal(byTestId(page, 'listener-loopback').length, 0, 'a listener that is off cannot be unreachable')
+  assert.doesNotMatch(text(page), /Reachable from other machines/, 'the "reachable" prose is gone')
   assert.equal(byTestId(page, 'listener-reachable').length, 0)
   assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), '127.0.0.1:3081', 'host:port without a URL')
   page.unmount()
@@ -794,24 +929,25 @@ await check('listening on: a safe-band port (30081) says nothing about port risk
   await flush()
   assert.equal(byTestId(page, 'listener-port-risk').length, 0, 'no row when there is nothing to say')
   const rendered = text(page)
-  assert.ok(!rendered.includes(ui.api.testing.DICT.en.portRiskTitle))
+  assert.ok(!rendered.includes(ui.api.testing.DICT.en.portRiskBody))
   assert.ok(!rendered.includes(ui.api.testing.DICT.en.portRiskSafeBand))
   page.unmount()
 })
 
-await check('listening on: a port in the measured retuned range (3081) gets the note, naming the safe band and the automatic next port', async () => {
+await check('listening on: a port in the measured retuned range (3081) gets the note, naming the safe band', async () => {
   const ui = load({ status: { ...ONLINE, lan: riskLan(3081), tailscale: { addresses: [], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
   const { DICT } = ui.api.testing
   const [note] = byTestId(page, 'listener-port-risk')
   assert.ok(note, 'the note is rendered')
+  // One compact line under the facts, not a bordered panel with a heading.
+  assert.match(String(note.props.className), /dshdev-note/)
+  assert.equal(note.findAll((node) => node.type === 'strong').length, 0, 'no bold heading')
   const rendered = flatText(note)
-  assert.ok(rendered.includes(DICT.en.portRiskTitle), 'says the OS can take the port')
   assert.ok(rendered.includes(DICT.en.portRiskBody), 'says the bind can fail at a random moment')
   assert.ok(rendered.includes(DICT.en.portRiskSafeBand), 'names the safe band')
   assert.match(rendered, /20000-39999/)
-  assert.ok(rendered.includes(DICT.en.portRiskAuto), 'says the gateway moves to the next free port')
   page.unmount()
 })
 
@@ -822,7 +958,7 @@ await check('listening on: a port in the Windows default dynamic range (50000) g
   const { DICT } = ui.api.testing
   const [note] = byTestId(page, 'listener-port-risk')
   assert.ok(note, 'the note is rendered')
-  assert.ok(flatText(note).includes(DICT.en.portRiskTitle))
+  assert.ok(flatText(note).includes(DICT.en.portRiskBody))
   assert.equal(byTestId(page, 'listener-port-risk').length, 1, 'one note, not one per row')
   page.unmount()
 })
@@ -849,15 +985,14 @@ await check('listening on: a busy port keeps the error verbatim while the note e
   const [note] = byTestId(page, 'listener-port-risk')
   assert.ok(note, 'a busy port is explained')
   const rendered = flatText(note)
-  assert.ok(rendered.includes(DICT.en.portBusyTitle), 'names the busy port')
   assert.ok(rendered.includes(DICT.en.portBusyBody), 'explains the cause')
-  assert.match(rendered, /busy port/i)
+  assert.match(rendered, /busy port/i, 'names the busy port')
   assert.ok(!rendered.includes('EADDRINUSE'), 'explains the cause, does not repeat the raw text')
   page.unmount()
 })
 
 await check('listening on port risk: every new string exists in vi and en; vi/en key sets stay identical', async () => {
-  const keys = ['portRiskTitle', 'portRiskBody', 'portRiskSafeBand', 'portRiskAuto', 'portBusyTitle', 'portBusyBody']
+  const keys = ['portRiskBody', 'portRiskSafeBand', 'portBusyBody']
   const states = [
     { ...ONLINE, lan: riskLan(3081), tailscale: { addresses: [], urls: [] } },
     { ...ONLINE, lan: BUSY_LAN, tailscale: { addresses: [], urls: [] } },
@@ -884,10 +1019,14 @@ await check('listening on port risk: every new string exists in vi and en; vi/en
 })
 
 await check('listening on: every new string exists in vi and en; vi/en key sets stay identical', async () => {
-  const keys = ['listeningOn', 'listenerUp', 'listenerDown', 'listenerUnknown', 'certPin', 'loopbackTitle',
-    'loopbackWarning', 'reachableTitle', 'reachableNote', 'reachableTailscale']
+  const keys = ['listeningOn', 'listenerUp', 'listenerDown', 'listenerUnknown', 'certPin',
+    'routeLoopback', 'routeLan', 'routeTailscale', 'loopbackWarning', 'reachableNote']
   const states = [
+    // loopback bind: the loopback route and its one long warning.
     { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.1.2'], urls: [] } },
+    // a plain LAN bind: the LAN route, the count-free "who can connect" line.
+    { ...ONLINE, lan: riskLan(30081), tailscale: { addresses: ['100.64.1.2'], urls: [] } },
+    // a tailnet bind: the Tailscale route, said once in the chip.
     { ...ONLINE, lan: { ...LAN_UP, host: '100.64.1.2', urls: ['wss://100.64.1.2:3081/ws/mobile'] }, tailscale: { addresses: ['100.64.1.2'], urls: [] } },
     { remoteControl: { enabled: false, accepting: false } },
   ]
@@ -912,7 +1051,7 @@ await check('listening on: every new string exists in vi and en; vi/en key sets 
   assert.deepEqual(Object.keys(DICT.vi).sort(), Object.keys(DICT.en).sort(), 'vi and en stay twins')
 })
 
-await check('listening on: read-only — no write request and no input for this block', async () => {
+await check('listening on: read-only — no write request and no input for this block, only the two copy buttons', async () => {
   const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.1.2'], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
@@ -920,17 +1059,34 @@ await check('listening on: read-only — no write request and no input for this 
     ['/mgw/devices', '/mgw/pending', '/mgw/status'], 'the block adds no request: it reuses the polls already on this tab')
   assert.equal(ui.calls.some((call) => call.method !== 'GET'), false, 'no write, no dial')
   const [card] = byTestId(page, 'listening-on')
-  assert.equal(card.findAll((node) => node.type === 'input' || node.type === 'button').length, 0, 'read-only: no controls')
+  assert.equal(card.findAll((node) => node.type === 'input').length, 0, 'read-only: no input')
+  // The only controls are the two copy buttons (address, pin): copying changes
+  // nothing on the Host, and no click on this card sends a request.
+  const controls = card.findAll((node) => node.type === 'button')
+  assert.equal(controls.length, 2, 'exactly the address and pin copy buttons')
+  assert.deepEqual(controls.map((node) => node.props.className), ['dshdev-btn', 'dshdev-btn'])
+  assert.deepEqual(controls.map((node) => node.children.join('')), [ui.api.testing.DICT.en.copy, ui.api.testing.DICT.en.copy])
+  await act(async () => { await new Promise((resolve) => setImmediate(resolve)) })
+  assert.equal(ui.calls.some((call) => call.method !== 'GET'), false, 'still no write, no dial')
   page.unmount()
 })
 
 // Connection plan (POST /mgw/listen): the one writer on the Allow tab. It binds
 // the listener to one of this machine's own addresses, so the address and URLs the
 // Listening on card shows must follow the response instead of a config edit.
+// The control is one section inside the "Advanced" disclosure now (the page starts
+// quiet), so every check below opens that disclosure before reading it.
 const PLAN_LAN = { ...LAN_UP, host: '100.64.0.7', urls: ['wss://100.64.0.7:3081/ws/mobile'] }
 const planSelect = (page) => byTestId(page, 'plan-select')[0]
 const planOption = (page, label) => find(page, (node) => node.type === 'option' && node.children.join('') === label)[0]
 const LISTEN = (ui) => ui.calls.filter((call) => call.route === '/mgw/listen')
+// The one disclosure on the Allow tab (the plan and the limits live inside it).
+const advancedToggle = (page) => find(page, (node) => node.type === 'button' && node.props['aria-expanded'] === false)[0]
+const openAdvanced = async (page) => {
+  const toggle = advancedToggle(page)
+  assert.ok(toggle, 'the Advanced disclosure is on the tab, closed')
+  await click(toggle)
+}
 
 await check('connection plan: the current plan is derived from status — loopback, a 100.64 Tailscale address, a private LAN address', async () => {
   const cases = [
@@ -944,6 +1100,7 @@ await check('connection plan: the current plan is derived from status — loopba
     const ui = load({ status: { ...ONLINE, lan, tailscale } })
     const page = await mount(React.createElement(ui.api.testing.AllowTab))
     await flush()
+    await openAdvanced(page)
     assert.equal(planSelect(page).props.value, expected, `${lan.host} is the ${expected} plan`)
     assert.equal(planSelect(page).props.disabled, false, 'a known plan is selectable')
     page.unmount()
@@ -954,6 +1111,7 @@ await check('connection plan: choosing Tailscale sends exactly one POST /mgw/lis
   const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  await openAdvanced(page)
   assert.equal(planSelect(page).props.value, 'loopback')
   ui.calls.length = 0
   await act(async () => { await planSelect(page).props.onChange({ target: { value: 'tailscale' } }) })
@@ -968,7 +1126,9 @@ await check('connection plan: choosing Tailscale sends exactly one POST /mgw/lis
   assert.equal(byTestId(page, 'plan-tailscale-addresses')[0].children.join(''), '100.64.0.7', 'the plain address is secondary text')
   // The read-only card below is updated from the response, not from the next poll.
   assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://100.64.0.7:30081/ws/mobile')
-  assert.equal(byTestId(page, 'listener-reachable').length, 1, 'a Tailscale bind is called reachable')
+  assert.equal(byTestId(page, 'listener-route')[0].children.join(''), ui.api.testing.DICT.en.routeTailscale,
+    'a Tailscale bind is named in the route chip')
+  assert.equal(byTestId(page, 'listener-reachable').length, 0, 'and nothing restates it in prose')
   assert.equal(byTestId(page, 'listener-pin')[0].props.title, PIN, 'the pin still comes from status after the rebind')
   page.unmount()
 })
@@ -977,6 +1137,7 @@ await check('connection plan: without a detected Tailscale interface the option 
   const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: [], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  await openAdvanced(page)
   assert.equal(planOption(page, 'Tailscale private network').props.disabled, true)
   assert.equal(planOption(page, 'LAN').props.disabled, false)
   assert.ok(text(page).includes(ui.api.testing.DICT.en.planTailscaleUnavailable), 'the reason is shown')
@@ -989,6 +1150,7 @@ await check('connection plan: a 409 tailscale/not-detected shows the message, pu
     listenFailure: { status: 409, body: { error: 'tailscale/not-detected', message: 'No Tailscale interface address on this machine.' } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  await openAdvanced(page)
   await act(async () => { await planSelect(page).props.onChange({ target: { value: 'tailscale' } }) })
   assert.equal(byTestId(page, 'plan-error')[0].children.join(''), 'No Tailscale interface address on this machine.')
   assert.match(text(page), /No Tailscale interface address on this machine\./)
@@ -998,12 +1160,28 @@ await check('connection plan: a 409 tailscale/not-detected shows the message, pu
   assert.equal(LISTEN(ui).length, 1, 'the fallback fires no second rebind')
   assert.equal(byTestId(page, 'listener-bind')[0].children.join(''), 'wss://127.0.0.1:3081/ws/mobile', 'the bind did not move')
   page.unmount()
+  // The same refusal on a Vietnamese page: the known reason is named in
+  // Vietnamese instead of pasting the route's English sentence onto the page.
+  const vi = load({ locale: 'vi', status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } },
+    listenFailure: { status: 409, body: { error: 'tailscale/not-detected', message: 'No Tailscale interface address on this machine.' } } })
+  const viPage = await mount(React.createElement(vi.api.testing.AllowTab))
+  await flush()
+  await openAdvanced(viPage)
+  await act(async () => { await planSelect(viPage).props.onChange({ target: { value: 'tailscale' } }) })
+  const viReason = byTestId(viPage, 'plan-error')[0].children.join('')
+  assert.equal(viReason, vi.api.testing.DICT.vi.planErrTailscale, 'the Vietnamese page names the reason in Vietnamese')
+  assert.notEqual(viReason, vi.api.testing.DICT.en.planErrTailscale)
+  assert.equal(text(viPage).includes('No Tailscale interface address on this machine.'), false,
+    'no raw English reason printed on the Vietnamese page')
+  assert.equal(LISTEN(vi).length, 1, 'and still exactly one rebind, no retry')
+  viPage.unmount()
 })
 
 await check('connection plan: two rapid selections cannot put two rebinds in flight', async () => {
   const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  await openAdvanced(page)
   let release
   ui.state.listenGate = new Promise((resolve) => { release = resolve })
   await act(async () => {
@@ -1028,6 +1206,7 @@ await check('connection plan: the LAN option is honest — it names the first pr
   const ui = load({ status: { ...ONLINE, lan: privateLan, tailscale: { addresses: [], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  await openAdvanced(page)
   const planCard = flatText(byTestId(page, 'connection-plan')[0])
   // The distinguishing phrases, not the whole sentence, so the copy can be edited.
   assert.match(planCard, /first private address the operating system reports/)
@@ -1047,6 +1226,7 @@ await check('connection plan: the LAN option is honest — it names the first pr
   const loopback = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: [], urls: [] } } })
   const loopbackPage = await mount(React.createElement(loopback.api.testing.AllowTab))
   await flush()
+  await openAdvanced(loopbackPage)
   assert.equal(byTestId(loopbackPage, 'plan-private-hint').length, 0, 'quiet when there is nothing to say')
   assert.match(flatText(byTestId(loopbackPage, 'plan-bound')[0]), /wss:\/\/127\.0\.0\.1:3081\/ws\/mobile/)
   loopbackPage.unmount()
@@ -1061,6 +1241,7 @@ await check('connection plan: the LAN consent strings exist in vi and en, render
     const lang = locale === 'vi' ? 'vi' : 'en'
     const page = await mount(React.createElement(ui.api.testing.AllowTab))
     await flush()
+    await openAdvanced(page)
     const rendered = flatText(byTestId(page, 'connection-plan')[0])
     for (const key of keys) {
       assert.ok(DICT[lang][key], `${lang} ${key} exists`)
@@ -1077,6 +1258,11 @@ await check('connection plan: every new string exists in vi and en (identical ke
     'planUnknown', 'planTailscaleUnavailable']
   const ui0 = load()
   for (const lang of ['en', 'vi']) for (const key of keys) assert.ok(ui0.api.testing.DICT[lang][key], `${lang} ${key}`)
+  // The refusal reasons are strings too: they exist in both languages even though
+  // they only render after a failed POST (asserted in the 409 test above).
+  for (const lang of ['en', 'vi']) for (const key of ['planErrTailscale', 'planErrLan', 'planErrDisabled']) {
+    assert.ok(ui0.api.testing.DICT[lang][key], `${lang} ${key}`)
+  }
   assert.deepEqual(Object.keys(ui0.api.testing.DICT.vi).sort(), Object.keys(ui0.api.testing.DICT.en).sort(), 'vi and en stay twins')
   for (const locale of ['en-US', 'vi']) {
     const ui = load({ locale, status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
@@ -1089,6 +1275,7 @@ await check('connection plan: every new string exists in vi and en (identical ke
     }
     const page = await mount(React.createElement(ui.api.testing.AllowTab))
     await flush()
+    await openAdvanced(page)
     collect(page)
     // In flight: the "applying" hint. The request is held open so it renders.
     let release
@@ -1102,6 +1289,7 @@ await check('connection plan: every new string exists in vi and en (identical ke
     bare.state.status = null
     const barePage = await mount(React.createElement(bare.api.testing.AllowTab))
     await flush()
+    await openAdvanced(barePage)
     assert.equal(byTestId(barePage, 'plan-select')[0].props.disabled, true, 'no status, no plan')
     collect(barePage)
     barePage.unmount()
@@ -1109,6 +1297,7 @@ await check('connection plan: every new string exists in vi and en (identical ke
     const off = load({ locale, status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: [], urls: [] } } })
     const offPage = await mount(React.createElement(off.api.testing.AllowTab))
     await flush()
+    await openAdvanced(offPage)
     collect(offPage)
     offPage.unmount()
     const missing = keys.filter((key) => !seen.has(key))
@@ -1118,10 +1307,293 @@ await check('connection plan: every new string exists in vi and en (identical ke
   const ui = load({ status: { ...ONLINE, lan: LAN_UP, tailscale: { addresses: ['100.64.0.7'], urls: [] } } })
   const page = await mount(React.createElement(ui.api.testing.AllowTab))
   await flush()
+  await openAdvanced(page)
   await act(async () => { await planSelect(page).props.onChange({ target: { value: 'tailscale' } }) })
   assert.deepEqual([...new Set(ui.calls.map((call) => `${call.method} ${call.route}`))].sort(),
     ['GET /mgw/devices', 'GET /mgw/pending', 'GET /mgw/status', 'POST /mgw/listen'])
   page.unmount()
+})
+
+// --- Qoder-style presentation of the Devices page ---------------------------
+// Presentation only: these checks read the markup this file renders and the one
+// stylesheet it injects. Nothing here adds a route, a timer or a request.
+const roles = (page, role) => find(page, (node) => node.props.role === role)
+const flowOf = (page) => byTestId(page, 'flow')[0]
+const flowNote = (page) => find(page, (node) => node.props.className === 'dshdev-flow-note')[0].children.join('')
+
+await check('settings page: the two tabs are one segmented control — same ids, labels and order, plus one muted subtitle', async () => {
+  const ui = load()
+  const page = await mount(React.createElement(ui.api.testing.DevicesPage))
+  await flush()
+  const { DICT } = ui.api.testing
+  const tabs = roles(page, 'tab')
+  assert.equal(tabs.length, 2, 'still the two tabs, in the same order')
+  assert.deepEqual(tabs.map((tab) => tab.children.join('')), [DICT.en.tabAllow, DICT.en.tabConnect], 'labels unchanged')
+  assert.deepEqual(tabs.map((tab) => tab.props['aria-selected']), [true, false], 'allow is still the default tab')
+  for (const tab of tabs) assert.match(tab.props.className, /dshdev-seg-btn/, 'a pill per tab, not an underline')
+  assert.equal(roles(page, 'tablist').length, 1, 'one tablist role holds them')
+  assert.match(text(page), /Devices/)
+  assert.equal(byTestId(page, 'page-subtitle')[0].children.join(''), DICT.en.subtitle, 'one muted subtitle line')
+  // The pill follows the selection and the other tab is the one that renders.
+  assert.equal(byTestId(page, 'connected-count').length, 0, 'the Allow tab does not carry the remote count')
+  await click(tabs[1])
+  assert.deepEqual(roles(page, 'tab').map((tab) => tab.props['aria-selected']), [false, true])
+  assert.equal(byTestId(page, 'connected-count').length, 1, 'the Connect tab opened')
+  // The subtitle is translated, not copied, and the dictionaries stay twins.
+  const vi = load({ locale: 'vi' })
+  const viPage = await mount(React.createElement(vi.api.testing.DevicesPage))
+  await flush()
+  assert.equal(byTestId(viPage, 'page-subtitle')[0].children.join(''), vi.api.testing.DICT.vi.subtitle)
+  assert.notEqual(vi.api.testing.DICT.vi.subtitle, vi.api.testing.DICT.en.subtitle)
+  assert.deepEqual(Object.keys(vi.api.testing.DICT.vi).sort(), Object.keys(vi.api.testing.DICT.en).sort())
+  page.unmount(); viPage.unmount()
+})
+
+await check('connect tab: the this-device row names the machine /mgw/status reports and counts only online hosts', async () => {
+  const remotes = [
+    { id: 'r1', name: 'Laptop', address: '192.168.1.30:3081', status: 'online', approvals: [] },
+    { id: 'r2', name: 'Studio', address: '192.168.1.31:3081', status: 'online', approvals: [] },
+    { id: 'r3', name: 'Down', address: '192.168.1.32:3081', status: 'offline', approvals: [] },
+    { id: 'r4', name: 'Gone', address: '192.168.1.33:3081', status: 'revoked', approvals: [] },
+  ]
+  const ui = load({ remotes, status: { ...ONLINE, gatewayName: 'Workstation-7' } })
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  assert.equal(byTestId(page, 'this-device-name')[0].children.join(''), 'Workstation-7',
+    'the name this machine already reports, not an invented one')
+  assert.ok(text(page).includes(DICT.en.thisDevice), 'and a chip saying it is this device')
+  assert.equal(byTestId(page, 'connected-count')[0].children.join(''), '2 connected successfully',
+    'only status "online" counts: offline and revoked do not')
+  assert.equal(ui.api.testing.connectedCount(1), '1 connected successfully', 'one connection reads right too')
+  assert.equal(ui.intervals.size, 1, 'the /mgw/status read rides the poll this tab already runs')
+  assert.equal(ui.calls.filter((call) => call.route === '/mgw/status').length >= 1, true)
+  assert.equal(ui.calls.some((call) => /^\/devices\/(?!remotes)/.test(call.route)), false, 'no new /devices route')
+  // A gateway that reports no name falls back to the translated literal.
+  const anonymous = load({ remotes })
+  const anonPage = await mount(React.createElement(anonymous.api.testing.ConnectTab))
+  await flush()
+  assert.equal(byTestId(anonPage, 'this-device-name')[0].children.join(''), anonymous.api.testing.DICT.en.thisDevice)
+  // The count is translated too, with the number in the right place.
+  const vi = load({ locale: 'vi', remotes })
+  const viPage = await mount(React.createElement(vi.api.testing.ConnectTab))
+  await flush()
+  assert.equal(byTestId(viPage, 'connected-count')[0].children.join(''), '2 kết nối thành công')
+  page.unmount(); anonPage.unmount(); viPage.unmount()
+})
+
+await check('connect tab: the flow strip animates only when a real link justifies it — online, connecting, idle', async () => {
+  // The honesty rule: `data-state` is derived from the paired hosts, nothing else.
+  const strip = async (remotes, locale = 'en-US') => {
+    const ui = load({ remotes, locale })
+    const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+    await flush()
+    const info = { state: flowOf(page).props['data-state'], note: flowNote(page),
+      dots: find(page, (node) => node.props.className === 'dshdev-flow-dot').length }
+    page.unmount()
+    return info
+  }
+  const remote = (patch) => ({ id: 'r1', name: 'A', address: '192.168.1.30:3081', status: 'offline', approvals: [], ...patch })
+  const online = await strip([remote({ status: 'online' })])
+  assert.equal(online.state, 'online', 'a host that answers flows')
+  const retrying = await strip([remote({ retry: { attempt: 1, nextAt: Date.now() + 1000 } })])
+  assert.equal(retrying.state, 'connecting', 'a scheduled retry is a link being dialled')
+  assert.equal((await strip([remote({ status: 'connecting' })])).state, 'connecting')
+  // Nothing online at all: no animation, whatever else the rows say.
+  assert.equal((await strip([remote({})])).state, 'idle', 'an offline host is not a live link')
+  assert.equal((await strip([remote({ status: 'revoked' })])).state, 'idle')
+  assert.equal((await strip([])).state, 'idle', 'no paired host is not a live link')
+  // The rule itself, independent of rendering: a dialling link is the louder state.
+  const { flowState } = load().api.testing
+  assert.equal(flowState([{ status: 'online' }, { status: 'offline', retry: { attempt: 2 } }]), 'connecting')
+  assert.equal(flowState([{ status: 'online' }, { status: 'offline' }]), 'online')
+  assert.equal(flowState(null), 'idle', 'a list that does not exist yet is not a connection')
+})
+
+await check('connect tab: idle still draws its dots (static) and the note says which state the strip is in', async () => {
+  // A strip that vanished when nothing is connected would read as "no feature";
+  // idle keeps the grid, dimmed and still.
+  const ui = load()
+  const page = await mount(React.createElement(ui.api.testing.ConnectTab))
+  await flush()
+  const { DICT } = ui.api.testing
+  assert.equal(flowOf(page).props['data-state'], 'idle')
+  const dots = find(page, (node) => node.props.className === 'dshdev-flow-dot')
+  assert.equal(dots.length, 60, 'the 15 x 4 grid is there in every state')
+  // Band + caption: the dots stay in their own fixed-height band and the caption
+  // is a child of the strip, after it, in the DOM (so assistive tech reads it).
+  const [band] = find(page, (node) => node.props.className === 'dshdev-flow-band')
+  assert.ok(band, 'the dots sit in a band of their own')
+  assert.equal(band.findAll((node) => node.props.className === 'dshdev-flow-dot').length, 60, 'the band holds the grid')
+  const [note] = find(page, (node) => node.props.className === 'dshdev-flow-note')
+  assert.ok(note, 'the caption is in the DOM, not only painted')
+  assert.equal(note.props.role, 'status', 'the caption is announced')
+  assert.equal(note.props['aria-live'], 'polite')
+  assert.ok(flowOf(page).children.indexOf(note) > flowOf(page).children.indexOf(band), 'the caption sits under the band')
+  assert.equal(flowNote(page), DICT.en.flowIdle, 'nothing claims to be flowing')
+  assert.ok(DICT.vi.flowIdle && DICT.vi.flowIdle !== DICT.en.flowIdle)
+  page.unmount()
+  // With a host online the same strip says what is happening, and in vi too.
+  const online = { id: 'r1', name: 'A', address: '192.168.1.30:3081', status: 'online', approvals: [] }
+  for (const locale of ['en-US', 'vi']) {
+    const up = load({ remotes: [online], locale })
+    const upPage = await mount(React.createElement(up.api.testing.ConnectTab))
+    await flush()
+    const lang = locale === 'vi' ? 'vi' : 'en'
+    assert.equal(flowOf(upPage).props['data-state'], 'online')
+    assert.equal(flowNote(upPage), up.api.testing.DICT[lang].flowBusy)
+    assert.equal(find(upPage, (node) => node.props.className === 'dshdev-flow-dot').length, 60)
+    upPage.unmount()
+  }
+})
+
+await check('flow strip: fixed-height band with its caption beneath, no idle animation, reduced motion stops it — CSS only, no timer or canvas', () => {
+  // The strip must not move the page when the state or the host count changes:
+  // the dot band is ONE fixed-height row and the caption sits outside it.
+  const bandRule = source.split('\n').find((line) => line.startsWith('.dshdev-flow-band{'))
+  assert.match(bandRule, /height:44px/, 'one fixed-height row')
+  assert.match(bandRule, /overflow:hidden/, 'nothing in the band can grow it')
+  const containerRule = source.split('\n').find((line) => line.startsWith('.dshdev-flow{'))
+  assert.match(containerRule, /flex-direction:column/, 'the caption stacks under the band')
+  assert.doesNotMatch(containerRule, /height:/, 'the band alone owns the fixed height, so the caption never shifts it')
+  // The caption is quiet: muted, small — a caption, not a second heading.
+  const noteRule = source.split('\n').find((line) => line.startsWith('.dshdev-flow-note{'))
+  assert.match(noteRule, /color:\$\{colors\.muted\}/, 'muted')
+  assert.match(noteRule, /font-size:11\.5px/, 'small')
+  // Dots stay legible on a dark theme: an explicit colour and a visible floor,
+  // never fully transparent.
+  const dotRule = source.split('\n').find((line) => line.startsWith('.dshdev-flow-dot{'))
+  assert.match(dotRule, /background:\$\{colors\.accent\}/, 'the dot has its own colour')
+  assert.match(dotRule, /opacity:\.26/, 'a visible floor when still')
+  assert.match(dotRule, /will-change:opacity/)
+  // A pulse exists for online and connecting, and for no other state at all.
+  const ruleOf = (state) => source.split('\n').find((line) => line.startsWith(`.dshdev-flow[data-state=${state}] .dshdev-flow-dot{`))
+  assert.match(ruleOf('online'), /animation:dshdev-flow-pulse/, 'an answering host pulses, gently')
+  assert.match(ruleOf('online'), /2\.8s/, 'gently: the online wave is slow')
+  assert.match(ruleOf('connecting'), /animation:dshdev-flow-pulse 1\.1s/, 'a dialling link pulses faster and brighter')
+  assert.equal(ruleOf('idle'), undefined, 'idle has no rule: the dots do not move')
+  // Accessibility: reduced motion leaves static dots, at every state.
+  assert.match(source, /@media \(prefers-reduced-motion: reduce\)\{\s*\.dshdev-flow \.dshdev-flow-dot\{animation:none!important/)
+  assert.match(source, /@media \(prefers-reduced-motion: reduce\)\{[^}]*\.dshdev-flow \.dshdev-flow-dot\{animation:none!important;opacity:\.26\}/,
+    'reduced motion keeps the visible floor, not a vanishing grid')
+  // The travelling wave is one keyframe plus a per-dot delay, painted by the compositor.
+  assert.match(source, /@keyframes dshdev-flow-pulse\{0%,100%\{opacity:\.22\}45%\{opacity:1\}\}/,
+    'one keyframe: dim to full, never to nothing')
+  assert.match(source, /animationDelay: `\$\{column \* 90 \+ row \* 40\}ms`/, 'each dot starts a little later: one wave')
+  // No scripted animation and no external asset: the glyphs are inline data URIs.
+  assert.doesNotMatch(source, /requestAnimationFrame|<canvas|requestIdleCallback/)
+  assert.equal([...source.matchAll(/--dshdev-glyph:url\("data:image\/svg\+xml,/g)].length, 3,
+    'the three row actions are inline SVG data URIs, not files')
+})
+
+await check('authorized devices: one chip per scope with a count, the ScopePicker\'s dangerous set in amber, a two-row clamp that keeps every chip and opens with aria-expanded, and the last use on its own line in the page language', async () => {
+  const TS = 1_700_000_000_000
+  // The dangerous set is not a second list: it is exactly the scopes the ScopePicker
+  // prints a risk line for, so the chip tooltip and the checkbox hint cannot drift.
+  const { DICT } = load().api.testing
+  const risky = ALL.filter((scope) => typeof DICT.en[`risk.${scope}`] === 'string')
+  assert.equal(risky.length, 9, 'the nine dangerous scopes, as the picker classifies them')
+  const devices = [
+    { id: 'd1', name: 'DNLP25-IT09', displayName: 'DNLP25-IT09', kind: 'desktop', scopes: ALL, createdAt: TS, lastSeenAt: TS, online: true },
+    { id: 'd2', name: 'Pixel 8', displayName: 'Pixel 8', kind: 'mobile', scopes: ['sessions:read', 'prompt:send'], createdAt: TS, lastSeenAt: null, online: false },
+    { id: 'd3', name: 'Old phone', displayName: 'Old phone', kind: 'mobile', scopes: [], createdAt: TS, lastSeenAt: null, online: false },
+  ]
+  const WHEN = { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+  assert.notEqual(new Date(TS).toLocaleString('en-US', WHEN), new Date(TS).toLocaleString('vi-VN', WHEN),
+    'the two page languages really format a date differently')
+  for (const [locale, lang, tag] of [['en-US', 'en', 'en-US'], ['vi', 'vi', 'vi-VN']]) {
+    const ui = load({ locale, devices, status: { remoteControl: { enabled: true, accepting: true }, lan: { listening: true, urls: [] } } })
+    const { DICT } = ui.api.testing
+    const page = await mount(React.createElement(ui.api.testing.AllowTab))
+    await flush()
+    const items = byTestId(page, 'authorized-item')
+    assert.equal(items.length, 3)
+    const chipsOf = (item) => item.findAll((node) => typeof node.type === 'string' && typeof node.props['data-scope'] === 'string')
+    const areaOf = (item) => item.findAll((node) => typeof node.type === 'string' && /^dshdev-scopes( |$)/.test(String(node.props.className || '')))[0]
+    const toggleOf = (item) => item.findAll((node) => node.type === 'button' && node.props.className === 'dshdev-scopes-toggle')[0]
+    const whenOf = (item) => item.findAll((node) => node.props['data-testid'] === 'last-used')[0].children.join('')
+
+    // The owner's real case: 14 granted scopes, 14 chips, in the granted order.
+    assert.deepEqual(chipsOf(items[0]).map((node) => node.props['data-scope']), ALL, `${lang}: every scope is its own chip`)
+    assert.equal(byTestId(page, 'scope-count')[0].children.join(''), DICT[lang].scopeCount.replace('{{n}}', '14'),
+      `${lang}: the count labels the list`)
+    for (const chip of chipsOf(items[0])) {
+      const scope = chip.props['data-scope']
+      const flagged = / dshdev-scope risk|^dshdev-scope risk$/.test(String(chip.props.className))
+      assert.equal(flagged, risky.includes(scope), `${lang}: ${scope} carries the amber flag only when the picker calls it dangerous`)
+      // No new copy: the tooltip is the very sentence the checkbox prints.
+      assert.equal(chip.props.title, risky.includes(scope) ? DICT[lang][`risk.${scope}`] : undefined)
+    }
+
+    // Clamped to about two rows, and every chip stays in the DOM (CSS only).
+    assert.match(String(areaOf(items[0]).props.className), /clamped/, `${lang}: 14 chips clamp`)
+    assert.equal(chipsOf(items[0]).length, ALL.length, `${lang}: clamping removes nothing`)
+    assert.equal(toggleOf(items[0]).props['aria-expanded'], false)
+    assert.equal(toggleOf(items[0]).children.join(''), DICT[lang].showAllScopes.replace('{{n}}', '14'))
+    await click(toggleOf(items[0]))
+    assert.equal(toggleOf(items[0]).props['aria-expanded'], true, `${lang}: the toggle says it is open`)
+    assert.doesNotMatch(String(areaOf(items[0]).props.className), /clamped/, `${lang}: open means no clamp`)
+    assert.equal(toggleOf(items[0]).children.join(''), DICT[lang].showLessScopes)
+    assert.equal(chipsOf(items[0]).length, ALL.length, `${lang}: opening is not a second render of the list`)
+    await click(toggleOf(items[0]))
+    assert.match(String(areaOf(items[0]).props.className), /clamped/, `${lang}: and it closes again`)
+
+    // A short grant has nothing to open; an empty one says so without a chip.
+    assert.equal(toggleOf(items[1]), undefined, `${lang}: two scopes never clamp`)
+    assert.equal(chipsOf(items[1]).length, 2)
+    assert.equal(chipsOf(items[2]).length, 0)
+    assert.equal(items[2].findAll((node) => node.props['data-testid'] === 'scope-count')[0].children.join(''),
+      DICT[lang].scopeCount.replace('{{n}}', '0'))
+
+    // Last use: its own row under the chips, formatted for the page's language.
+    assert.equal(whenOf(items[0]), new Date(TS).toLocaleString(tag, WHEN), `${lang}: date and time, compact`)
+    assert.equal(whenOf(items[1]), DICT[lang].never, `${lang}: a device never seen says so`)
+    const meta = items[0].findAll((node) => node.props.className === 'dshdev-item-meta')
+    assert.equal(meta.length, 1, 'one row of its own, not part of the chip area')
+    assert.equal(meta[0].children[0].children.join(''), DICT[lang].lastUsed, 'with its muted label')
+    page.unmount()
+  }
+})
+
+await check('authorized devices and the host popover: presentation is CSS + markup only — no scope list is printed as a comma sentence anywhere', () => {
+  // No scope list survives as prose: the two places that built one now share the chips.
+  assert.doesNotMatch(source, /map\(\(scope\) => tr\(`scope\.\$\{scope\}`\)\)\.join/, 'no joined scope sentence')
+  assert.doesNotMatch(source, /`\$\{tr\('scopes'\)\}: /, 'no "Permissions: …" line')
+  // A rule may be written over several lines (the file already does that) and it
+  // carries `${colors.x}` placeholders, so walk the braces instead of splitting on
+  // the first `}` — a placeholder's own brace is not the end of the rule.
+  const rule = (selector) => {
+    const start = source.indexOf(`${selector}{`)
+    assert.ok(start >= 0, `no rule for ${selector}`)
+    const text = source.slice(start)
+    let depth = 0
+    for (let i = 0; i < text.length; i += 1) {
+      if (text[i] === '$' && text[i + 1] === '{') {
+        i = text.indexOf('}', i) // a placeholder never nests a brace
+        continue
+      }
+      if (text[i] === '{') depth += 1
+      else if (text[i] === '}') {
+        depth -= 1
+        if (depth === 0) return text.slice(0, i + 1)
+      }
+    }
+    return text
+  }
+  // The clamp is a rule, not a slice: the chips stay in the DOM for assistive tech.
+  const clamp = rule('.dshdev-scopes.clamped')
+  assert.match(clamp, /max-height:50px/, 'about two 22px rows')
+  assert.doesNotMatch(clamp, /display:none|visibility:hidden/)
+  assert.match(rule('.dshdev-item.dshdev-item-stack'), /display:block/, 'header line above, body across the card below')
+  assert.match(rule('.dshdev-item-top'), /flex-wrap:wrap/, 'the actions wrap under the name instead of squeezing it')
+  assert.match(rule('.dshdev-item-main'), /flex:1 1 180px/, 'a basis, so a narrow card breaks lines rather than crushing the text')
+  const chip = rule('.dshdev-scope')
+  assert.match(chip, /border-radius:999px/); assert.match(chip, /font-size:11\.5px/)
+  assert.match(chip, /border:1px solid \$\{colors\.border\}/); assert.match(chip, /background:\$\{colors\.hover\}/)
+  assert.match(chip, /white-space:nowrap/, 'a chip never wraps mid-label')
+  // Amber comes from the theme's warn colour, so it follows the theme like the badges do.
+  assert.match(rule('.dshdev-scope.risk'), /colors\.warn/)
+  assert.doesNotMatch(source, /https?:\/\/[^\s'"`]+\.(?:png|jpg|svg|woff2?)/, 'no new asset')
 })
 
 finish('client')

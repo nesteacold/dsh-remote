@@ -1,0 +1,40 @@
+# SUBFLOW — pair by pasting the code (the automated alternative to scanning the QR).
+#
+# PREREQUISITES
+#   * `PAIR_QR` env var: the pairing code text from the fixture (`GET /state` → `pairing.qr`) or
+#     from the real gateway UI. It is unpadded base64url, so `inputText` needs no escaping.
+#   * Codes are **single-use** and expire in ≤ 5 min. Rotate before every run:
+#       POST <controlUrl>/pairing/new   (header x-fixture-token)
+#   * `launchApp` with `permissions: { camera: deny }` keeps the screen deterministic: with the
+#     camera denied the pair screen renders the "Allow camera" notice plus the paste field, and
+#     no CameraView (a live preview makes screenshots and taps non-deterministic).
+#   * `pair-submit` is `disabled` while the field is empty (`app/pair.tsx`), so asserting
+#     `enabled: true` after `inputText` is the "the paste landed" proof. That is deliberate: the
+#     pairing code is **never** echoed into a matcher (FR-011), where it would also become an
+#     unescaped regex fragment and end up in Maestro's selector log.
+
+appId: com.dshext.companion
+---
+# Reach the pair screen from the sessions screen (empty state shows the CTA).
+- runFlow:
+    when:
+      visible: ".*(Pair a computer|Ghép đôi máy tính).*"
+    commands:
+      - tapOn: ".*(Pair a computer|Ghép đôi máy tính).*"
+
+- assertVisible: ".*(Pair your computer|Ghép đôi máy tính).*"
+
+# 1) Focus the paste field by hook — no placeholder / hintText semantics involved.
+- tapOn:
+    id: "pair-manual-input"
+
+# 2) Paste the one-time code; the field must have taken it (submit stays disabled until it has).
+- inputText: ${PAIR_QR}
+- assertVisible:
+    id: "pair-submit"
+    enabled: true
+- hideKeyboard
+
+# 3) Submit by hook: cannot hit the "Pair your computer" heading instead.
+- tapOn:
+    id: "pair-submit"

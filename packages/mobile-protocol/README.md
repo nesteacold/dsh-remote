@@ -8,7 +8,8 @@ package so they cannot drift apart silently; the normative definition is
 (**revision 2**: client frames use `type` + `requestId`, server frames use `kind` and echo
 `requestId`; **revision 3** adds device `kind`/`scopes` and `auth/forbidden-scope`,
 `specs/005-remote-desktop-client/spec.md`; **revisions 4–5** add the spec 008 remote bridge and its
-scopes, additive), and a breaking change requires a new major version of
+scopes, additive; **revision 7** adds the spec 011 `sessions:author` scope and the four
+session-authoring ops, additive), and a breaking change requires a new major version of
 this package.
 
 - Runtime: `src/index.mjs` — pure ESM, no dependencies, frozen constant tables.
@@ -22,7 +23,7 @@ this package.
 | `PROTOCOL_SUBPROTOCOL` (`dsh-mobile-v1`), `SUBPROTOCOL_PREFIXES`, `DEVICE_ID_HEADER`, `pairingSubprotocols()`, `authSubprotocols()`, `deviceSubprotocol()` | §1, §3 |
 | `COMPANION_PROTOCOL_VERSION` (1), `MIN_CLIENT_VERSION` (1), `CLOSE_CODES` (4004/4003/4401) | §3 |
 | `PAIRING_QR_VERSION` (3) | §2 |
-| `OPS` (the §4 `type` column, in table order), `OP_RESPONSES` (§4 response `kind` column) | §4 |
+| `OPS` (the §4 `type` column, in table order, then the four spec 011 authoring ops), `OP_RESPONSES` (§4 response `kind` column, plus the authoring kinds) | §4 |
 | `CAPABILITIES`, `OPTIONAL_CAPABILITIES` (`push-v1`) | §3.5 |
 | `ERROR_CODES` (code → upgrade HTTP status, `null` where the table shows `—`), `PASSTHROUGH_ERROR_CODES` | §6 |
 | `APPROVAL_OUTCOMES_CLIENT`, `APPROVAL_OUTCOMES_FINAL`, `RECEIPT_REASONS` | §5 |
@@ -30,11 +31,16 @@ this package.
 | `DEVICE_KINDS`, `SCOPES`, `DESKTOP_DEFAULT_SCOPES`, `SCOPE_BY_TYPE`, `auth/forbidden-scope` | spec 005 FR2/FR3/FR6 |
 | `harness:remote` (scope), `REMOTE_CLIENT_TYPES`, `REMOTE_SERVER_KINDS`, `REMOTE_STREAM_DEFAULT_CREDIT`, `REMOTE_BINARY_CHUNK_BYTES` | spec 008 (revision 4, additive; remote-bridge channel, not §4 ops) |
 | `commands:execute`, `workspace:manage`, `credentials:write`, `plugins:manage`, `schedule:write`, `terminal` (scopes), `DESKTOP_ONLY_SCOPES`, `SCOPE_PRESETS` (`standard`, `full`) | spec 008 "full control" (revision 5, additive) |
+| `sessions:author` (scope), `AUTHORING_CLIENT_TYPES`, `AUTHORING_SCOPE` | spec 011 (revision 7, additive; `workspaces`, `session-create`, `models`, `select-model`) |
 
 The spec 008 scopes (`harness:remote` and the six above) are **desktop-only and explicit-only**: none
 is in `DESKTOP_DEFAULT_SCOPES`, and a `mobile` or pre-005 record never holds one.
 `SCOPE_PRESETS.standard` = `sessions:read`, `prompt:send`, `approval:respond`, `files:read`,
 `harness:remote`; `SCOPE_PRESETS.full` = every desktop scope.
+
+`sessions:author` (spec 011) is **explicit-only** like the spec 008 scopes (never in
+`DESKTOP_DEFAULT_SCOPES`) but deliberately **not desktop-only**: a `mobile` device may hold it,
+and it is what gates the four authoring ops.
 
 ## Tests
 

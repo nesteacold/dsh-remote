@@ -17,6 +17,7 @@
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -29,9 +30,6 @@ import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const DEV_A = 'fence0000-0000-4000-8000-00000000000a'
 const DEV_B = 'fence0000-0000-4000-8000-00000000000b'
-// WHATWG fetch refuses a few "bad ports"; re-listen until the ephemeral port is usable.
-const FETCH_BAD_PORTS = new Set([1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566,
-  6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080])
 
 async function factory(t, options = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-fence-'))
@@ -48,11 +46,9 @@ async function factory(t, options = {}) {
     res.writeHead(404).end()
   })
   server.on('upgrade', (req, socket, head) => { if (upgrade) upgrade.handler(req, socket, head); else socket.destroy() })
-  for (;;) {
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-    if (!FETCH_BAD_PORTS.has(server.address().port)) break
-    await new Promise((resolve) => server.close(resolve))
-  }
+  // WHATWG fetch refuses a few "bad ports"; the helper re-binds until the
+  // ephemeral port is one `fetch` accepts (test/support/fetch-safe-listen.mjs).
+  await listenFetchSafe(server)
   const port = server.address().port
   const ctx = {
     webServer: {
@@ -405,9 +401,10 @@ test('C5: the owner/admin channel is not negotiated and keeps working (loopback/
 
 test('D1: the op/forbidden refusal never echoes a malformed requestId and still echoes a valid one', async (t) => {
   const instance = await factory(t)
-  // `workspaces` is not a companion-v1 op, so the dispatcher's op/forbidden
+  // `plugin-catalog` is not a companion-v1 op, so the dispatcher's op/forbidden
   // branch answers it — BEFORE the framing fence, which is exactly why that
-  // branch has to validate the id it would reflect.
+  // branch has to validate the id it would reflect. (Spec 011: `workspaces` used
+  // to play this part, but it is a SCOPED op now, so the fence answers it first.)
   const layout = await pairDevice(instance, DEV_A, { scopes: [] })
   const ws = await connectToken(instance, layout.token, DEV_A)
   await negotiate(ws)
@@ -415,15 +412,15 @@ test('D1: the op/forbidden refusal never echoes a malformed requestId and still 
   for (const id of ['ctrl\u0001id', 'a'.repeat(65), 'has space', 'unicode-é']) {
     // Only frames that arrive AFTER this send (the buffer is shared).
     const from = seen.length
-    ws.send(JSON.stringify({ type: 'workspaces', requestId: id }))
+    ws.send(JSON.stringify({ type: 'plugin-catalog', requestId: id }))
     const refused = await take(ws, (frame, index) => index >= from && frame.kind === 'error' && frame.code === 'op/forbidden')
-    assert.equal(refused.requestType, 'workspaces')
+    assert.equal(refused.requestType, 'plugin-catalog')
     assert.equal('requestId' in refused, false, `a malformed id must not be reflected: ${JSON.stringify(id)}`)
   }
   // The branch itself is unchanged for a well-formed id (no over-narrowing).
-  ws.send(JSON.stringify({ type: 'workspaces', requestId: 'ok-1_2.3' }))
+  ws.send(JSON.stringify({ type: 'plugin-catalog', requestId: 'ok-1_2.3' }))
   const echoed = await take(ws, (frame) => frame.kind === 'error' && frame.code === 'op/forbidden' && frame.requestId === 'ok-1_2.3')
-  assert.equal(echoed.requestType, 'workspaces')
+  assert.equal(echoed.requestType, 'plugin-catalog')
 })
 
 // The remaining pre-fence refusals (remote-control disabled, the auth/required

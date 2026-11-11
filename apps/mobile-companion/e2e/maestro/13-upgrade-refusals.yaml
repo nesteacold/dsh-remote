@@ -1,0 +1,65 @@
+# 13 — HTTP upgrade refusals map to distinct user-visible states (contract §6, A034).
+#
+# This is the **A034 checkpoint**: "confirm URLSession exposes handshake status for 401/403
+# mapping". The app maps a refused upgrade to `auth/required` (401) or `remote/disabled` (403)
+# (`src/platform/pinned-transport.ts`). The two errors must produce *different* copy — if the
+# native layer loses the status, both collapse into `client/upgrade-failed` and the user sees the
+# generic pairing error instead. So the assertion is the specific text, not "an error happened".
+#
+# EXPECTED TEXT MATRIX (what proves the mapping):
+#   401 → `pair.error.expired`          → "This pairing code expired or was already used…"
+#   403 → `pair.error.remoteDisabled`   → "Remote control is off on your computer…"
+#   status lost → `pair.error.generic`  → "Pairing failed. Show a new code and try again."
+#
+# SCENARIO: fixture armed with `POST /scenario/upgrade-status {status:401}` (or 403) before launch;
+#           the orchestrator runs this flow twice, once per status.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: the error copy is the observable here — the pair screen's error box has no `testID`
+#        (documented gap), so this flow stays text-matched in both locales on purpose.
+#
+# EXIT CRITERIA:
+#   1. the 401 run shows the expired/used copy and NOT the remote-control copy;
+#   2. the 403 run shows the remote-control copy and NOT the expired/used copy;
+#   3. neither run shows the generic "Pairing failed" copy — that would mean the status was lost;
+#   4. `GET /state` recorded one refused upgrade with the expected status (orchestrator).
+
+appId: com.dshext.companion
+env:
+  PAIR_QR: ${PAIR_QR}
+  # Set by the orchestrator: 401 or 403.
+  EXPECTED_UPGRADE_STATUS: ${EXPECTED_UPGRADE_STATUS}
+---
+- launchApp:
+    clearState: true
+    clearKeychain: true
+    permissions:
+      camera: deny
+
+- runFlow: subflows/unlock.yaml
+- tapOn: ".*(Pair a computer|Ghép đôi máy tính).*"
+
+- runFlow: subflows/pair-paste.yaml
+
+- extendedWaitUntil:
+    visible: ".*(Could not pair|Không ghép đôi được).*"
+    timeout: 30000
+
+# 401: expired / already used. 403: remote control off. Anchored to the status under test so a
+# regression that collapses both into the generic message fails here.
+- runFlow:
+    when:
+      true: ${EXPECTED_UPGRADE_STATUS == 401}
+    commands:
+      - assertVisible: ".*(This pairing code expired or was already used|Mã ghép đôi đã hết hạn hoặc đã dùng).*"
+      - assertNotVisible: ".*(Remote control is off on your computer|Điều khiển từ xa đang tắt trên máy tính).*"
+
+- runFlow:
+    when:
+      true: ${EXPECTED_UPGRADE_STATUS == 403}
+    commands:
+      - assertVisible: ".*(Remote control is off on your computer|Điều khiển từ xa đang tắt trên máy tính).*"
+      - assertNotVisible: ".*(This pairing code expired or was already used|Mã ghép đôi đã hết hạn hoặc đã dùng).*"
+
+# The status was not lost: never the generic fallback.
+- assertNotVisible: ".*(Pairing failed. Show a new code and try again|Ghép đôi thất bại. Hãy hiển thị mã mới và thử lại).*"

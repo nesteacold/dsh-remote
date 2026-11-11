@@ -1,0 +1,46 @@
+# 08 — forced network drop and bounded-backoff reconnect (US5, A016, SC-005).
+#
+# PLATFORM: **Android only as written.** `setAirplaneMode` is an Android-only command; on iOS the
+#           simulator has no airplane mode and Maestro passes the command as a no-op (which would
+#           make this flow assert on a connection that never dropped). The iOS equivalent is the
+#           orchestrator's `/scenario/drop` (server-side socket kill) plus the banner assertions:
+#           see docs/device-validation.md §4, checkpoint T-08 and §5.4.
+#
+# PREQUISITES: paired, on the session list, driven over a **local emulator** (airplane mode kills
+#               Wi-Fi; if you run Maestro over adb-over-network the test would disconnect itself).
+# MANUAL:      biometric prompt only.
+#
+# HOOK: `banner` (present on both screens, `app/index.tsx` / `app/session/[id].tsx`). The hook
+#       decides *whether* a banner is up; the localised copy decides *which* banner it is — both
+#       are asserted, so a locally changed string cannot make "no banner" look like a pass.
+#
+# EXIT CRITERIA:
+#   1. the reconnecting banner appears (hook + copy) while the link is down;
+#   2. the banner clears after the link returns, without an app restart;
+#   3. the fixture ends with exactly one open connection (orchestrator assertion) — i.e. the retry
+#      loop did not fork a second socket;
+#   4. the session list is intact and no duplicate message row appears.
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+- assertVisible:
+    id: "session-row-sess-alpha"
+
+- setAirplaneMode: enabled
+- extendedWaitUntil:
+    visible:
+      id: "banner"
+    timeout: 30000
+- assertVisible: ".*(Reconnecting|Đang kết nối lại).*"
+
+- setAirplaneMode: disabled
+# The banner is only rendered while `snapshot.banner !== 'none'`.
+- extendedWaitUntil:
+    notVisible:
+      id: "banner"
+    timeout: 60000
+- assertNotVisible: ".*(Reconnecting|Đang kết nối lại).*"
+- assertVisible:
+    id: "session-row-sess-alpha"

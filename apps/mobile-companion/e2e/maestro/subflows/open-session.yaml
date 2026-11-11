@@ -1,0 +1,41 @@
+# SUBFLOW — open the fixture session that carries the approval under test.
+#
+# PREREQUISITES
+#   * paired and connected (subflows/unlock.yaml → subflows/pair-paste.yaml);
+#   * `SESSION_ID`: the fixture session id to open (`sess-alpha` / `sess-beta` / `sess-gamma`,
+#     see `e2e/harness/gateway.mjs` BASE_SESSIONS). It is used as the `session-row-<id>` hook,
+#     so it must be regex-safe (see "Test hooks" in `e2e/README.md`);
+#   * `SESSION_TAB`: the tab *fragment* the row lives in — `running` / `idle` / `archived`
+#     (`app/index.tsx` renders `sessions-tab-<tab>`), not the tab's localised label;
+#   * `SESSION_TITLE`: the row title the fixture serves (`projections.values.title`, A046).
+#
+# Exit state: the session screen of that session is open (composer hook visible).
+
+appId: com.dshext.companion
+env:
+  SESSION_ID: sess-alpha
+  SESSION_TAB: running
+  SESSION_TITLE: Refactor gateway TLS
+---
+# Spec 011 P1-A: the app opens on the Workspace home tab; the session list lives under Conversations.
+# Tapping an already-selected tab is a no-op, so this is safe for flows that are already there.
+- tapOn:
+    id: "tab-conversations"
+- tapOn:
+    id: "sessions-tab-${SESSION_TAB}"
+
+# The row hook (`app/index.tsx` renders session-row-<session id>): stable across title copy,
+# locale and row order, unlike the row's text.
+- assertVisible:
+    id: "session-row-${SESSION_ID}"
+# …and the title itself, which proves the canonical projection mapping (A046).
+- assertVisible: ".*${SESSION_TITLE}.*"
+
+- tapOn:
+    id: "session-row-${SESSION_ID}"
+
+# The composer only renders on the session screen; the composer hook is its stable anchor.
+- extendedWaitUntil:
+    visible:
+      id: "session-composer"
+    timeout: 20000

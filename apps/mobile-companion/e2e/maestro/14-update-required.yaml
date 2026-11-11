@@ -1,0 +1,64 @@
+# 14 — protocol mismatch is a terminal, actionable state (FR-004, N7/A050).
+#
+# `classifyProtocolUnsupported` (src/core/client.ts) splits the mismatch by *which side is older*:
+#   minClientVersion > COMPANION_PROTOCOL_VERSION  → side 'app'  → "Update DSH Companion"
+#   otherwise (host speaks an older protocol)      → side 'host' → "Update DSH on your computer"
+# The app decides this from `hello` and **never sends `client-hello`** in the 'app' case, so the
+# orchestrator asserts `clientHellos === 0` there: proving the handshake stopped, not that some
+# later error happened to be rendered.
+#
+# SCENARIO: paired; fixture armed before launch (see EXPECTED_UPDATE_SIDE):
+#   app-older : POST /scenario/protocol {companionProtocol:2, minClientVersion:2}
+#   host-older: POST /scenario/protocol {companionProtocol:0, minClientVersion:1}
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: the update overlay has no `testID` (documented gap: `app/_layout.tsx`), so its copy and
+#        buttons stay text-matched; "the session list is not reachable underneath" is asserted
+#        structurally with the `session-row-sess-alpha` hook being absent.
+#
+# EXIT CRITERIA:
+#   1. the update-required overlay names the correct side for the scenario;
+#   2. it states the protocol version it was told about;
+#   3. it offers both actions (Retry, "Pair a different computer");
+#   4. the session list is not left visible underneath as if the connection were healthy.
+
+appId: com.dshext.companion
+env:
+  # Set by the orchestrator: app | host.
+  EXPECTED_UPDATE_SIDE: app
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+# The app is older than the host: it must ask for a new build of itself.
+- runFlow:
+    when:
+      true: ${EXPECTED_UPDATE_SIDE == "app"}
+    commands:
+      - extendedWaitUntil:
+          visible: ".*(Update DSH Companion|Cập nhật DSH Companion).*"
+          timeout: 30000
+      - assertVisible: ".*(Your computer needs a newer version of this app|Máy tính cần bản ứng dụng mới hơn).*"
+      - assertVisible: ".*(Protocol version 2|Phiên bản giao thức 2).*"
+      - assertNotVisible: ".*(Update DSH on your computer|Cập nhật DSH trên máy tính).*"
+
+# The host is older than the app: the desktop must be updated instead.
+- runFlow:
+    when:
+      true: ${EXPECTED_UPDATE_SIDE == "host"}
+    commands:
+      - extendedWaitUntil:
+          visible: ".*(Update DSH on your computer|Cập nhật DSH trên máy tính).*"
+          timeout: 30000
+      - assertVisible: ".*(Your computer speaks an older protocol|Máy tính dùng giao thức cũ hơn).*"
+      - assertVisible: ".*(Protocol version 1|Phiên bản giao thức 1).*"
+      - assertNotVisible: ".*(Your computer needs a newer version of this app|Máy tính cần bản ứng dụng mới hơn).*"
+
+# Both actions are offered in either case.
+- assertVisible: "^Retry$|^Thử lại$"
+- assertVisible: ".*(Pair a different computer|Ghép đôi máy tính khác).*"
+
+# The overlay is modal: the session list is not reachable underneath it.
+- assertNotVisible:
+    id: "session-row-sess-alpha"

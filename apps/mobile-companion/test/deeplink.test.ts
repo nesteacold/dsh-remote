@@ -23,11 +23,14 @@ describe('sessionDeepLink / parseSessionDeepLink', () => {
     assert.deepEqual(parseSessionDeepLink(link), { sessionId: 'a/b c', approvalId: 'x&y=z' });
   });
 
-  it('accepts a trailing-slash form produced by URL normalisation', () => {
-    assert.deepEqual(parseSessionDeepLink('dshcompanion:///s/session-abc?a=ap-2'), {
-      sessionId: 'session-abc',
-      approvalId: 'ap-2',
-    });
+  it('accepts both documented forms: host `s` and a leading `/s` path segment', () => {
+    // The app advertises `dshcompanion://s/<id>`, but the platform can hand the same link over as
+    // `dshcompanion:///s/<id>` (empty host, `s` as the first path segment) — that is the form the
+    // Android device report produced. Both must parse to the same session.
+    for (const url of ['dshcompanion://s/session-abc', 'dshcompanion:///s/session-abc']) {
+      assert.deepEqual(parseSessionDeepLink(url), { sessionId: 'session-abc', approvalId: null }, url);
+      assert.deepEqual(parseSessionDeepLink(`${url}?a=ap-2`), { sessionId: 'session-abc', approvalId: 'ap-2' }, url);
+    }
   });
 
   it('rejects links that are not companion session links', () => {
@@ -36,6 +39,8 @@ describe('sessionDeepLink / parseSessionDeepLink', () => {
       'dshcompanion://pair',
       'dshcompanion://s',
       'dshcompanion://s/',
+      'dshcompanion:///s',
+      'dshcompanion:///s/',
       'not a url',
       'dshcompanion://s/%E0%A4%A',
     ]) {

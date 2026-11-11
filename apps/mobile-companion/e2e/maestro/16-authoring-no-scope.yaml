@@ -1,0 +1,39 @@
+# 16 — a device WITHOUT `sessions:author` cannot author, and says so honestly.
+#
+# SCENARIO: paired, ready socket, `hello.device.scopes = ["sessions:read"]` — no authoring grant.
+#           The orchestrator arms it with `POST /scenario/scopes {"scopes":["sessions:read"]}`
+#           immediately before this flow.
+# HARNESS:  `--cert-mode ok`.
+# MANUAL:   biometric prompt only.
+#
+# HOOKS: `new-session` (must be DISABLED — the enabled state is the assertion, so no copy matching
+#        is needed for the control itself) and `new-session-reason` (the line that names WHY).
+#        The reason's copy is still matched in both locales because *which* reason it is matters:
+#        "not granted" must never be shown for a connection problem.
+#
+# EXIT CRITERIA:
+#   1. the action is disabled and the visible reason is the permission one;
+#   2. the app never navigates to a conversation (no `session-composer`);
+#   3. NO authoring frame reaches the Host — not `session-create`, and not even the `workspaces`
+#      read, because the home only fetches the picker once the grant is present
+#      (asserted by the orchestrator from `GET /state` → `evidence.authoringRequests`).
+
+appId: com.dshext.companion
+---
+- launchApp
+- runFlow: subflows/unlock.yaml
+
+- extendedWaitUntil:
+    visible:
+      id: "new-session-reason"
+    timeout: 30000
+- assertVisible:
+    id: "new-session"
+    enabled: false
+- assertVisible: ".*(not granted permission to create sessions|chưa được cấp quyền tạo phiên).*"
+
+# Disabled means nothing happened: no navigation, no conversation.
+- assertVisible:
+    id: "workspace-home"
+- assertNotVisible:
+    id: "session-composer"

@@ -16,6 +16,7 @@ import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import http from 'node:http'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import os from 'node:os'
 import path from 'node:path'
 import { once } from 'node:events'
@@ -40,7 +41,9 @@ async function factory(t, config = {}) {
     res.writeHead(404).end()
   })
   server.on('upgrade', (req, socket, head) => { if (upgrade) upgrade.handler(req, socket, head); else socket.destroy() })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  // fetch-safe: undici refuses a whole class of ports ("bad port"), and the OS is
+  // free to hand this listener one; the helper re-binds until `fetch` accepts it.
+  await listenFetchSafe(server)
   const port = server.address().port
   const ctx = {
     webServer: {

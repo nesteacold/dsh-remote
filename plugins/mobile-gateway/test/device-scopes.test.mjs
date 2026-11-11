@@ -1,6 +1,6 @@
 // Spec 005 FR1/FR3 — the device record carries `kind` and `scopes`, and a record
-// written before they existed still loads as a mobile device with every scope
-// (T3), so an already-paired phone keeps working after the upgrade.
+// written before they existed still loads as a mobile device with the historical
+// mobile grant (T3), so an already-paired phone keeps working after the upgrade.
 //
 // Security review (D006): that migration is the ONLY thing a restart may widen.
 // A scope list the owner did write is read literally (empty and unknown-only stay
@@ -15,14 +15,19 @@ import { test } from 'node:test'
 import { createRegistry, digest } from '../lib/devices.js'
 import { scopeDenial } from '../lib/allowlist.mjs'
 import {
-  DESKTOP_DEFAULT_SCOPES, DESKTOP_ONLY_SCOPES, DEVICE_KINDS, REMOTE_CLIENT_TYPES, SCOPES as CONTRACT_SCOPES, SCOPE_BY_TYPE,
+  DESKTOP_DEFAULT_SCOPES, DESKTOP_ONLY_SCOPES, DEVICE_KINDS, NEVER_DEFAULT_SCOPES, REMOTE_CLIENT_TYPES,
+  SCOPES as CONTRACT_SCOPES, SCOPE_BY_TYPE,
 } from '@dsh-ext/mobile-protocol'
 
-// "Every scope" of a mobile device / a migrated pre-005 record is the six spec 005
-// scopes. The spec 008 scopes (`harness:remote` and the full-control families) are
-// explicit-only and desktop-only, so they are never part of that full grant
-// (asserted below).
+// "Every scope" of a mobile device / a migrated pre-005 record is the seven spec
+// 005/011 scopes. The spec 008 scopes (`harness:remote` and the full-control
+// families) are explicit-only and desktop-only, so they are never part of that
+// full grant (asserted below). The migration grant is narrower than that list: see
+// MOBILE_DEFAULT_SCOPES.
 const SCOPES = CONTRACT_SCOPES.filter((scope) => !DESKTOP_ONLY_SCOPES.includes(scope))
+// Spec 011 FR-006: `sessions:author` is grantable to a mobile device but is never
+// part of a DEFAULT grant (offer or migration); the contract's own list decides.
+const MOBILE_DEFAULT_SCOPES = SCOPES.filter((scope) => !NEVER_DEFAULT_SCOPES.includes(scope))
 
 function tempRegistry(t, options) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-005-devices-'))
@@ -44,17 +49,23 @@ function storedRecord(overrides = {}) {
   }
 }
 
-test('a pairing defaults to a mobile device with every scope', (t) => {
+test('a pairing defaults to a mobile device with every scope the defaults allow', (t) => {
   const { file, options } = tempRegistry(t)
   const registry = createRegistry(file, options)
   const pairing = registry.createPairing('Phone A')
   assert.equal(pairing.kind, 'mobile')
-  assert.deepEqual(pairing.scopes, [...SCOPES])
+  assert.deepEqual(pairing.scopes, [...MOBILE_DEFAULT_SCOPES])
+  // Spec 011 FR-006: the author scope is grantable here, but never by default.
+  assert.equal(pairing.scopes.includes('sessions:author'), false, 'sessions:author must be an explicit tick')
+  for (const scope of NEVER_DEFAULT_SCOPES) assert.equal(pairing.scopes.includes(scope), false, scope)
   const claimed = registry.claimPairing(pairing.code, 'phone-0001')
   assert.equal(claimed.device.kind, 'mobile')
-  assert.deepEqual(claimed.device.scopes, [...SCOPES])
-  assert.deepEqual(registry.list()[0].scopes, [...SCOPES])
+  assert.deepEqual(claimed.device.scopes, [...MOBILE_DEFAULT_SCOPES])
+  assert.deepEqual(registry.list()[0].scopes, [...MOBILE_DEFAULT_SCOPES])
   assert.equal(registry.list()[0].kind, 'mobile')
+  // An explicit offer naming it is taken literally (the defaults narrow only defaults).
+  const explicit = registry.createPairing('Phone B', { scopes: ['sessions:read', 'sessions:author'] })
+  assert.deepEqual(explicit.scopes, ['sessions:read', 'sessions:author'])
 })
 
 test('a desktop offer keeps DESKTOP_DEFAULT_SCOPES unless the owner picks some', (t) => {
@@ -122,7 +133,7 @@ test('re-pairing the same installation replaces kind and scopes with the new gra
   assert.equal(registry.generation(phone.device.id), undefined, 'a revoked device has no generation')
 })
 
-test('T3: a legacy record (no kind/scopes) loads as mobile with every scope and is persisted', (t) => {
+test('T3: a legacy record (no kind/scopes) loads as mobile with the historical mobile grant and is persisted', (t) => {
   const { file, options } = tempRegistry(t)
   const legacy = {
     version: 3,
@@ -141,19 +152,28 @@ test('T3: a legacy record (no kind/scopes) loads as mobile with every scope and 
   const registry = createRegistry(file, options)
   const [device] = registry.list()
   assert.equal(device.kind, 'mobile')
-  assert.deepEqual(device.scopes, [...SCOPES])
+  // Spec 011 FR-006: the migration restores the pre-011 mobile grant — the exact
+  // scopes such a record had before the upgrade — and not every non-desktop scope,
+  // because `sessions:author` is never-default and must be an owner's tick.
+  assert.deepEqual(device.scopes, [...MOBILE_DEFAULT_SCOPES],
+    'a pre-005 migration must not widen a record with a NEVER_DEFAULT_SCOPES scope')
+  assert.equal(device.scopes.includes('sessions:author'), false,
+    'sessions:author must not arrive through a record written before spec 011 existed')
   // The old credential still authenticates, carrying the migrated grant.
   const authenticated = registry.authenticate('legacy-token')
   assert.equal(authenticated.id, device.id)
-  assert.deepEqual(authenticated.scopes, [...SCOPES])
+  assert.deepEqual(authenticated.scopes, [...MOBILE_DEFAULT_SCOPES])
   // Every companion type the gateway can scope is allowed to it (the pre-005
   // behaviour). The spec 008 remote-bridge types are not companion ops and need
-  // `harness:remote`, which a migrated mobile record never holds.
+  // `harness:remote`, which a migrated mobile record never holds; the spec 011
+  // authoring types need `sessions:author`, which the migration must not grant.
   for (const [type, scope] of Object.entries(SCOPE_BY_TYPE)) {
     if (REMOTE_CLIENT_TYPES.includes(type)) {
       assert.equal(authenticated.scopes.includes(scope), false, `${type} must stay closed to a migrated mobile`)
+    } else if (MOBILE_DEFAULT_SCOPES.includes(scope)) {
+      assert.ok(authenticated.scopes.includes(scope), `${type} (${scope}) must keep working after the migration`)
     } else {
-      assert.ok(authenticated.scopes.includes(scope), scope)
+      assert.equal(authenticated.scopes.includes(scope), false, `${type} (${scope}) is not part of the migrated grant`)
     }
   }
 
@@ -161,9 +181,54 @@ test('T3: a legacy record (no kind/scopes) loads as mobile with every scope and 
   registry.connected(device.id)
   const stored = JSON.parse(fs.readFileSync(file, 'utf8')).devices[0]
   assert.equal(stored.kind, 'mobile')
-  assert.deepEqual(stored.scopes, [...SCOPES])
+  assert.deepEqual(stored.scopes, [...MOBILE_DEFAULT_SCOPES])
   const reopened = createRegistry(file, options)
-  assert.deepEqual(reopened.list()[0].scopes, [...SCOPES])
+  assert.deepEqual(reopened.list()[0].scopes, [...MOBILE_DEFAULT_SCOPES])
+})
+
+// Spec 011 FR-006 regression: the pre-005 migration used to copy the whole
+// non-desktop list, so a record written before spec 011 existed silently acquired
+// `sessions:author` on the first load after the upgrade — a privilege grant the
+// owner never ticked.
+test('T3b: a legacy record never acquires sessions:author through the migration', (t) => {
+  const { file, options } = tempRegistry(t)
+  fs.writeFileSync(file, JSON.stringify({
+    version: 3,
+    // `storedRecord` writes no `kind` and no `scopes`: exactly the legacy shape.
+    devices: [storedRecord({ tokenHash: digest('legacy-no-author') })],
+  }))
+
+  const registry = createRegistry(file, options)
+  const [device] = registry.list()
+  assert.equal(device.kind, 'mobile')
+  for (const scope of NEVER_DEFAULT_SCOPES) {
+    assert.equal(device.scopes.includes(scope), false, `${scope} must not be granted by the migration`)
+  }
+  assert.deepEqual(registry.authenticate('legacy-no-author').scopes, [...MOBILE_DEFAULT_SCOPES])
+  // The narrowing is persisted, so a reload cannot resurrect the scope either.
+  registry.connected(device.id)
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).devices[0].scopes, [...MOBILE_DEFAULT_SCOPES])
+  assert.deepEqual(createRegistry(file, options).list()[0].scopes, [...MOBILE_DEFAULT_SCOPES])
+})
+
+// The never-default rule narrows DEFAULTS only: a record that names the scope was
+// written by an owner decision (or by an explicit offer) and keeps it.
+test('T3c: a record that explicitly lists sessions:author keeps it', (t) => {
+  const { file, options } = tempRegistry(t)
+  fs.writeFileSync(file, JSON.stringify({
+    version: 3,
+    devices: [storedRecord({ kind: 'mobile', scopes: ['sessions:read', 'sessions:author'] })],
+  }))
+
+  const registry = createRegistry(file, options)
+  const [device] = registry.list()
+  assert.equal(device.kind, 'mobile')
+  assert.deepEqual(device.scopes, ['sessions:read', 'sessions:author'],
+    'an explicit grant is read literally; NEVER_DEFAULT_SCOPES only filters defaults')
+  const authenticated = registry.authenticate('stored-token')
+  assert.equal(authenticated.scopes.includes('sessions:author'), true,
+    'the explicit path must still grant the author scope')
+  assert.equal(scopeDenial(authenticated, 'session-create'), undefined)
 })
 
 test('T7: an expired pairing code no longer redeems, and a desktop code keeps the offer TTL', async (t) => {
@@ -292,11 +357,12 @@ test('restart: a partial record (only one of kind/scopes) grants no default', (t
 
 test('the shared vocabulary is what the record uses', () => {
   assert.deepEqual([...DEVICE_KINDS], ['mobile', 'desktop'])
-  // Six spec 005 scopes + seven spec 008 scopes (`harness:remote` and the six
-  // full-control scopes; explicit-only, desktop-only).
-  assert.equal(CONTRACT_SCOPES.length, 13)
+  // Seven spec 005 scopes + the spec 011 author scope + seven spec 008 scopes
+  // (`harness:remote` and the six full-control scopes; explicit-only, desktop-only).
+  assert.equal(CONTRACT_SCOPES.length, 14)
   assert.equal(DESKTOP_ONLY_SCOPES.length, 7)
-  assert.equal(SCOPES.length, 6)
+  assert.equal(SCOPES.length, 7)
+  assert.deepEqual(SCOPES.filter((scope) => NEVER_DEFAULT_SCOPES.includes(scope)), ['sessions:author'])
 })
 
 test('spec 008 full control: a desktop can be granted every desktop-only scope; a mobile or legacy record never holds one', (t) => {

@@ -148,6 +148,14 @@ export const CLIENT_ERROR_CODES = [
   'client/pinned-transport-unavailable',
   /** No device token in secure storage for the stored host. */
   'client/not-paired',
+  /** The Host refused this pairing attempt (pairing close 4403, contract §3.8). */
+  'client/pairing-rejected',
+  /** The approval window closed before the desktop approved this phone (pairing close 4408). */
+  'client/pairing-timeout',
+  /** The one-time code or the pending approval request expired (pairing close 4410). */
+  'client/pairing-expired',
+  /** The Host asked for a one-time code; this app version has no OTP flow yet (contract §3.8). */
+  'client/pairing-otp-unsupported',
 ] as const;
 
 export type ClientErrorCode = (typeof CLIENT_ERROR_CODES)[number];

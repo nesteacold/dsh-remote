@@ -31,6 +31,21 @@ export interface SessionSummary {
   updatedAt: number;
   /** True while at least one approval for this session waits for a decision. */
   needsDecision: boolean;
+  /**
+   * Upstream row `origin` (`'root'` | `'subagent'`, …) when the Host sent one. ABSENT stays absent:
+   * an older Host that reports nothing is never assumed to be a root session.
+   */
+  origin?: string;
+  /** Upstream `parentSessionId` of a subagent row, when present. */
+  parentSessionId?: string;
+}
+
+/**
+ * True only when the Host SAID this is a subagent session. Absent `origin` is not evidence either
+ * way, so it is treated as "not known to be a subagent" — never labelled.
+ */
+export function isSubagentSession(session: Pick<SessionSummary, 'origin'>): boolean {
+  return session.origin === 'subagent';
 }
 
 export type SessionTab = SessionState;
@@ -74,7 +89,10 @@ function projectTitle(row: Record<string, unknown>, id: string): string {
   const projections = row.projections as { values?: { title?: unknown } } | undefined;
   const projected = projections?.values?.title;
   if (typeof projected === 'string' && projected.trim() !== '') return projected;
-  return id;
+  // A brand-new session genuinely has no Host title yet. The wire id is NOT a title: showing it put
+  // `session-de1cb815-…` in the header on device. Return "no title" and let the UI supply a human
+  // fallback (`sessionDisplayTitle`), so the id is never rendered as content.
+  return '';
 }
 
 /**
@@ -116,6 +134,12 @@ function coerceSummary(raw: unknown): SessionSummary | null {
     updatedAt: toEpochMs(r.updatedAt) ?? 0,
     // Server-provided hint; the local approval pushes are authoritative and are OR-ed in.
     needsDecision: r.needsDecision === true,
+    // Measured on the live Host: 827 of 861 rows are `origin: 'subagent'` with a `parentSessionId`.
+    // Both are TOP-LEVEL row fields, so the gateway's title-only projection keeps them intact.
+    ...(typeof r.origin === 'string' && r.origin !== '' ? { origin: r.origin } : {}),
+    ...(typeof r.parentSessionId === 'string' && r.parentSessionId !== ''
+      ? { parentSessionId: r.parentSessionId }
+      : {}),
   };
 }
 

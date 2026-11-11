@@ -24,6 +24,8 @@ export {
   type PinnedWsErrorEvent,
   type PinnedWsAdapter,
   type PinnedWsEventName,
+  type PinnedWsListenerFailure,
+  type PinnedWsListenerFailureReporter,
 } from './src/events';
 
 /** Error codes the native side reports in `onError` (`code` field). */

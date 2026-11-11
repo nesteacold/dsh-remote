@@ -6,7 +6,7 @@
 // routes a notification tap (deep link) to the right session/card after unlock (US6 §2).
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { AppState, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import { AppState, StyleSheet, Text, TouchableOpacity, View, useColorScheme } from 'react-native';
 import { Stack, useRouter } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import * as Linking from 'expo-linking';
@@ -18,6 +18,10 @@ import { StartupSequence } from '../src/core/startup';
 import { UnlockAttempts } from '../src/core/unlock-attempt';
 import { authenticate, initialNotificationUrl, unlockCapability } from '../src/platform';
 import { detectLocale, t, type Interpolate, type Locale } from '../i18n';
+// UI ported from Clarklevis1995/dsh-mobile androidApp/.../ui/DshTheme.kt (MIT).
+// The gate and the update screen sit outside the Stack, so they read the scheme directly; the
+// screens under the Stack read the same palette through `ThemeProvider` / `useTheme()`.
+import { ThemeProvider, paletteFor } from '../src/ui/theme';
 
 type GateStatus = 'checking' | 'locked' | 'unlocked' | 'unavailable';
 
@@ -168,37 +172,52 @@ export default function RootLayout() {
     });
   }, [controller, tr]);
 
+  // Themed chrome from the first frame: the scheme is resolved before anything renders, so neither
+  // the gate nor the stack can flash a white screen (spec 011 P1-A item 2).
+  const palette = paletteFor(useColorScheme() === 'light' ? 'light' : 'dark');
   const locked = gate === 'checking' || gate === 'locked' || gate === 'unavailable';
   const updateRequired = snapshot.updateRequired;
 
   return (
     <SafeAreaProvider>
-      <StatusBar style="auto" />
+      <ThemeProvider>
+      <StatusBar style={palette.isDark ? 'light' : 'dark'} />
       {locked ? (
-        <View style={styles.gate}>
-          <Text style={styles.title}>{tr('unlock.title')}</Text>
-          <Text style={styles.subtitle}>{tr('unlock.subtitle')}</Text>
-          {gateMessage !== null ? <Text style={styles.message}>{gateMessage}</Text> : null}
+        <View style={[styles.gate, { backgroundColor: palette.bg }]}>
+          <Text style={[styles.title, { color: palette.text }]}>{tr('unlock.title')}</Text>
+          <Text style={[styles.subtitle, { color: palette.textMuted }]}>{tr('unlock.subtitle')}</Text>
+          {gateMessage !== null ? <Text style={[styles.message, { color: palette.warning }]}>{gateMessage}</Text> : null}
           {gate === 'checking' ? null : (
             <TouchableOpacity
-              style={styles.button}
+              style={[styles.button, { backgroundColor: palette.accent }]}
               accessibilityRole="button"
+              accessibilityLabel={gate === 'unavailable' ? tr('common.ok') : tr('unlock.button')}
               onPress={() => {
                 setGate('locked');
                 setGateMessage(null);
                 void attemptUnlock(false);
               }}
             >
-              <Text style={styles.buttonText}>{gate === 'unavailable' ? tr('common.ok') : tr('unlock.button')}</Text>
+              <Text style={[styles.buttonText, { color: palette.onAccent }]}>{gate === 'unavailable' ? tr('common.ok') : tr('unlock.button')}</Text>
             </TouchableOpacity>
           )}
         </View>
       ) : (
         <AppProvider controller={controller} snapshot={snapshot} tr={tr} locale={locale}>
-          <Stack screenOptions={{ headerShown: true }}>
-            <Stack.Screen name="index" options={{ title: tr('unlock.title') }} />
+          <Stack
+            screenOptions={{
+              headerShown: true,
+              headerStyle: { backgroundColor: palette.bg },
+              headerTintColor: palette.text,
+              headerShadowVisible: false,
+              contentStyle: { backgroundColor: palette.bg },
+            }}
+          >
+            <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
             <Stack.Screen name="pair" options={{ title: tr('pair.title') }} />
             <Stack.Screen name="session/[id]" options={{ title: tr('common.host') }} />
+            <Stack.Screen name="s/[id]" options={{ headerShown: false }} />
+            <Stack.Screen name="s/index" options={{ headerShown: false }} />
           </Stack>
           {updateRequired !== null ? (
             // N7: a protocol mismatch is terminal for this connection, so it gets an actionable
@@ -217,6 +236,7 @@ export default function RootLayout() {
           ) : null}
         </AppProvider>
       )}
+      </ThemeProvider>
     </SafeAreaProvider>
   );
 }
@@ -229,19 +249,20 @@ function UpdateRequiredScreen(props: {
   onPairAnother: () => void;
 }) {
   const { update, tr, onRetry, onPairAnother } = props;
+  const palette = paletteFor(useColorScheme() === 'light' ? 'light' : 'dark');
   const appSide = update.side === 'app';
   const version = update.minClientVersion ?? update.hostCompanionProtocol;
   return (
-    <View style={styles.overlay} accessibilityViewIsModal>
+    <View style={[styles.overlay, { backgroundColor: palette.bg }]} accessibilityViewIsModal>
       <View style={styles.gate}>
-        <Text style={styles.title}>{tr(appSide ? 'update.appTitle' : 'update.hostTitle')}</Text>
-        <Text style={styles.subtitle}>{tr(appSide ? 'update.appBody' : 'update.hostBody')}</Text>
-        {version === undefined ? null : <Text style={styles.message}>{tr('update.details', { version })}</Text>}
-        <TouchableOpacity style={styles.button} accessibilityRole="button" onPress={onRetry}>
-          <Text style={styles.buttonText}>{tr('update.retry')}</Text>
+        <Text style={[styles.title, { color: palette.text }]}>{tr(appSide ? 'update.appTitle' : 'update.hostTitle')}</Text>
+        <Text style={[styles.subtitle, { color: palette.textMuted }]}>{tr(appSide ? 'update.appBody' : 'update.hostBody')}</Text>
+        {version === undefined ? null : <Text style={[styles.message, { color: palette.warning }]}>{tr('update.details', { version })}</Text>}
+        <TouchableOpacity style={[styles.button, { backgroundColor: palette.accent }]} accessibilityRole="button" onPress={onRetry}>
+          <Text style={[styles.buttonText, { color: palette.onAccent }]}>{tr('update.retry')}</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.secondary} accessibilityRole="button" onPress={onPairAnother}>
-          <Text style={styles.secondaryText}>{tr('update.pairAnother')}</Text>
+        <TouchableOpacity style={[styles.secondary, { backgroundColor: palette.surface }]} accessibilityRole="button" onPress={onPairAnother}>
+          <Text style={[styles.secondaryText, { color: palette.text }]}>{tr('update.pairAnother')}</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -284,14 +305,16 @@ export function useApp(): AppContextValue {
   return value;
 }
 
+// Colours are supplied per-render from the theme palette (spec 011: no hex literal outside
+// src/ui/theme.ts); these styles carry layout/typography only.
 const styles = StyleSheet.create({
-  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: '#fff' },
+  overlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
   gate: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, gap: 12 },
   title: { fontSize: 26, fontWeight: '700' },
-  subtitle: { fontSize: 15, opacity: 0.7, textAlign: 'center' },
-  message: { fontSize: 14, color: '#b45309', textAlign: 'center', marginTop: 8 },
-  button: { marginTop: 16, backgroundColor: '#2563eb', paddingHorizontal: 28, paddingVertical: 14, borderRadius: 12 },
-  buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
-  secondary: { marginTop: 4, paddingHorizontal: 20, paddingVertical: 12, borderRadius: 10, backgroundColor: '#e2e8f0' },
+  subtitle: { fontSize: 15, textAlign: 'center' },
+  message: { fontSize: 14, textAlign: 'center', marginTop: 8 },
+  button: { marginTop: 16, paddingHorizontal: 28, paddingVertical: 14, borderRadius: 12, minHeight: 44, justifyContent: 'center' },
+  buttonText: { fontSize: 16, fontWeight: '600' },
+  secondary: { marginTop: 4, paddingHorizontal: 20, paddingVertical: 12, borderRadius: 10, minHeight: 44, justifyContent: 'center' },
   secondaryText: { fontSize: 15, fontWeight: '600' },
 });

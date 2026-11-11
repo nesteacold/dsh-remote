@@ -23,6 +23,45 @@ export type MessageKey =
   | 'tabs.running'
   | 'tabs.idle'
   | 'tabs.archived'
+  // Bottom tab bar + workspace home + conversations + settings (spec 011 P1-A port).
+  | 'tabs.workspace'
+  | 'tabs.conversations'
+  | 'tabs.settings'
+  | 'home.hero'
+  | 'home.heroSubtitle'
+  | 'home.recent'
+  | 'home.seeAll'
+  | 'home.emptyTitle'
+  | 'home.emptyBody'
+  | 'conversations.title'
+  | 'settings.title'
+  | 'settings.computer'
+  | 'settings.paired'
+  | 'settings.pairAnother'
+  | 'settings.fontSize'
+  | 'settings.fontSizeHint'
+  // Session authoring: workspace picker, new session, model/mode row (spec 011 revision 7).
+  | 'authoring.connecting'
+  | 'authoring.reconnecting'
+  | 'home.loadingSessions'
+  | 'authoring.scopeUnknown'
+  | 'authoring.modelSubagent'
+  | 'home.showSubagents'
+  | 'home.hideSubagents'
+  | 'authoring.modelsUnavailable'
+  | 'authoring.createFailed'
+  | 'authoring.needScope'
+  | 'authoring.needWorkspace'
+  | 'authoring.loadingWorkspaces'
+  | 'authoring.workspacesError'
+  | 'authoring.workspacesEmpty'
+  | 'authoring.workspaceTitle'
+  | 'authoring.workspacePlaceholder'
+  | 'authoring.retry'
+  | 'authoring.close'
+  | 'authoring.newSession'
+  | 'authoring.mode'
+  | 'authoring.model'
   | 'sessions.search'
   | 'sessions.empty'
   | 'sessions.emptySearch'
@@ -43,10 +82,14 @@ export type MessageKey =
   | 'pair.manualPlaceholder'
   | 'pair.submit'
   | 'pair.connecting'
+  | 'pair.waitingApproval'
   | 'pair.success'
   | 'pair.errorTitle'
   | 'pair.error.remoteDisabled'
   | 'pair.error.expired'
+  | 'pair.error.rejected'
+  | 'pair.error.timeout'
+  | 'pair.error.otpUnsupported'
   | 'pair.error.pinMismatch'
   | 'pair.error.unavailable'
   | 'pair.error.appUpdate'
@@ -54,6 +97,8 @@ export type MessageKey =
   | 'pair.error.generic'
   // session screen
   | 'session.loading'
+  | 'session.untitled'
+  | 'session.untitledAgo'
   | 'session.empty'
   | 'session.composerPlaceholder'
   | 'session.send'
@@ -62,10 +107,21 @@ export type MessageKey =
   | 'session.cancelConfirmBody'
   | 'session.cancelConfirm'
   | 'session.cancelled'
+  | 'session.historyFailed'
   | 'session.historyOlder'
+  | 'session.pendingUnconfirmed'
   | 'session.pending'
   | 'session.failed'
   | 'session.retry'
+  | 'session.linkOpenTitle'
+  | 'session.linkOpenBody'
+  | 'session.linkOpen'
+  | 'session.role.tool'
+  | 'session.role.system'
+  | 'session.role.other'
+  | 'session.more'
+  | 'session.sendOffline'
+  | 'session.sendNotReady'
   // approvals
   | 'approval.title'
   | 'approval.approve'
@@ -85,6 +141,7 @@ export type MessageKey =
   | 'banner.gatewayOff'
   | 'banner.revoked'
   | 'banner.reauth'
+  | 'banner.cleanupFailed'
   | 'banner.pinnedTransportMissing'
   // protocol update (N7)
   | 'update.appTitle'
@@ -134,6 +191,46 @@ const en = {
   'tabs.running': 'Running',
   'tabs.idle': 'Idle',
   'tabs.archived': 'Archived',
+  'tabs.workspace': 'Workspace',
+  'tabs.conversations': 'Conversations',
+  'tabs.settings': 'Settings',
+  'home.hero': 'Explore further',
+  'home.heroSubtitle': 'DeepSeek Harness companion',
+  'home.recent': 'Recent sessions',
+  'home.seeAll': 'See all conversations',
+  'home.emptyTitle': 'No sessions yet',
+  'home.emptyBody': 'Start a session on your computer and it appears here.',
+  'conversations.title': 'Conversations',
+  'settings.title': 'Settings',
+  'settings.computer': 'Paired computer',
+  'settings.paired': 'Paired',
+  'settings.pairAnother': 'Pair another computer',
+  'settings.fontSize': 'Text size',
+  'settings.fontSizeHint': 'Applies to this app only.',
+  // While the socket is not `ready` the app must say so — never diagnose a permission problem it
+  // cannot know about yet (the Vietnamese/light review caught it accusing the host mid-connect).
+  'authoring.connecting': 'Connecting to this computer…',
+  'authoring.reconnecting': 'Reconnecting to this computer…',
+  'home.loadingSessions': 'Loading sessions…',
+  'authoring.scopeUnknown': 'This computer did not report its permissions, so creating a session is unavailable.',
+  'authoring.modelSubagent': 'Sub-agent session: its model cannot be changed from this phone.',
+  'home.showSubagents': 'Show {count} sub-agent sessions',
+  'home.hideSubagents': 'Hide sub-agent sessions',
+  'session.historyFailed': 'Could not load earlier messages.',
+  'authoring.modelsUnavailable': 'Could not load the model list from this computer.',
+  'authoring.createFailed': 'Could not create the session. Try again.',
+  'authoring.needScope': 'This phone was not granted permission to create sessions. Ask for it when you pair.',
+  'authoring.needWorkspace': 'Choose a workspace first.',
+  'authoring.loadingWorkspaces': 'Loading workspaces…',
+  'authoring.workspacesError': 'Could not load workspaces. Tap to retry.',
+  'authoring.workspacesEmpty': 'This computer has no workspaces.',
+  'authoring.workspaceTitle': 'Workspace',
+  'authoring.workspacePlaceholder': 'Choose a workspace',
+  'authoring.retry': 'Retry',
+  'authoring.close': 'Close',
+  'authoring.newSession': 'New session',
+  'authoring.mode': 'Mode',
+  'authoring.model': 'Model',
   'sessions.search': 'Search sessions',
   'sessions.empty': 'No sessions in this tab yet.',
   'sessions.emptySearch': 'No session matches your search.',
@@ -153,16 +250,23 @@ const en = {
   'pair.manualPlaceholder': 'Paste the pairing code',
   'pair.submit': 'Pair',
   'pair.connecting': 'Connecting to {host}…',
+  'pair.waitingApproval': 'Approve this phone on your computer. Check the code: {code}',
   'pair.success': 'Paired with {host}',
   'pair.errorTitle': 'Could not pair',
   'pair.error.remoteDisabled': 'Remote control is off on your computer. Turn it on in DSH, then scan a new code.',
   'pair.error.expired': 'This pairing code expired or was already used. Show a new one on your computer.',
+  'pair.error.rejected': 'Your computer refused this pairing. Check the approval prompt on your computer and try again with a new code.',
+  'pair.error.timeout': 'The approval window ran out before the pairing finished. Show a new code on your computer and try again.',
+  'pair.error.otpUnsupported': 'This computer asks for a one-time code, which this app version cannot enter. Update DSH Companion, or pair with the QR code instead.',
   'pair.error.pinMismatch': 'That computer is not the one the code belongs to. Nothing was sent. If its certificate changed, pair again with a fresh code.',
   'pair.error.unavailable': 'Could not reach that computer. Check you are on the same network and the gateway is running.',
   'pair.error.appUpdate': 'Your computer needs a newer DSH Companion. Update the app.',
   'pair.error.hostUpdate': 'Your computer runs an older protocol. Update DSH on the desktop.',
   'pair.error.generic': 'Pairing failed. Show a new code and try again.',
   'session.loading': 'Loading conversation…',
+  // A session the Host has not titled yet: a human label + when it started, never the wire id.
+  'session.untitled': 'New session',
+  'session.untitledAgo': 'New session · {when}',
   'session.empty': 'No messages yet.',
   'session.composerPlaceholder': 'Send an instruction…',
   'session.send': 'Send',
@@ -172,9 +276,19 @@ const en = {
   'session.cancelConfirm': 'Stop',
   'session.cancelled': 'Session stopped.',
   'session.historyOlder': 'Load earlier messages',
+  'session.pendingUnconfirmed': 'Not confirmed by the computer',
   'session.pending': 'sending…',
   'session.failed': 'not sent',
   'session.retry': 'Retry',
+  'session.linkOpenTitle': 'Open this link outside the app?',
+  'session.linkOpenBody': '{url}',
+  'session.linkOpen': 'Open',
+  'session.role.tool': 'Tool',
+  'session.role.system': 'System',
+  'session.role.other': 'Activity',
+  'session.more': 'More actions',
+  'session.sendOffline': 'Offline — reconnect to send',
+  'session.sendNotReady': 'Connecting… you can type meanwhile',
   'approval.title': 'Approval needed: {tool}',
   'approval.approve': 'Allow once',
   'approval.reject': 'Reject',
@@ -192,6 +306,8 @@ const en = {
   'banner.gatewayOff': 'Remote control is off on your computer. Auto-reconnect is paused.',
   'banner.revoked': 'This device was removed from the computer. Pair again to continue.',
   'banner.reauth': 'The computer asks to re-authenticate. Reconnecting…',
+  'banner.cleanupFailed':
+    'This phone could not finish deleting the stored credential. This device stays unpaired and the credential will not be used — restart the app and forget the computer again.',
   'banner.pinnedTransportMissing':
     'This build has no pinned TLS transport (Expo Go / web). Install a dev build to connect; the app will not fall back to an unpinned socket.',
   'update.appTitle': 'Update DSH Companion',
@@ -224,14 +340,55 @@ const vi = {
   'unlock.unavailable': 'Hãy đặt khoá màn hình (mã PIN hoặc sinh trắc học) để bảo vệ thông tin đã ghép đôi.',
   'unlock.passcodeOnly': 'Chưa đặt sinh trắc học; đang dùng mã mở khoá thiết bị.',
   'tabs.running': 'Đang chạy',
-  'tabs.idle': 'Chờ',
+  // Session state, not a queue: "Chờ" (= waiting) mislabelled an idle session; "Rảnh" = free/idle.
+  'tabs.idle': 'Rảnh',
   'tabs.archived': 'Lưu trữ',
+  'tabs.workspace': 'Không gian',
+  'tabs.conversations': 'Hội thoại',
+  'tabs.settings': 'Cài đặt',
+  // "chưa tới" read as "explore has not arrived yet"; "thêm" = "further/more".
+  'home.hero': 'Khám phá thêm',
+  'home.heroSubtitle': 'Ứng dụng đồng hành DeepSeek Harness',
+  'home.recent': 'Phiên gần đây',
+  'home.seeAll': 'Xem tất cả hội thoại',
+  'home.emptyTitle': 'Chưa có phiên nào',
+  'home.emptyBody': 'Hãy bắt đầu một phiên trên máy tính, phiên đó sẽ hiện ở đây.',
+  'conversations.title': 'Hội thoại',
+  'settings.title': 'Cài đặt',
+  'settings.computer': 'Máy tính đã ghép đôi',
+  'settings.paired': 'Đã ghép đôi',
+  'settings.pairAnother': 'Ghép đôi máy tính khác',
+  'settings.fontSize': 'Cỡ chữ',
+  'settings.fontSizeHint': 'Chỉ áp dụng cho ứng dụng này.',
+  'authoring.connecting': 'Đang kết nối tới máy tính…',
+  'authoring.reconnecting': 'Đang kết nối lại tới máy tính…',
+  'home.loadingSessions': 'Đang tải phiên…',
+  'authoring.scopeUnknown': 'Máy tính này không báo quyền của thiết bị, nên chưa thể tạo phiên.',
+  'authoring.modelSubagent': 'Phiên tác tử con: không thể đổi model từ điện thoại này.',
+  'home.showSubagents': 'Hiện {count} phiên tác tử con',
+  'home.hideSubagents': 'Ẩn các phiên tác tử con',
+  'session.historyFailed': 'Không tải được tin nhắn trước.',
+  'authoring.modelsUnavailable': 'Không tải được danh sách model từ máy tính này.',
+  'authoring.createFailed': 'Không tạo được phiên. Hãy thử lại.',
+  'authoring.needScope': 'Điện thoại này chưa được cấp quyền tạo phiên. Hãy yêu cầu khi ghép đôi.',
+  'authoring.needWorkspace': 'Hãy chọn một không gian làm việc trước.',
+  'authoring.loadingWorkspaces': 'Đang tải không gian làm việc…',
+  'authoring.workspacesError': 'Không tải được không gian làm việc. Chạm để thử lại.',
+  'authoring.workspacesEmpty': 'Máy tính này chưa có không gian làm việc nào.',
+  'authoring.workspaceTitle': 'Không gian làm việc',
+  'authoring.workspacePlaceholder': 'Chọn không gian làm việc',
+  'authoring.retry': 'Thử lại',
+  'authoring.close': 'Đóng',
+  'authoring.newSession': 'Phiên mới',
+  'authoring.mode': 'Chế độ',
+  'authoring.model': 'Model',
   'sessions.search': 'Tìm phiên',
   'sessions.empty': 'Chưa có phiên nào trong mục này.',
   'sessions.emptySearch': 'Không có phiên nào khớp tìm kiếm.',
   'sessions.needsDecision': 'Cần bạn quyết định',
   'sessions.updatedAgo': 'cập nhật {when}',
-  'sessions.hiddenOlder': '{count} phiên cũ hơn nằm ngoài cửa sổ 30 ngày.',
+  // "cửa sổ 30 ngày" was a literal calque of "30-day window"; plain Vietnamese is clearer.
+  'sessions.hiddenOlder': '{count} phiên cũ hơn 30 ngày nên không hiển thị.',
   'sessions.pair': 'Ghép đôi máy tính',
   'sessions.forget': 'Quên máy tính này',
   'sessions.forgetConfirm': 'Xoá thông tin đăng nhập đã lưu và ghép đôi lại sau?',
@@ -245,16 +402,22 @@ const vi = {
   'pair.manualPlaceholder': 'Dán mã ghép đôi',
   'pair.submit': 'Ghép đôi',
   'pair.connecting': 'Đang kết nối tới {host}…',
+  'pair.waitingApproval': 'Hãy phê duyệt điện thoại này trên máy tính. Đối chiếu mã: {code}',
   'pair.success': 'Đã ghép đôi với {host}',
   'pair.errorTitle': 'Không ghép đôi được',
   'pair.error.remoteDisabled': 'Điều khiển từ xa đang tắt trên máy tính. Hãy bật trong DSH và quét mã mới.',
   'pair.error.expired': 'Mã ghép đôi đã hết hạn hoặc đã dùng. Hãy hiển thị mã mới trên máy tính.',
+  'pair.error.rejected': 'Máy tính đã từ chối lần ghép đôi này. Hãy kiểm tra hộp thoại phê duyệt trên máy tính rồi thử lại bằng mã mới.',
+  'pair.error.timeout': 'Hết thời gian chờ phê duyệt trước khi ghép đôi xong. Hãy hiển thị mã mới trên máy tính và thử lại.',
+  'pair.error.otpUnsupported': 'Máy tính yêu cầu mã dùng một lần, phiên bản ứng dụng này chưa nhập được. Hãy cập nhật DSH Companion, hoặc ghép đôi bằng mã QR.',
   'pair.error.pinMismatch': 'Máy tính này không khớp với mã. Không có dữ liệu nào được gửi. Nếu chứng chỉ vừa đổi, hãy ghép đôi lại bằng mã mới.',
   'pair.error.unavailable': 'Không kết nối được máy tính. Kiểm tra cùng mạng và gateway đang chạy.',
   'pair.error.appUpdate': 'Máy tính cần bản DSH Companion mới hơn. Hãy cập nhật ứng dụng.',
   'pair.error.hostUpdate': 'Máy tính dùng giao thức cũ hơn. Hãy cập nhật DSH trên máy tính.',
   'pair.error.generic': 'Ghép đôi thất bại. Hãy hiển thị mã mới và thử lại.',
   'session.loading': 'Đang tải hội thoại…',
+  'session.untitled': 'Phiên mới',
+  'session.untitledAgo': 'Phiên mới · {when}',
   'session.empty': 'Chưa có tin nhắn.',
   'session.composerPlaceholder': 'Gửi chỉ dẫn…',
   'session.send': 'Gửi',
@@ -264,9 +427,19 @@ const vi = {
   'session.cancelConfirm': 'Dừng',
   'session.cancelled': 'Đã dừng phiên.',
   'session.historyOlder': 'Tải tin nhắn cũ hơn',
+  'session.pendingUnconfirmed': 'Máy tính chưa xác nhận',
   'session.pending': 'đang gửi…',
   'session.failed': 'chưa gửi',
   'session.retry': 'Gửi lại',
+  'session.linkOpenTitle': 'Mở liên kết này bên ngoài ứng dụng?',
+  'session.linkOpenBody': '{url}',
+  'session.linkOpen': 'Mở',
+  'session.role.tool': 'Công cụ',
+  'session.role.system': 'Hệ thống',
+  'session.role.other': 'Hoạt động',
+  'session.more': 'Thao tác khác',
+  'session.sendOffline': 'Đang ngoại tuyến — kết nối lại để gửi',
+  'session.sendNotReady': 'Đang kết nối… bạn có thể soạn trước',
   'approval.title': 'Cần phê duyệt: {tool}',
   'approval.approve': 'Cho phép một lần',
   'approval.reject': 'Từ chối',
@@ -284,6 +457,8 @@ const vi = {
   'banner.gatewayOff': 'Điều khiển từ xa đang tắt trên máy tính. Tự kết nối lại đã tạm dừng.',
   'banner.revoked': 'Thiết bị này đã bị xoá khỏi máy tính. Hãy ghép đôi lại để tiếp tục.',
   'banner.reauth': 'Máy tính yêu cầu xác thực lại. Đang kết nối lại…',
+  'banner.cleanupFailed':
+    'Điện thoại chưa xoá xong thông tin đăng nhập đã lưu. Thiết bị này vẫn ở trạng thái chưa ghép đôi và thông tin đó sẽ không được dùng — hãy khởi động lại ứng dụng và xoá máy tính một lần nữa.',
   'banner.pinnedTransportMissing':
     'Bản này không có kênh TLS ghim chứng chỉ (Expo Go / web). Hãy cài bản dev build để kết nối; ứng dụng không bao giờ chuyển sang kết nối không ghim.',
   'update.appTitle': 'Cập nhật DSH Companion',
@@ -332,6 +507,9 @@ export function detectLocale(languageTag: string | null | undefined): Locale {
 export type PairErrorKind =
   | 'remoteDisabled'
   | 'expired'
+  | 'rejected'
+  | 'timeout'
+  | 'otpUnsupported'
   | 'pinMismatch'
   | 'unavailable'
   | 'appUpdate'
@@ -362,6 +540,15 @@ export function pairErrorFromCode(code: ClientErrorCode | ContractErrorCode | st
     case 'pairing/expired':
     case 'auth/required':
       return 'expired';
+    // Contract §3.8: the pairing connection's own outcomes.
+    case 'client/pairing-rejected':
+      return 'rejected';
+    case 'client/pairing-expired':
+      return 'expired';
+    case 'client/pairing-timeout':
+      return 'timeout';
+    case 'client/pairing-otp-unsupported':
+      return 'otpUnsupported';
     case 'client/pin-mismatch':
       return 'pinMismatch';
     case 'client/update-app-required':

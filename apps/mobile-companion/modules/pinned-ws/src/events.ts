@@ -80,19 +80,43 @@ export const PinnedWsEvents = {
 } as const satisfies Record<string, PinnedWsEventName>;
 
 /**
+ * Listener-boundary failure report. Mirrors the transport/client reporter structurally (this
+ * module is not allowed to import the app core). `native` plus the fixed event name is all a
+ * sink ever learns: never the exception message, the event payload or the frame text.
+ */
+export interface PinnedWsListenerFailure {
+  boundary: 'native';
+  stage: PinnedWsEventName;
+}
+
+/** Injected reporter; absent by default, so a normal build allocates nothing on failure. */
+export type PinnedWsListenerFailureReporter = (info: PinnedWsListenerFailure) => void;
+
+/**
  * Subscribe to all four events; returns one unsubscribe function. Exported so the adapter and
- * tests share the exact subscription semantics (a throwing listener cannot stop the others).
+ * tests share the exact subscription semantics.
+ *
+ * A throwing consumer must not break the native event queue, so isolation stays; the throw is
+ * reported to `onListenerFailure` with the fixed event name instead of disappearing. A broken
+ * listener is reported, never punished by closing the socket (it may be an unrelated consumer).
  */
 export function addPinnedWsListener(
   module: PinnedWsAdapter,
   hooks: Partial<PinnedWsEventMap>,
+  onListenerFailure?: PinnedWsListenerFailureReporter,
 ): () => void {
   const subscriptions = PINNED_WS_EVENT_NAMES.filter((name) => hooks[name] !== undefined).map((name) =>
     module.addListener(name, (event) => {
       try {
         (hooks[name] as ((event: unknown) => void) | undefined)?.(event);
       } catch {
-        // A throwing consumer must not break the native event queue.
+        // The event name is the only detail reported: never the event or the exception.
+        if (onListenerFailure === undefined) return;
+        try {
+          onListenerFailure({ boundary: 'native', stage: name });
+        } catch {
+          // a reporter must never break the native event queue either
+        }
       }
     }),
   );

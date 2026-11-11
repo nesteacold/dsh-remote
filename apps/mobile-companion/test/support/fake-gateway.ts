@@ -15,6 +15,7 @@
 //
 // Nothing here listens beyond 127.0.0.1 and every port is ephemeral.
 
+import { randomBytes } from 'node:crypto';
 import { createServer, type Server as HttpsServer } from 'node:https';
 import type { IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -24,6 +25,9 @@ import {
   CAPABILITIES,
   COMPANION_PROTOCOL_VERSION,
   MIN_CLIENT_VERSION,
+  PAIRING_CLOSE_CODES,
+  PAIRING_NONCE,
+  PAIRING_PROOF_TYPE,
   PROTOCOL_SUBPROTOCOL,
   SUBPROTOCOL_PREFIXES,
 } from '@dsh-ext/mobile-protocol';
@@ -61,6 +65,12 @@ export interface FakeGatewayOptions {
   tokens?: string[];
   /** Valid pairing codes (the `dsh-pair.<code>` subprotocol value). */
   pairingCodes?: string[];
+  /**
+   * Spec 011 — the scopes this host reports for the device in `hello.device.scopes` (and
+   * `paired.device`). Default **absent**: an older gateway reports none, which the app must read as
+   * UNKNOWN rather than "denied". Set it to drive the granted/denied paths.
+   */
+  deviceScopes?: string[];
   /** Reject the HTTP upgrade with this status (401 / 403 scenarios). */
   upgradeStatus?: number;
   /** Close every new socket with this code right after `hello` (4003 / 4004 / 4401). */
@@ -83,6 +93,24 @@ export interface FakeGatewayOptions {
   suppressClientHelloAck?: boolean;
   /** Answer `client-hello` twice (a duplicate ack must not resolve the pairing twice). */
   duplicateClientHelloAck?: boolean;
+  /**
+   * Contract §3.8: `otpRequired` in the pairing challenge. `true` means the Host wants a
+   * one-time-code proof (`otpProof`); this fixture accepts any non-empty one, because the OTP
+   * flow is not implemented on the app side yet (slice B fails with
+   * `client/pairing-otp-unsupported`). Tests use it to prove a missing `otpProof` closes 4410.
+   */
+  otpRequired?: boolean;
+  /**
+   * Auto-approve a pairing as soon as its proof is accepted (default `true`). Every existing test
+   * pairs through this fixture and none of them is about the approval wait, so they keep their
+   * shape; set `false` to hold the pairing pending and drive it with
+   * `approvePairing()` / `rejectPairing()` / `expirePairing()`.
+   */
+  autoApprovePairing?: boolean;
+  /** Lifetime of the pending request in `pairing-pending` (default 5 minutes, contract §3.8). */
+  pairingExpiryMs?: number;
+  /** Verification code shown to the user (default a fixed 6-digit code). */
+  verificationCode?: string;
 }
 
 interface PairingAttempt {
@@ -105,7 +133,46 @@ interface Connection {
   received: string[];
   subscribed: string | null;
   ready: boolean;
+  /**
+   * Contract §3.8 pairing state machine. Null on an authenticated connection. A pairing socket is
+   * not a MobileConnection: until `admitted`, the only frame it may send is the proof.
+   */
+  pairing: {
+    code: string;
+    /** Frames refused before admission (the third closes 4403, contract §3.8). */
+    refusals: number;
+    /** True once a valid proof was accepted: `hello`/operations are allowed from here. */
+    admitted: boolean;
+    /** Set when the proof was accepted and the socket waits for the Host user. */
+    pending: { verificationCode: string; requestId: string; expiresAt: number } | null;
+    /** True once this attempt was approved (the token was handed out). */
+    approved: boolean;
+    /** `clientNonce` of the accepted proof, for assertions. */
+    proofNonce: string | null;
+  } | null;
 }
+
+// Spec 011 (mobile session authoring) — the two read frames the authoring UI needs, in the shape the
+// REAL Host/gateway sends (measured from the DSH artifact: catalog.js + lib/dsh-host-adapter.mjs:364-376
+// for the per-session form). A model entry is `{ id, name }` (no `label`/`provider`); the provider id
+// lives in `group.id`; the reply carries `current`, `routable` and `failures`.
+const FIXTURE_CURRENT_MODEL = { provider: 'deepseek', model: 'deepseek-v4-flash' }
+
+const FIXTURE_MODEL_GROUPS = [
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    models: [
+      { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', description: 'Fast' },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro' },
+    ],
+  },
+]
+
+const FIXTURE_WORKSPACES = [
+  { workspaceId: 'ws-disktree', name: 'DiskTree', path: '/home/me/DiskTree' },
+  { workspaceId: 'ws-dxvk', name: 'DXVK_Project', path: '/home/me/DXVK_Project' },
+]
 
 const DEFAULT_SESSIONS: FakeSession[] = [
   { id: 's-running', title: 'Refactor gateway TLS', state: 'running', updatedAt: Date.parse('2026-11-09T05:00:00Z') },
@@ -127,6 +194,11 @@ function toFrame(obj: unknown): string {
   return JSON.stringify(obj);
 }
 
+/** A contract-shaped `serverNonce` (32 chars of unpadded base64url, like 24 random bytes). */
+function randomNonce(): string {
+  return randomBytes(24).toString('base64url');
+}
+
 function headerValue(request: IncomingMessage, name: string): string | null {
   const raw = request.headers[name];
   if (raw === undefined) return null;
@@ -136,6 +208,8 @@ function headerValue(request: IncomingMessage, name: string): string | null {
 export class FakeGateway {
   readonly certificate: TestCertificate;
   private readonly options: FakeGatewayOptions;
+  /** Test-only switch (see `refuseUpgrade`): refuses every new upgrade with this status. */
+  private upgradeStatusOverride: number | null = null;
   private httpsServer: HttpsServer | null = null;
   private wss: WebSocketServer | null = null;
   private readonly connections = new Set<Connection>();
@@ -174,6 +248,14 @@ export class FakeGateway {
   bearerClientHellos = 0;
   /** ping frames received. */
   pingCount = 0;
+  /** `pairing-challenge` frames sent (contract §3.8: exactly one per pairing socket). */
+  pairingChallenges = 0;
+  /** Accepted proofs, in order: the `clientNonce` each pairing socket presented. */
+  readonly pairingProofs: string[] = [];
+  /** Frames refused before a pairing was admitted (the third refusal closes 4403). */
+  pairingRefusals = 0;
+  /** Pairings waiting for the test to approve / reject / expire (manual mode only). */
+  readonly pendingPairings: Array<{ code: string; verificationCode: string; requestId: string; expiresAt: number; clientNonce: string }> = [];
   /** Frames rejected for not being a `{type, requestId}` request. */
   readonly protocolViolations: string[] = [];
   /** Errors recorded by the server while handling frames (test diagnostics). */
@@ -222,6 +304,14 @@ export class FakeGateway {
 
   addPairingCode(code: string): void {
     this.pairingCodes.add(code);
+  }
+
+  /**
+   * Test-only: refuse every *new* upgrade with `status` (`null` clears it). Used to turn a host
+   * that accepted this device into one that refuses its credential (HTTP 401) from now on.
+   */
+  refuseUpgrade(status: number | null): void {
+    this.upgradeStatusOverride = status;
   }
 
   addToken(token: string): void {
@@ -397,6 +487,7 @@ export class FakeGateway {
 
   /** HTTP upgrade checks (contract §3): 403 remote off, 401 missing/invalid/revoked/expired. */
   private verifyUpgrade(request: IncomingMessage): number | null {
+    if (this.upgradeStatusOverride !== null) return this.upgradeStatusOverride;
     if (this.options.upgradeStatus !== undefined) return this.options.upgradeStatus;
     const url = request.url ?? '';
     if (/[?&](token|pairingCode|pairing_code)=/.test(url)) return 401;
@@ -468,6 +559,7 @@ export class FakeGateway {
       received: [],
       subscribed: null,
       ready: false,
+      pairing: null,
     };
     this.connections.add(connection);
     this.connectionAttempts += 1;
@@ -478,20 +570,27 @@ export class FakeGateway {
         socket.close(1008, 'pairing/expired');
         return;
       }
-      this.pairingCodes.delete(pairing.code); // one-time
-      this.consumedPairingCodes.push(pairing.code);
-      const token = `tok-${this.nextToken++}`;
-      this.tokens.add(token);
-      this.minted.push(token);
-      connection.token = token;
-      // A later bearer connection is this same device (resolved from the token, not the header).
-      this.tokenDevices.set(token, connection.device.id);
-      socket.send(toFrame({ kind: 'paired', token, device: connection.device }));
-    }
-
-    this.sendHello(connection);
-
-    if (this.options.closeAfterHello !== undefined) {      socket.close(this.options.closeAfterHello, 'close-after-hello');
+      // Contract §3.8: the challenge is sent unconditionally on accept, before any client frame.
+      // The code is only reserved here — the proof consumes it — and this socket is NOT a
+      // MobileConnection yet: no token, no `paired`, no `hello`.
+      connection.pairing = {
+        code: pairing.code,
+        refusals: 0,
+        admitted: false,
+        pending: null,
+        approved: false,
+        proofNonce: null,
+      };
+      this.pairingChallenges += 1;
+      socket.send(toFrame({
+        kind: 'pairing-challenge',
+        serverNonce: randomNonce(),
+        certSha256: this.certificate.certSha256,
+        otpRequired: this.options.otpRequired === true,
+      }));
+    } else {
+      this.sendHello(connection);
+      if (this.options.closeAfterHello !== undefined) socket.close(this.options.closeAfterHello, 'close-after-hello');
     }
 
     socket.on('message', (data: RawData) => {
@@ -504,7 +603,11 @@ export class FakeGateway {
         this.serverErrors.push(error instanceof Error ? error.message : String(error));
       }
     });
-    socket.on('close', () => this.connections.delete(connection));
+    socket.on('close', () => {
+      // A dropped pairing leaves no pending request behind for a later test to approve.
+      if (connection.pairing !== null) this.removePendingPairing(connection.pairing.code);
+      this.connections.delete(connection);
+    });
     socket.on('error', () => {
       /* terminated by the client during drop tests */
     });
@@ -519,11 +622,163 @@ export class FakeGateway {
       minClientVersion: this.options.minClientVersion ?? MIN_CLIENT_VERSION,
       capabilities: this.options.push === true ? [...CAPABILITIES, 'push-v1'] : [...CAPABILITIES],
       authenticated: connection.token !== null,
-      device: { id: connection.device.id, name: connection.device.name },
+      device: {
+        id: connection.device.id,
+        name: connection.device.name,
+        // Spec 011: `hello.device` carries `kind` + the granted `scopes`. Omitted entirely when the
+        // fixture models an older gateway (`deviceScopes` unset), so "absent" stays distinguishable
+        // from "reported an empty grant".
+        ...(this.options.deviceScopes === undefined
+          ? {}
+          : { kind: 'mobile' as const, scopes: this.options.deviceScopes }),
+      },
       gatewayId: 'b3a4c2c9-5d2f-4a8e-9f2b-0c1d2e3f4a5b',
       dshVersion: '0.2.2-rc.1',
       certSha256: this.certificate.certSha256,
     };
+  }
+
+  /**
+   * Contract §3.8: everything a pairing socket may (not) do before the Host admits it.
+   *
+   * A proof with a well-formed `clientNonce` reserves the one-time code and raises one pending
+   * request; anything else is refused with `op/forbidden`, and the third refusal closes 4403.
+   * An ill-formed nonce is a different outcome — 4403 `pairing/bad-nonce`, immediately — and a
+   * missing `otpProof` on an OTP challenge expires the attempt with 4410, as the contract pins.
+   */
+  private handlePreAdmissionFrame(connection: Connection, frame: Record<string, unknown>): void {
+    const pairing = connection.pairing;
+    if (pairing === null) return;
+    const socket = connection.socket;
+    const type = typeof frame.type === 'string' ? frame.type : null;
+
+    if (type === PAIRING_PROOF_TYPE) {
+      const nonce = frame.clientNonce;
+      if (typeof nonce !== 'string' || !PAIRING_NONCE.test(nonce)) {
+        // Contract §3.8: a missing or ill-formed nonce closes the socket with 4403 bad-nonce.
+        socket.close(PAIRING_CLOSE_CODES.rejected, 'pairing/bad-nonce');
+        return;
+      }
+      if (this.options.otpRequired === true) {
+        // Contract §3.8: with `otpRequired` the proof MUST carry `otpProof`; a wrong or missing
+        // one expires the attempt with 4410. This fixture does not verify a real HMAC (the app
+        // has no OTP flow yet); it only requires the field.
+        if (typeof frame.otpProof !== 'string' || frame.otpProof === '') {
+          socket.close(PAIRING_CLOSE_CODES.expired, 'pairing/expired');
+          return;
+        }
+      }
+      this.admitPairing(connection, nonce);
+      return;
+    }
+
+    // Any other frame before admission: refuse it, and the third refusal closes 4403.
+    pairing.refusals += 1;
+    this.pairingRefusals += 1;
+    // Echo the offending frame's own discriminator: an operation carries `type`, a misplaced
+    // server-style frame (e.g. a forged `paired`) carries `kind`.
+    const requestType = typeof frame.type === 'string'
+      ? frame.type
+      : (typeof frame.kind === 'string' ? frame.kind : null);
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(toFrame({
+        kind: 'error',
+        code: 'op/forbidden',
+        ...(requestType === null ? {} : { requestType }),
+        message: 'only the pairing proof is accepted before the Host approves',
+        ...(typeof frame.requestId === 'string' ? { requestId: frame.requestId } : {}),
+      }));
+    }
+    if (pairing.refusals >= 3) socket.close(PAIRING_CLOSE_CODES.rejected, 'pairing/refused');  }
+
+  /** A valid proof: reserve the code, raise the pending request, then approve or wait. */
+  private admitPairing(connection: Connection, clientNonce: string): void {
+    const pairing = connection.pairing;
+    if (pairing === null || pairing.pending !== null) return; // already admitted by this proof
+    this.pairingCodes.delete(pairing.code); // one-time: the proof consumes the code
+    this.consumedPairingCodes.push(pairing.code);
+    this.pairingProofs.push(clientNonce);
+    pairing.proofNonce = clientNonce;
+    pairing.admitted = true;
+
+    const verificationCode = this.options.verificationCode ?? '482 913';
+    const requestId = `pair-req-${this.nextToken}`;
+    const expiresAt = Date.now() + (this.options.pairingExpiryMs ?? 5 * 60_000);
+    pairing.pending = { verificationCode, requestId, expiresAt };
+    this.pendingPairings.push({ code: pairing.code, verificationCode, requestId, expiresAt, clientNonce });
+
+    const socket = connection.socket;
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(toFrame({ kind: 'pairing-pending', verificationCode, requestId, expiresAt }));
+    }
+    // Default: approve immediately, so every pre-existing test keeps its shape (the extra
+    // challenge/pending frames are tolerated by the client and invisible to their assertions).
+    if (this.options.autoApprovePairing !== false) this.approvePairing(connection);
+  }
+
+  /**
+   * Approve a pending pairing: mint the device token and send `paired` then `hello`, i.e. the
+   * moment a human clicks Approve on the desktop. Defaults to every pending pairing.
+   */
+  approvePairing(target?: Connection): void {
+    const candidates = target === undefined ? this.pendingConnections() : [target];
+    for (const connection of candidates) {
+      const pairing = connection.pairing;
+      if (pairing === null || pairing.pending === null || pairing.approved) continue;
+      pairing.approved = true;
+      const token = `tok-${this.nextToken++}`;
+      this.tokens.add(token);
+      this.minted.push(token);
+      connection.token = token;
+      // A later bearer connection is this same device (resolved from the token, not the header).
+      this.tokenDevices.set(token, connection.device.id);
+      this.removePendingPairing(pairing.code);
+      if (connection.socket.readyState !== WebSocket.OPEN) continue;
+      connection.socket.send(toFrame({ kind: 'paired', token, device: connection.device }));
+      this.sendHello(connection);
+      if (this.options.closeAfterHello !== undefined) {
+        connection.socket.close(this.options.closeAfterHello, 'close-after-hello');
+      }
+    }
+  }
+
+  /**
+   * Reject a pending pairing (the desktop user refused): `pairing-rejected` then close 4403.
+   * Defaults to every pending pairing.
+   */
+  rejectPairing(target?: Connection, reason = 'pairing/refused'): void {
+    const candidates = target === undefined ? this.pendingConnections() : [target];
+    for (const connection of candidates) {
+      const pairing = connection.pairing;
+      if (pairing === null || pairing.pending === null) continue;
+      this.removePendingPairing(pairing.code);
+      connection.socket.send(toFrame({ kind: 'pairing-rejected', reason }));
+      connection.socket.close(PAIRING_CLOSE_CODES.rejected, reason);
+    }
+  }
+
+  /**
+   * Expire a pending pairing (the five-minute window ran out, contract §3.8): `pairing-rejected`
+   * then close 4410 `pairing/expired`. Defaults to every pending pairing.
+   */
+  expirePairing(target?: Connection, reason = 'pairing/expired'): void {
+    const candidates = target === undefined ? this.pendingConnections() : [target];
+    for (const connection of candidates) {
+      const pairing = connection.pairing;
+      if (pairing === null || pairing.pending === null) continue;
+      this.removePendingPairing(pairing.code);
+      connection.socket.send(toFrame({ kind: 'pairing-rejected', reason }));
+      connection.socket.close(PAIRING_CLOSE_CODES.expired, reason);
+    }
+  }
+
+  private pendingConnections(): Connection[] {
+    return [...this.connections].filter((c) => c.pairing !== null && c.pairing.pending !== null && !c.pairing.approved);
+  }
+
+  private removePendingPairing(code: string): void {
+    const index = this.pendingPairings.findIndex((entry) => entry.code === code);
+    if (index >= 0) this.pendingPairings.splice(index, 1);
   }
 
   private sendHello(connection: Connection): void {
@@ -538,6 +793,13 @@ export class FakeGateway {
       frame = JSON.parse(text) as Record<string, unknown>;
     } catch {
       this.serverErrors.push('non-json frame');
+      return;
+    }
+    // Contract §3.8: a pairing socket is a restricted state machine, not a MobileConnection.
+    // Until a valid proof admits it, the ONLY frame it may send is `pairing-proof` (which
+    // deliberately carries no `requestId`), so this gate runs before the request shape check.
+    if (connection.pairing !== null && !connection.pairing.admitted) {
+      this.handlePreAdmissionFrame(connection, frame);
       return;
     }
     const type = frame.type;
@@ -594,6 +856,39 @@ export class FakeGateway {
     switch (type) {
       case 'sessions':
         return send({ kind: 'sessions', items: this.sessions.map(sessionRow) });
+      // Spec 011 authoring reads (contract revision 7). A device without `sessions:author` is refused
+      // by the gateway before it reaches these, so the fixture only models the allowed path.
+      case 'workspaces':
+        return send({ kind: 'workspaces', items: FIXTURE_WORKSPACES });
+      case 'models':
+        // The MEASURED per-session reply: `{ current, routable, groups, failures }`.
+        return send({
+          kind: 'models',
+          current: FIXTURE_CURRENT_MODEL,
+          routable: true,
+          groups: FIXTURE_MODEL_GROUPS,
+          failures: [],
+        });
+      // Spec 011 authoring write: create a session in the requested workspace. The fixture keeps it
+      // in its own list, so a caller that refreshes afterwards really sees the new session.
+      case 'session-create': {
+        const workspaceId = typeof frame.workspaceId === 'string' ? frame.workspaceId : '';
+        if (workspaceId === '') return fail('bad-request', 'workspaceId required');
+        if (!FIXTURE_WORKSPACES.some((workspace) => workspace.workspaceId === workspaceId)) {
+          return fail('bad-request', 'workspaceId is not a workspace of this host');
+        }
+        this.seq += 1;
+        const createdId = `sess-created-${this.seq}`;
+        this.sessions.push({
+          id: createdId,
+          title: `New session ${this.seq}`,
+          state: 'idle',
+          // Must be recent: the app windows its list to the last 30 days, so a fixed past timestamp
+          // would make a freshly created session vanish from the list it is supposed to appear in.
+          updatedAt: Date.now(),
+        });
+        return send({ kind: 'session-created', sessionId: createdId, requestId: frame.requestId });
+      }
       case 'search': {
         const q = typeof frame.query === 'string' ? frame.query.toLowerCase() : '';
         const rows = this.sessions

@@ -1,0 +1,73 @@
+# 03 — session list: tabs, canonical projections, search (US2, A022, A046).
+#
+# SCENARIO: already paired (run 02 first, or a persisted host).
+# HARNESS:  `--cert-mode ok`.
+#
+# The fixture serves **canonical** rows (`sessionId`, boolean `running`, epoch-ms `updatedAt`,
+# title under `projections.values.title`, `archived: true` for the archive tab), so a green run
+# here is evidence that the app projects the real upstream row shape — the open question recorded
+# in spec 002 ("session state mapping and history row shape inferred — verify against real
+# gateway in A040").
+#
+# HOOKS (see "Test hooks" in e2e/README.md):
+#   sessions-tab-running / -idle / -archived   the tab targets (locale-independent)
+#   session-row-sess-alpha / -beta / -gamma    the fixture rows (`sess-alpha` running,
+#                                              `sess-beta` idle, `sess-gamma` archived)
+#
+# EXIT CRITERIA:
+#   1. the three tabs render and switch;
+#   2. each fixture id appears in its own tab and nowhere else (asserted per row hook);
+#   3. search narrows the list to the matching title.
+#
+# The search field still has no hook: it is addressed by its placeholder (documented gap, not a
+# manual step — it is the same text in both message tables).
+
+appId: com.dshext.companion
+---
+# Spec 011 P1-A: the app opens on the Workspace home tab; the session list lives under Conversations.
+- tapOn:
+    id: "tab-conversations"
+# Running tab is the default.
+- assertVisible:
+    id: "sessions-tab-running"
+- assertVisible:
+    id: "sessions-tab-idle"
+- assertVisible:
+    id: "sessions-tab-archived"
+- assertVisible:
+    id: "session-row-sess-alpha"
+- assertVisible: ".*Refactor gateway TLS.*"
+- assertNotVisible:
+    id: "session-row-sess-beta"
+- assertNotVisible:
+    id: "session-row-sess-gamma"
+
+# Idle tab: the second canonical row.
+- tapOn:
+    id: "sessions-tab-idle"
+- assertVisible:
+    id: "session-row-sess-beta"
+- assertVisible: ".*Release notes draft.*"
+- assertNotVisible:
+    id: "session-row-sess-alpha"
+
+# Archived tab: the row that is only expressible through the archive marker.
+- tapOn:
+    id: "sessions-tab-archived"
+- assertVisible:
+    id: "session-row-sess-gamma"
+- assertVisible: ".*Old spike.*"
+- assertNotVisible:
+    id: "session-row-sess-beta"
+
+# Search is a server round-trip (`search`) merged into the cached list.
+- tapOn:
+    id: "sessions-tab-running"
+- tapOn: ".*(Search sessions|Tìm phiên).*"
+- inputText: "release"
+- extendedWaitUntil:
+    visible:
+      id: "session-row-sess-beta"
+    timeout: 15000
+- assertNotVisible:
+    id: "session-row-sess-gamma"

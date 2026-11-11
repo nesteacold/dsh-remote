@@ -1,4 +1,5 @@
 import { createTestConnection, createTestRemoteAccess } from './helpers/peer.mjs'
+import { listenFetchSafe } from './support/fetch-safe-listen.mjs'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -167,7 +168,9 @@ const server = http.createServer((req, res) => {
   res.end()
 })
 const webServer = {
-  port: 18086,
+  // Bound below with an OS-chosen port. This used to be the fixed 18086, which made two suites
+  // (or a suite beside `test:package`) collide with EADDRINUSE and abort the `&&` chain mid-run.
+  port: 0,
   register(route) { managementRoute = route; return () => { managementRoute = null } },
   registerUpgrade(route) { server.on('upgrade', (req, socket, head) => route.handler(req, socket, head)); return () => {} },
 }
@@ -495,11 +498,14 @@ await plugin.apply(ctx, {
   // T016: a per-run certificate directory (the default would sit beside the
   // fixed device file and be reused across runs).
   tlsCertificateDir: fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-dispatch-tls-')),
-  deviceFile: '/tmp/dsh-mobile-gateway-dispatch-test-devices.json',
+  // Per-run device registry. This was a fixed shared path (`/tmp/…dispatch-test-devices.json`), so
+  // two concurrent runs paired into the same file and could observe each other's devices.
+  deviceFile: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-dispatch-devices-')), 'devices.json'),
   fileDownloadChunkBytes: 64 * 1024,
 })
-server.listen(webServer.port)
-
+// Bind an OS-chosen port (fetch-safe: undici refuses some ports) instead of the old fixed 18086.
+const { port: managementPort } = await listenFetchSafe(server)
+webServer.port = managementPort
 const WebSocket = require('ws')
 function waitFor(pred, timeout) { return new Promise((res) => { const t0 = Date.now(); const iv = setInterval(() => { if (pred()) { clearInterval(iv); res(true) } else if (Date.now() - t0 > timeout) { clearInterval(iv); res(false) } }, 20) }) }
 

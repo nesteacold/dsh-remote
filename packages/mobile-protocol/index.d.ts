@@ -1,5 +1,5 @@
 /**
- * TypeScript declarations for `@dsh-ext/mobile-protocol` (contract v1, revision 4).
+ * TypeScript declarations for `@dsh-ext/mobile-protocol` (contract v1, revision 7).
  *
  * Keep in step with `src/index.mjs`; `test/contract.test.mjs` checks the runtime values
  * against the contract document, and `types.test-d.ts` inside the companion app keeps a
@@ -46,6 +46,11 @@ export type Op =
   | 'device-forget'
   | 'push-register'
   | 'push-remove'
+  // Spec 011 (revision 7): session-authoring ops, gated by `sessions:author`.
+  | 'workspaces'
+  | 'session-create'
+  | 'models'
+  | 'select-model'
 
 export const OPS: readonly Op[]
 
@@ -64,6 +69,11 @@ export type ResponseKind =
   | 'device-forgotten'
   | 'push-registered'
   | 'push-removed'
+  // Spec 011 (revision 7): the kinds the upstream gateway answers the authoring ops with.
+  | 'workspaces'
+  | 'session-created'
+  | 'models'
+  | 'select-model'
 
 export const OP_RESPONSES: Readonly<Record<Op, ResponseKind>>
 
@@ -93,17 +103,69 @@ export type Scope =
   | 'plugins:manage'
   | 'schedule:write'
   | 'terminal'
+  /**
+   * Spec 011: list this Host's workspaces, list the model catalog, create a session and
+   * pick its provider/model. Explicit only; deliberately NOT desktop-only (a `mobile`
+   * device may hold it).
+   */
+  | 'sessions:author'
 
 export const SCOPES: readonly Scope[]
 export const DESKTOP_DEFAULT_SCOPES: readonly Scope[]
+/**
+ * Scopes no default grant may contain for any device kind (spec 011 FR-006).
+ * `sessions:author` is grantable to a `mobile` device, so it is not desktop-only and
+ * would otherwise fall into both default computations; it must be an explicit tick.
+ * Explicit grants (an owner's tick, `SCOPE_PRESETS.full`) still include it.
+ */
+export const NEVER_DEFAULT_SCOPES: readonly Scope[]
 /** Scopes only a `desktop` device may hold, and only when chosen explicitly. */
 export const DESKTOP_ONLY_SCOPES: readonly Scope[]
 export type ScopePresetName = 'standard' | 'full'
-/** Devices UI presets: `standard` = default at Approve, `full` = every desktop scope. */
+/** Devices UI presets: `standard` = default at Approve, `full` = every contract scope. */
 export const SCOPE_PRESETS: Readonly<Record<ScopePresetName, readonly Scope[]>>
 
+/** Spec 011 client types: the last four `Op`s, served only to a device holding `sessions:author`. */
+export type AuthoringType = 'workspaces' | 'session-create' | 'models' | 'select-model'
+export const AUTHORING_CLIENT_TYPES: readonly AuthoringType[]
+/** The scope every authoring type requires (`sessions:author`). */
+export const AUTHORING_SCOPE: Scope
+
 /** Scope of each scoped inbound type; a type absent here is refused for a scoped device. */
-export const SCOPE_BY_TYPE: Readonly<Partial<Record<Op | RemoteClientType, Scope>>>
+export const SCOPE_BY_TYPE: Readonly<Partial<Record<Op | RemoteClientType | AuthoringType, Scope>>>
+
+export interface WorkspacesFrame {
+  type: 'workspaces'
+  requestId: string
+}
+
+export interface SessionCreateFrame {
+  type: 'session-create'
+  requestId: string
+  /** One of this Host's workspaces; a foreign id is refused. */
+  workspaceId?: string
+  /** Needs `workspace:manage`: an arbitrary Host directory. */
+  cwd?: string
+  /** Needs `workspace:manage`: an arbitrary agent composition. */
+  agentPreset?: string
+}
+
+export interface ModelsFrame {
+  type: 'models'
+  requestId: string
+  /** With a session: that session's catalog. Without: the whole Host catalog. */
+  sessionId?: string
+}
+
+export interface SelectModelFrame {
+  type: 'select-model'
+  requestId: string
+  /** A session this device can address; otherwise refused like `session/prompt`. */
+  sessionId: string
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
 
 // ---------------------------------------------------------------------------
 // Spec 008 — remote-bridge channel (revision 4, additive)
@@ -187,6 +249,72 @@ export const CLOSE_CODES: Readonly<{
   reauth: 4003
   revoked: 4401
 }>
+
+// ---------------------------------------------------------------------------
+// §3.8 — pairing proof exchange (revision 6, additive)
+// ---------------------------------------------------------------------------
+
+/** The single client frame a pairing socket may send before the Host approves. */
+export const PAIRING_PROOF_TYPE: 'pairing-proof'
+/** Format a `clientNonce` MUST match: 16–64 chars of unpadded base64url (stateless regex). */
+export const PAIRING_NONCE: RegExp
+/**
+ * Close codes of a pairing connection. Deliberately separate from {@link CLOSE_CODES},
+ * which stays pinned to the authenticated-connection codes.
+ * `rejected` 4403, `timeout` 4408, `expired` 4410.
+ */
+export const PAIRING_CLOSE_CODES: Readonly<{
+  rejected: 4403
+  timeout: 4408
+  expired: 4410
+}>
+
+/**
+ * Build a `clientNonce`: 32 chars of unpadded base64url (192 bits), inside
+ * {@link PAIRING_NONCE}. `randomBytes` defaults to Web Crypto and may be injected
+ * (e.g. the app's `expo-crypto`); it MUST return cryptographically secure bytes, and
+ * the function THROWS rather than fall back to a weak source.
+ */
+export function createClientNonce(randomBytes?: (size: number) => Uint8Array | ArrayLike<number>): string
+
+/** Server frame sent once as soon as a pairing socket opens (unconditional). */
+export interface PairingChallengeFrame {
+  kind: 'pairing-challenge'
+  /** Opaque server nonce (unpadded base64url). */
+  serverNonce: string
+  /** The pinned leaf the gateway presents (64 lowercase hex). */
+  certSha256: string
+  /** True for an OTP flow (the proof needs `otpProof`); false for the QR/long-string flow. */
+  otpRequired: boolean
+}
+
+/** The only client frame a pairing socket may send before the Host approves. */
+export interface PairingProofFrame {
+  type: 'pairing-proof'
+  /** MUST match {@link PAIRING_NONCE}. */
+  clientNonce: string
+  /** REQUIRED when the challenge had `otpRequired: true`, and MUST be absent otherwise. */
+  otpProof?: string
+}
+
+/** Proof accepted; the request now waits for the Host user's approval (5-minute window). */
+export interface PairingPendingFrame {
+  kind: 'pairing-pending'
+  /** Short human code, shown on the Host too; the user compares them. */
+  verificationCode: string
+  requestId: string
+  /** Epoch milliseconds when the pending request expires. */
+  expiresAt: number
+}
+
+/** Sent just before the socket closes, with one of the pairing close codes. */
+export interface PairingRejectedFrame {
+  kind: 'pairing-rejected'
+  /** e.g. `pairing/timeout`, `pairing/expired`, `pairing/refused`, `pairing/bad-nonce`. */
+  reason: string
+}
+
+export type PairingCloseCode = 4403 | 4408 | 4410
 
 export type ContractErrorCode =
   | 'auth/required'

@@ -49,16 +49,19 @@ export function deviceAccessAvailable(ctx) {
  * @param {object} deps.ctx plugin Context with `connection` and `remoteAccess`
  * @param {(deviceId: string) => (object|undefined)} deps.getDevice live registry record (undefined once revoked)
  * @param {() => Iterable<string>} deps.getVisibleSessionIds EXACT ids a device may see (snapshot, see `refreshSessions`)
+ * @param {() => Iterable<string>} [deps.getWorkspaceIds] EXACT workspace ids of this Host: DSH filters the
+ *   `workspace/follow` baseline per item, so this is what makes a workspace visible to a device at all
  * @param {(message: string) => void} [deps.log]
  * @throws when the Host lacks `remoteAccess` (the plugin must not start a device path without it)
  */
-export function createDeviceAccess({ ctx, getDevice, getVisibleSessionIds, log = () => {} }) {
+export function createDeviceAccess({ ctx, getDevice, getVisibleSessionIds, getWorkspaceIds, log = () => {} }) {
   if (!deviceAccessAvailable(ctx)) {
     throw new Error('mobile-gateway requires DSH remoteAccess (ctx.remoteAccess.registerPolicy) to run paired devices as non-owner Peers')
   }
   const policy = createCompanionAccessPolicy({
     getDevice,
     getSessionIds: () => getVisibleSessionIds(),
+    ...(getWorkspaceIds === undefined ? {} : { getWorkspaceIds }),
   })
   // Registered exactly once; DSH throws on a duplicate kind and removes the
   // policy with the plugin's fiber, so no manual teardown is needed for it.

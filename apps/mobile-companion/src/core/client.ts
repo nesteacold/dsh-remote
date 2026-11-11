@@ -12,6 +12,11 @@
 //
 // Close codes (contract §3): 4004 gateway disabled (stop auto-reconnect), 4003 re-authenticate,
 // 4401 revoked (wipe the credential). In-band `auth/revoked` / `remote/disabled` behave the same.
+// An HTTP upgrade refusal takes that path too: the pinned transport maps 401 -> `auth/required`
+// and 403 -> `remote/disabled` onto its *error* event (`details.status`), and both are permanent
+// — the same stored credential and the same owner switch would be refused again — so they end the
+// attempt with `retry: false` instead of feeding the reconnect loop a host that keeps refusing
+// (device trace: a 403 host was retried every 30 s, forever).
 //
 // Close semantics (M6): ending a connection is terminal and reported exactly once. `close()` is
 // authoritative even when the transport stays silent after a local close (a native socket can be
@@ -19,6 +24,16 @@
 // becomes `closed` (a terminal protocol state is kept) and one `disconnected` is emitted. The
 // handshake is bounded too: `handshakeTimeoutMs` (default 10 s) covers no `open`, no `hello` and
 // no accepted `client-hello`, so an attempt cannot wait forever for a host that never answers.
+//
+// Pairing proof exchange (contract §3.8, additive): a pairing socket is not a MobileConnection.
+// The Host sends `pairing-challenge` unconditionally on accept, the client answers with exactly
+// one `pairing-proof {clientNonce}` (the only frame it may send before admission), and then the
+// socket waits for a human to approve on the desktop — up to five minutes — before `paired`.
+// That wait is NOT a handshake step: `pairing-pending` clears the handshake deadline and replaces
+// it with an approval deadline derived from the Host's `expiresAt` (clamped by
+// `pairApprovalTimeoutMs`), so the 10 s handshake budget can never kill a pending approval.
+// A Host that never sends a challenge still works exactly as before (a bare `paired` is
+// accepted), which keeps the app compatible with fixtures and older Hosts mid-migration.
 //
 // Hard invariant (SC-002): no frame is handed to the transport before the socket is open. An
 // inbound application frame can only travel over a socket whose TLS handshake and certificate
@@ -32,8 +47,12 @@ import {
   CLOSE_CODES,
   COMPANION_PROTOCOL_VERSION,
   OPS,
+  PAIRING_CLOSE_CODES,
+  PAIRING_NONCE,
+  PAIRING_PROOF_TYPE,
   PING_INTERVAL_MS,
   authSubprotocols,
+  createClientNonce,
   pairingSubprotocols,
   type ApprovalRequestedFrame,
   type ApprovalResolvedFrame,
@@ -44,7 +63,7 @@ import {
 } from '@dsh-ext/mobile-protocol';
 
 import { CoreError, normaliseErrorCode, type CoreErrorCode } from './errors';
-import { TRANSPORT_ERROR, type Transport, type TransportEvent } from './transport';
+import { TRANSPORT_ERROR, type ListenerFailureReporter, type Transport, type TransportEvent } from './transport';
 
 export interface UpdateRequired {
   /** Which side must be updated for the connection to work. */
@@ -72,6 +91,13 @@ export interface ClientEventMap {
   state: ClientState;
   /** `paired` arrived: store the token now, it is sent only once. */
   paired: { token: string; device: DeviceInfo };
+  /**
+   * Contract §3.8: the Host accepted the proof and reserved the one-time code; it now waits for
+   * a human to approve this phone on the desktop. Show `verificationCode` (the desktop displays
+   * the same one). Neither success nor failure: only `paired` is success, and no frame may be
+   * sent until then.
+   */
+  pairingPending: { verificationCode: string; requestId: string; expiresAt: number };
   /** Server `hello` accepted and `client-hello` answered. */
   ready: { hello: HelloFrame; device: DeviceInfo | null };
   /** A request failed, or the server sent an error frame. */
@@ -90,8 +116,11 @@ export interface ClientEventMap {
   revoked: { code: 'auth/revoked' };
   /** Owner switched remote control off: stop auto-reconnect, show the "turn it on" screen. */
   gatewayDisabled: { code: 4004 | 'remote/disabled' };
-  /** Host asked to re-authenticate (close 4003): reconnect (pairing if the token is gone). */
-  reauthRequired: { code: 4003 };
+  /**
+   * The host asked to re-authenticate: close 4003 mid-connection (reconnect, the credential is
+   * fine) or an HTTP 401 upgrade refusal (`auth/required` — permanent, so `retry: false`).
+   */
+  reauthRequired: { code: 4003 | 'auth/required' };
 }
 
 type Handler<K extends keyof ClientEventMap> = (payload: ClientEventMap[K]) => void;
@@ -135,10 +164,35 @@ export interface ClientOptions {
    * default is 10 s; `0` disables the deadline (tests inject a small value).
    */
   handshakeTimeoutMs?: number;
+  /**
+   * Source of the `clientNonce` for the pairing proof (contract §3.8). Defaults to
+   * `createClientNonce()`, which uses Web Crypto. The app injects `expo-crypto` bytes instead:
+   * React Native need not provide `crypto.getRandomValues`, and an unusable source is reported
+   * (`client/bad-state`) rather than written to the wire.
+   */
+  clientNonce?: () => string;
+  /**
+   * Safety net for the approval wait (contract §3.8: the pending window is five minutes). The
+   * local deadline comes from the Host's `expiresAt`; this bounds it so a Host that promises a
+   * far-future expiry cannot hold the app forever. Defaults to the pending window plus a 30 s
+   * allowance for clock skew. `0` disables the local bound (the Host still expires the request).
+   */
+  pairApprovalTimeoutMs?: number;
   /** Ping interval override (tests); defaults to the contract's 25 s. */
   pingIntervalMs?: number;
   /** Called exactly once per connection when the host confirms revocation. */
   onRevoked?: () => void | Promise<void>;
+  /**
+   * Listener-boundary failure reporter (secret-free: a fixed boundary name plus a fixed stage
+   * string). Absent by default.
+   *
+   * Every `on()` handler used to be wrapped in an empty catch, so a throwing handler vanished —
+   * that is how a device run stayed silent while nothing happened on the wire. Isolation stays
+   * (the other handlers still run), but a throw is now reported. When it happens while a server
+   * frame is being processed, the attempt is finished too: a half-applied frame must not leave
+   * the client looking healthy, and a programming error must not spin a reconnect loop.
+   */
+  onListenerFailure?: ListenerFailureReporter;
 }
 
 interface PendingRequest {
@@ -156,6 +210,16 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
  * not a slow network, and must not leave the app stuck in `connecting`/`waiting-*` forever.
  */
 export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+
+/**
+ * Local upper bound for the desktop-approval wait (contract §3.8): the five-minute pending window
+ * plus 30 s of allowance for clock skew between this phone and the Host.
+ *
+ * This is deliberately NOT a handshake deadline. The handshake budget ends when `pairing-pending`
+ * arrives, because the approval wait is governed by the Host's `expiresAt`; this constant only
+ * caps a Host that promises an unreasonably distant expiry.
+ */
+export const DEFAULT_PAIR_APPROVAL_TIMEOUT_MS = 5 * 60_000 + 30_000;
 
 /**
  * Placeholder transport before the first `connect()` on a factory-based client. It never
@@ -186,6 +250,28 @@ const TRANSPORT_RETRYABLE: ReadonlySet<string> = new Set<string>([
 
 /** Close codes after which automatic reconnection is pointless (contract §3). */
 export const NO_AUTO_RECONNECT_CLOSE_CODES: ReadonlySet<number> = new Set([CLOSE_CODES.gatewayDisabled]);
+
+/**
+ * The terminal contract outcome of a **permanent** HTTP upgrade refusal, or `null` when the
+ * attempt is worth retrying (5xx, a generic network failure, a refused pin).
+ *
+ * The pinned transport maps 401 -> `auth/required` and 403 -> `remote/disabled`
+ * (`defaultUpgradeMapping`) and keeps the raw status in `details.status`; the `TransportEvent`
+ * doc promises that status for every upgrade refusal, so a transport that only reports the bare
+ * `client/upgrade-failed` code is still classified by its status. Only machine-readable fields
+ * are read here — never the message text.
+ */
+export function classifyUpgradeRefusal(
+  code: string,
+  details: Record<string, unknown> | undefined,
+): 'remote/disabled' | 'auth/required' | null {
+  if (code === 'remote/disabled') return 'remote/disabled';
+  if (code === 'auth/required') return 'auth/required';
+  const status = details === undefined ? undefined : details.status;
+  if (status === 403) return 'remote/disabled';
+  if (status === 401) return 'auth/required';
+  return null;
+}
 
 /**
  * Map a host version mismatch to a typed update requirement. `minClientVersion` above our
@@ -332,6 +418,8 @@ export class CompanionClient {
   private readonly newRequestId: () => string;
   private readonly requestTimeoutMs: number;
   private readonly handshakeTimeoutMs: number;
+  private readonly clientNonce: () => string;
+  private readonly pairApprovalTimeoutMs: number;
   private readonly pingIntervalMs: number;
   private readonly appVersion: string;
   private readonly platform: 'ios' | 'android';
@@ -345,6 +433,20 @@ export class CompanionClient {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   /** Bounded handshake deadline for the current attempt (null once it finished or was cleared). */
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Deadline for the Host user's approval on the desktop (contract §3.8), armed by
+   * `pairing-pending` from the Host's `expiresAt` and cleared with the handshake deadline.
+   */
+  private approvalTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * True from `pairing-pending` until the attempt ends. While it holds, the transport handshake
+   * deadline must not fire: the approval window is bound by its own deadline.
+   */
+  private approvalPending = false;
+  /** The proof is written exactly once per connection (contract §3.8). */
+  private pairingProofSent = false;
+  /** `reason` of an in-band `pairing-rejected`, kept for the close-code error message. */
+  private pairingRejectedReason: string | null = null;
   /**
    * True once the end of the current connection was reported. The first terminal report wins
    * (local close, transport close or the handshake deadline), so listeners see exactly one
@@ -361,6 +463,15 @@ export class CompanionClient {
   private lastClientHelloId: string | null = null;
   /** True when `options.transport` is a factory: a fresh transport per connection. */
   private readonly isFactory: boolean;
+  /** Secret-free listener-failure reporter (`undefined`: failures stay silent, as before). */
+  private readonly onListenerFailure: ListenerFailureReporter | undefined;
+  /**
+   * True while a server frame is being dispatched. A throwing handler then means a half-applied
+   * frame, so the protocol-processing path ends the attempt instead of carrying on.
+   */
+  private inProtocolProcessing = false;
+  /** Set once a listener failure ended the attempt, so a second throw cannot finish it again. */
+  private terminatingForListenerFailure = false;
 
   constructor(options: ClientOptions) {
     const source = options.transport;
@@ -376,9 +487,12 @@ export class CompanionClient {
     this.newRequestId = options.newRequestId ?? defaultRequestId;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
+    this.clientNonce = options.clientNonce ?? (() => createClientNonce());
+    this.pairApprovalTimeoutMs = options.pairApprovalTimeoutMs ?? DEFAULT_PAIR_APPROVAL_TIMEOUT_MS;
     this.pingIntervalMs = options.pingIntervalMs ?? PING_INTERVAL_MS;
     this.appVersion = options.appVersion;
     this.platform = options.platform;
+    this.onListenerFailure = options.onListenerFailure;
     if (options.onRevoked) {
       this.on('revoked', () => {
         void options.onRevoked?.();
@@ -459,6 +573,8 @@ export class CompanionClient {
     this.transport = this.isFactory ? this.createTransport() : this.transport;
     this.clearHandshakeTimer();
     this.closeReported = false;
+    // A new attempt may again end on a listener failure: the guard is per attempt, not lifetime.
+    this.terminatingForListenerFailure = false;
     this._state = 'connecting';
     this._hello = null;
     this._device = null;
@@ -467,6 +583,10 @@ export class CompanionClient {
     this.transportReady = false;
     this.pairing = isPairing;
     this.pairedReceived = false;
+    // §3.8 state is per connection: a reused client must not carry a previous attempt's proof
+    // guard or rejection reason into the next one.
+    this.pairingProofSent = false;
+    this.pairingRejectedReason = null;
     this.unsubscribe = this.transport.on((event) => this.onTransportEvent(event));
 
     const headers: Record<string, string> = {};
@@ -502,11 +622,12 @@ export class CompanionClient {
           message: error instanceof Error ? error.message : 'The transport could not start',
           retryable: true,
         }),
+        'transport-connect',
       );
       this.finishConnection(1006, 'connect-failed', true);
       return;
     }
-    this.emit('state', this._state);
+    this.emit('state', this._state, 'state');
   }
 
   /**
@@ -648,9 +769,9 @@ export class CompanionClient {
       }),
     );
     if (!terminal) this._state = 'closed';
-    if (!terminal && active) this.emit('state', this._state);
+    if (!terminal && active) this.emit('state', this._state, 'state');
     if (active || terminal) {
-      this.emit('disconnected', { code, reason, retry: terminal ? false : retry });
+      this.emit('disconnected', { code, reason, retry: terminal ? false : retry }, 'disconnected');
     }
     this.transport.close(code, reason);
   }
@@ -665,7 +786,7 @@ export class CompanionClient {
         if (this._state !== 'connecting') return;
         this.transportReady = true;
         this._state = 'waiting-hello';
-        this.emit('state', this._state);
+        this.emit('state', this._state, 'state');
         return;
       case 'message':
         // A transport must not deliver frames after a reported close (contract §3.1); drop
@@ -684,7 +805,7 @@ export class CompanionClient {
           if (this._state !== 'connecting') return;
           this.transportReady = true;
           this._state = 'waiting-hello';
-          this.emit('state', this._state);
+          this.emit('state', this._state, 'state');
         }
         this.handleFrameText(event.data);
         return;
@@ -704,29 +825,54 @@ export class CompanionClient {
         this.transportReady = false;
         if (closeCode === CLOSE_CODES.gatewayDisabled) {
           this._state = 'gateway-disabled';
-          this.emit('state', this._state);
-          this.emit('gatewayDisabled', { code: 4004 });
-          this.emit('disconnected', { code: closeCode, reason: event.reason, retry: false });
+          this.emit('state', this._state, 'state');
+          this.emit('gatewayDisabled', { code: 4004 }, 'close');
+          this.emit('disconnected', { code: closeCode, reason: event.reason, retry: false }, 'close');
           return;
         }
         if (closeCode === CLOSE_CODES.revoked) {
           this.fireRevoked();
-          this.emit('disconnected', { code: closeCode, reason: event.reason, retry: false });
+          this.emit('disconnected', { code: closeCode, reason: event.reason, retry: false }, 'close');
           return;
         }
         if (closeCode === CLOSE_CODES.reauth) {
           this._state = 'reauth-required';
-          this.emit('state', this._state);
-          this.emit('reauthRequired', { code: 4003 });
-          this.emit('disconnected', { code: closeCode, reason: event.reason, retry: true });
+          this.emit('state', this._state, 'state');
+          this.emit('reauthRequired', { code: 4003 }, 'close');
+          this.emit('disconnected', { code: closeCode, reason: event.reason, retry: true }, 'close');
+          return;
+        }
+        // Contract §3.8: a pairing connection has its own close codes. They are keyed off the
+        // code, never the reason text: 4408's reason (`pairing/timeout`) reads like any other
+        // timeout, and 4403 covers refusals, bad nonces, busy and disabled alike.
+        const pairingError = pairingCloseError(closeCode);
+        if (pairingError !== null) {
+          // Nothing about a refused/expired pairing is worth retrying automatically: 4403 says so
+          // explicitly, and the other two need a fresh code from the desktop.
+          this._state = 'closed';
+          const reason = this.pairingRejectedReason ?? event.reason;
+          this.emit('state', this._state, 'state');
+          // Reported before `disconnected` so a pairing promise sees this specific code: its
+          // listener only ignores `client/bad-message` / `client/disconnected`.
+          this.emit(
+            'error',
+            new CoreError({
+              code: pairingError.code,
+              message: pairingError.message,
+              retryable: false,
+              details: { closeCode, reason },
+            }),
+            'close:pairing',
+          );
+          this.emit('disconnected', { code: closeCode, reason, retry: false }, 'close');
           return;
         }
         if (this._state !== 'update-required' && this._state !== 'revoked'
           && this._state !== 'gateway-disabled' && this._state !== 'reauth-required') {
           this._state = 'closed';
         }
-        this.emit('state', this._state);
-        this.emit('disconnected', { code: closeCode, reason: event.reason, retry: true });
+        this.emit('state', this._state, 'state');
+        this.emit('disconnected', { code: closeCode, reason: event.reason, retry: true }, 'close');
         return;
       }
       case 'error': {
@@ -745,6 +891,7 @@ export class CompanionClient {
           this.emit(
             'error',
             new CoreError({ code: 'client/pin-mismatch', message: event.message, details: { transport: 'pin' } }),
+            'transport-error',
           );
           return;
         }
@@ -753,7 +900,23 @@ export class CompanionClient {
           this.emit(
             'error',
             new CoreError({ code: 'client/pinned-transport-unavailable', message: event.message, retryable: false }),
+            'transport-error',
           );
+          return;
+        }
+        // A permanent upgrade refusal (401/403, contract §3/§6) arrives as a transport *error*,
+        // not as an in-band frame: the same stored credential or the same owner switch will be
+        // refused on every retry, so the attempt ends exactly like the in-band `auth/required` /
+        // `remote/disabled` frames do — one terminal `disconnected` with `retry: false`, which is
+        // what stops `Reconnector`. Any other status (5xx, unknown) falls through and stays
+        // retryable below.
+        const refusal = classifyUpgradeRefusal(code, event.details);
+        if (refusal === 'remote/disabled') {
+          this.fireGatewayDisabled();
+          return;
+        }
+        if (refusal !== null) {
+          this.fireReauthRequired();
           return;
         }
         // Socket-level errors (ECONNRESET, connect failures) only surface as events: when the
@@ -770,26 +933,52 @@ export class CompanionClient {
             retryable: TRANSPORT_RETRYABLE.has(code),
             ...(event.details === undefined ? {} : { details: event.details }),
           }),
+          'transport-error',
         );
         return;
       }
     }
   }
 
+  /**
+   * Protocol processing entry point. Marks the frame dispatch so a throwing event handler is
+   * treated as a half-applied frame (`reportListenerFailure` then finishes the attempt) instead
+   * of a harmless callback error, and clears the mark on every exit path.
+   */
   private handleFrameText(text: string): void {
+    this.inProtocolProcessing = true;
+    try {
+      this.dispatchFrameText(text);
+    } finally {
+      this.inProtocolProcessing = false;
+    }
+  }
+
+  private dispatchFrameText(text: string): void {
     let frame: unknown;
     try {
       frame = JSON.parse(text);
     } catch {
-      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'Frame is not JSON' }));
+      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'Frame is not JSON' }), 'frame:bad-message');
       return;
     }
     if (typeof frame !== 'object' || frame === null) {
-      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'Frame is not an object' }));
+      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'Frame is not an object' }), 'frame:bad-message');
       return;
     }
     const f = frame as Record<string, unknown>;
     switch (f.kind) {
+      // Contract §3.8: the pairing state machine runs before `paired`, which arrives only after
+      // the desktop user approved. A Host that sends none of these still works (bare `paired`).
+      case 'pairing-challenge':
+        this.handlePairingChallenge(f);
+        return;
+      case 'pairing-pending':
+        this.handlePairingPending(f);
+        return;
+      case 'pairing-rejected':
+        this.handlePairingRejected(f);
+        return;
       case 'paired':
         this.handlePaired(f);
         return;
@@ -807,16 +996,16 @@ export class CompanionClient {
         return;
       case 'approval-requested': {
         const push = parseApprovalRequested(f);
-        if (push !== null) this.emit('approvalRequested', push);
+        if (push !== null) this.emit('approvalRequested', push, 'frame:approval-requested');
         return;
       }
       case 'approval-resolved': {
         const push = parseApprovalResolved(f);
-        if (push !== null) this.emit('approvalResolved', push);
+        if (push !== null) this.emit('approvalResolved', push, 'frame:approval-resolved');
         return;
       }
       case 'event':
-        this.emit('event', f);
+        this.emit('event', f, 'frame:event');
         return;
       default:
         // Responses to requests (`sessions`, `sent`, `approval-response`, ...) are matched by
@@ -827,32 +1016,167 @@ export class CompanionClient {
   }
 
   /**
+   * Contract §3.8: the Host challenges the pairing connection immediately after accepting it and
+   * refuses every frame but the proof until it is admitted. Answer exactly once.
+   *
+   * Failure modes are reported instead of written to the wire: an `otpRequired` challenge is a
+   * flow this build does not implement (decision: fail honestly rather than send a proof the Host
+   * would close with 4410), and an unusable nonce is a broken random source on this device — the
+   * Host would refuse it with 4403 and the user would read "rejected" for our own bug.
+   */
+  private handlePairingChallenge(f: Record<string, unknown>): void {
+    if (!this.pairing) {
+      this.emit(
+        'error',
+        new CoreError({ code: 'client/bad-message', message: 'pairing-challenge on an authenticated connection' }),
+        'frame:pairing-challenge',
+      );
+      return;
+    }
+    if (this.pairingProofSent) {
+      // Additive duplicate: the proof is already out, and a second one breaks "exactly once".
+      this.emit(
+        'error',
+        new CoreError({ code: 'client/bad-message', message: 'a second pairing-challenge arrived' }),
+        'frame:pairing-challenge',
+      );
+      return;
+    }
+    if (f.otpRequired === true) {
+      this.emit(
+        'error',
+        new CoreError({
+          code: 'client/pairing-otp-unsupported',
+          message: 'This computer asks for a one-time code, which this app version cannot answer',
+          retryable: false,
+        }),
+        'frame:pairing-challenge',
+      );
+      this.finishConnection(1002, 'pairing-otp-unsupported', false);
+      return;
+    }
+    const clientNonce = this.clientNonce();
+    if (typeof clientNonce !== 'string' || !PAIRING_NONCE.test(clientNonce)) {
+      this.emit(
+        'error',
+        new CoreError({
+          code: 'client/bad-state',
+          message: 'The pairing nonce source returned an unusable value',
+          details: { stage: 'pairing-challenge' },
+        }),
+        'frame:pairing-challenge',
+      );
+      this.finishConnection(1011, 'pairing-bad-nonce', false);
+      return;
+    }
+    this.pairingProofSent = true;
+    let sent = false;
+    try {
+      sent = this.transport.send(JSON.stringify({ type: PAIRING_PROOF_TYPE, clientNonce }));
+    } catch (error) {
+      // A transport may throw instead of returning false; both mean the frame never left.
+      this.emit(
+        'error',
+        new CoreError({ code: 'client/disconnected', message: 'Socket closed during the pairing proof', cause: error }),
+        'frame:pairing-challenge',
+      );
+    }
+    if (!sent) {
+      this.pairingProofSent = false;
+      if (this.transportReady) {
+        // The transport is open, so no close is coming on its own: report it here. When it is not
+        // open its own close (or the handshake deadline) owns the outcome, as in `sendClientHello`.
+        this.emit(
+          'error',
+          new CoreError({ code: 'client/disconnected', message: 'Socket closed during the pairing proof' }),
+          'frame:pairing-challenge',
+        );
+      }
+    }
+  }
+
+  /**
+   * Contract §3.8: the Host reserved the one-time code and waits for the desktop user to approve,
+   * for up to five minutes. The approval wait is not a handshake step, so the transport deadline
+   * is cleared here and replaced by a deadline derived from the Host's `expiresAt` — otherwise the
+   * 10 s handshake budget would kill a pairing the user is about to approve.
+   */
+  private handlePairingPending(f: Record<string, unknown>): void {
+    if (!this.pairing) {
+      this.emit(
+        'error',
+        new CoreError({ code: 'client/bad-message', message: 'pairing-pending on an authenticated connection' }),
+        'frame:pairing-pending',
+      );
+      return;
+    }
+    const verificationCode = typeof f.verificationCode === 'string' && f.verificationCode !== '' ? f.verificationCode : null;
+    const requestId = typeof f.requestId === 'string' && f.requestId !== '' ? f.requestId : null;
+    const expiresAt = typeof f.expiresAt === 'number' && Number.isFinite(f.expiresAt) ? f.expiresAt : null;
+    if (verificationCode === null || requestId === null || expiresAt === null) {
+      // Without a code the user cannot compare it with the desktop, which is the whole point of
+      // the exchange (contract §3.8): fail instead of waiting for an approval nobody can verify.
+      this.emit(
+        'error',
+        new CoreError({ code: 'client/bad-message', message: 'pairing-pending is malformed' }),
+        'frame:pairing-pending',
+      );
+      this.finishConnection(1002, 'pairing-pending-malformed', false);
+      return;
+    }
+    this.clearHandshakeTimer();
+    this.armApprovalTimer(expiresAt);
+    this.emit('pairingPending', { verificationCode, requestId, expiresAt }, 'frame:pairing-pending');
+  }
+
+  /**
+   * Contract §3.8: the Host refused or expired the pairing and closes right after this frame.
+   * Only the reason is remembered here — the close code (4403/4408/4410) is what the app reports,
+   * and finishing early would race that close into a second, less specific outcome.
+   */
+  private handlePairingRejected(f: Record<string, unknown>): void {
+    if (!this.pairing) {
+      this.emit(
+        'error',
+        new CoreError({ code: 'client/bad-message', message: 'pairing-rejected on an authenticated connection' }),
+        'frame:pairing-rejected',
+      );
+      return;
+    }
+    this.pairingRejectedReason = typeof f.reason === 'string' ? f.reason : null;
+  }
+
+  /**
    * Contract §5a: `paired` is sent **once**, **only on a pairing connection**, before `hello`.
    * Anything else (a replay, a bearer connection, a second frame) is refused and never stored:
    * accepting it would let a stale frame replace the credential the app already trusts.
    */
   private handlePaired(f: Record<string, unknown>): void {
     if (!this.pairing) {
-      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'paired frame on an authenticated connection' }));
+      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'paired frame on an authenticated connection' }), 'frame:paired');
       return;
     }
     if (this._state !== 'waiting-hello' || this.pairedReceived) {
       this.emit(
         'error',
         new CoreError({ code: 'client/bad-message', message: `paired frame is not expected in state ${this._state}` }),
+        'frame:paired',
       );
       return;
     }
     const token = typeof f.token === 'string' ? f.token : null;
     const device = parseDevice(f.device);
     if (token === null || device === null) {
-      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'paired frame is malformed' }));
+      this.emit('error', new CoreError({ code: 'client/bad-message', message: 'paired frame is malformed' }), 'frame:paired');
       return;
     }
     this.pairedReceived = true;
     this._pairedToken = token;
     this._device = device;
-    this.emit('paired', { token, device });
+    // The approval wait is over; the deadline for it must not fire during the rest of the
+    // handshake. (It only exists after `pairing-pending`; clearing it is a no-op otherwise.)
+    this.clearApprovalTimer();
+    this.emit('paired', { token, device }, 'frame:paired');
   }
 
   private handleHello(f: Record<string, unknown>): void {
@@ -863,6 +1187,7 @@ export class CompanionClient {
       this.emit(
         'error',
         new CoreError({ code: 'client/bad-message', message: 'hello arrived before paired on a pairing connection' }),
+        'frame:hello',
       );
       // Terminal for this attempt: one state report and one `disconnected` (M6), then close.
       this.finishConnection(1002, 'hello-before-paired', true);
@@ -891,7 +1216,7 @@ export class CompanionClient {
     }
     // Answer with `client-hello`; `ready` fires on the host's acknowledgement (§3.6).
     this._state = 'waiting-client-hello';
-    this.emit('state', this._state);
+    this.emit('state', this._state, 'state');
     this.sendClientHello();
   }
 
@@ -926,7 +1251,7 @@ export class CompanionClient {
       // The transport is not open. Its own `close` (or the handshake deadline) owns the outcome
       // here: finishing locally would hide the contract close code it is about to report
       // (4401 revoked / 4004 gateway disabled, ...).
-      this.emit('error', new CoreError({ code: 'client/disconnected', message: 'Socket closed during client-hello' }));
+      this.emit('error', new CoreError({ code: 'client/disconnected', message: 'Socket closed during client-hello' }), 'client-hello');
     } catch (error) {
       // An id source or transport that throws must be reported here: the exception used to
       // unwind into the transport listener, which swallows it (native `addPinnedWsListener`).
@@ -947,6 +1272,7 @@ export class CompanionClient {
     this.emit(
       'error',
       new CoreError({ code: 'client/bad-state', message, details: { stage: 'client-hello' }, cause }),
+      'client-hello',
     );
     this.finishConnection(1006, 'client-hello-failed', false);
   }
@@ -961,8 +1287,8 @@ export class CompanionClient {
     this.clearHandshakeTimer();
     this._state = 'ready';
     this.startPing();
-    this.emit('ready', { hello: this._hello as HelloFrame, device: this._device });
-    this.emit('state', this._state);
+    this.emit('ready', { hello: this._hello as HelloFrame, device: this._device }, 'frame:client-hello');
+    this.emit('state', this._state, 'state');
   }
 
   private handleAnswer(f: Record<string, unknown>): void {
@@ -1034,11 +1360,12 @@ export class CompanionClient {
       this.emit(
         'error',
         new CoreError({ code, message, details: { op: null, orphanRequestId: requestId } }),
+        'frame:error',
       );
       return;
     }
     this.failAllPending(err);
-    this.emit('error', err);
+    this.emit('error', err, 'frame:error');
   }
 
   private requireUpdate(update: UpdateRequired): void {
@@ -1048,8 +1375,8 @@ export class CompanionClient {
     this.stopPing();
     this.clearHandshakeTimer();
     this.failAllPending(new CoreError({ code: mapped, message: update.message, details: { side: update.side } }));
-    if (changed) this.emit('state', this._state);
-    this.emit('updateRequired', update);
+    if (changed) this.emit('state', this._state, 'state');
+    this.emit('updateRequired', update, 'update-required');
     // The host may close after protocol/unsupported; closing here is harmless and immediate.
     this.transport.close(1000, 'update-required');
   }
@@ -1061,19 +1388,48 @@ export class CompanionClient {
     this.stopPing();
     this.clearHandshakeTimer();
     this.failAllPending(new CoreError({ code: 'auth/revoked', message: 'This device was revoked' }));
-    this.emit('state', this._state);
-    this.emit('revoked', { code: 'auth/revoked' });
+    this.emit('state', this._state, 'state');
+    this.emit('revoked', { code: 'auth/revoked' }, 'revoked');
     this.transport.close(CLOSE_CODES.revoked, 'revoked');
   }
 
+  /**
+   * Owner switched remote control off: an in-band `remote/disabled` frame, or an HTTP 403 refused
+   * at the upgrade. `finishConnection` reports the single `disconnected` (`retry: false`, so the
+   * reconnect loop stops) and closes the transport with the contract code, so the outcome no
+   * longer depends on the transport following the frame/error with a close of its own.
+   */
   private fireGatewayDisabled(): void {
+    if (this.closeReported) return;
     this._state = 'gateway-disabled';
     this.stopPing();
     this.clearHandshakeTimer();
     this.failAllPending(new CoreError({ code: 'remote/disabled', message: 'Remote control is off on the host' }));
-    this.emit('state', this._state);
-    this.emit('gatewayDisabled', { code: 'remote/disabled' });
-    this.transport.close(CLOSE_CODES.gatewayDisabled, 'gateway-disabled');
+    this.emit('state', this._state, 'state');
+    this.emit('gatewayDisabled', { code: 'remote/disabled' }, 'gateway-disabled');
+    this.finishConnection(CLOSE_CODES.gatewayDisabled, 'gateway-disabled', false);
+  }
+
+  /**
+   * The host refused the credential at the upgrade (HTTP 401 -> `auth/required`).
+   *
+   * A 401 is the contract's *re-authenticate* vocabulary (§6), not a revocation — `auth/revoked`
+   * (close 4401) is what wipes the credential, and a 401 does not prove revocation — so the token
+   * is kept, the state becomes `reauth-required` and the app shows the re-auth banner. Unlike the
+   * mid-connection close 4003 (which keeps its prompt retry), the *upgrade* refusal is produced
+   * by the same stored credential on every attempt, so this one is terminal (`retry: false`).
+   */
+  private fireReauthRequired(): void {
+    if (this.closeReported) return;
+    this._state = 'reauth-required';
+    this.stopPing();
+    this.clearHandshakeTimer();
+    this.failAllPending(
+      new CoreError({ code: 'auth/required', message: 'The host rejected the credential; pair this phone again' }),
+    );
+    this.emit('state', this._state, 'state');
+    this.emit('reauthRequired', { code: 'auth/required' }, 'reauth-required');
+    this.finishConnection(CLOSE_CODES.reauth, 'reauth-required', false);
   }
 
   private startPing(): void {
@@ -1095,6 +1451,7 @@ export class CompanionClient {
             details: { stage: 'ping' },
             cause: error,
           }),
+          'ping',
         );
         return;
       }
@@ -1111,6 +1468,7 @@ export class CompanionClient {
             details: { stage: 'ping' },
             cause: error,
           }),
+          'ping',
         );
       }
     }, this.pingIntervalMs);
@@ -1138,6 +1496,57 @@ export class CompanionClient {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
+    // Every site that clears the handshake deadline also ends the approval wait (§3.8): the two
+    // are one attempt budget, and leaving the approval timer behind would fire it into a
+    // connection that already finished or already became `ready`.
+    this.clearApprovalTimer();
+  }
+
+  /**
+   * Arm the desktop-approval deadline (contract §3.8) from the Host's `expiresAt`, never beyond
+   * `pairApprovalTimeoutMs` (a Host promising a distant expiry must not hold the app forever).
+   * An `expiresAt` already in the past fires immediately: the Host says the window is closed.
+   */
+  private armApprovalTimer(expiresAt: number): void {
+    this.clearApprovalTimer();
+    const untilExpiry = Math.max(0, expiresAt - Date.now());
+    const delay = this.pairApprovalTimeoutMs > 0
+      ? Math.min(untilExpiry, this.pairApprovalTimeoutMs)
+      : untilExpiry;
+    const timer = setTimeout(() => this.onApprovalTimeout(), delay);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    this.approvalTimer = timer;
+    this.approvalPending = true;
+  }
+
+  private clearApprovalTimer(): void {
+    this.approvalPending = false;
+    if (this.approvalTimer !== null) {
+      clearTimeout(this.approvalTimer);
+      this.approvalTimer = null;
+    }
+  }
+
+  /**
+   * The desktop never approved inside the window the Host granted (contract §3.8). The pairing is
+   * not a failure of the connection: report a terminal pairing error and end the attempt, so the
+   * screen can say the approval window ran out and the user can pair with a fresh code.
+   */
+  private onApprovalTimeout(): void {
+    this.approvalTimer = null;
+    this.approvalPending = false;
+    if (this.closeReported) return;
+    this.emit(
+      'error',
+      new CoreError({
+        code: 'client/pairing-timeout',
+        message: 'The approval window on the computer ran out before this phone was approved',
+        retryable: false,
+        details: { stage: 'waiting-approval', timeoutMs: this.pairApprovalTimeoutMs },
+      }),
+      'approval-timeout',
+    );
+    this.finishConnection(1006, 'pairing-approval-timeout', false);
   }
 
   /**
@@ -1148,6 +1557,9 @@ export class CompanionClient {
   private onHandshakeTimeout(): void {
     this.handshakeTimer = null;
     if (this.closeReported) return;
+    // Contract §3.8: the approval wait has its own deadline. If a pairing is pending, the
+    // transport handshake budget no longer governs this attempt.
+    if (this.approvalPending) return;
     const stage = this._state;
     if (stage !== 'connecting' && stage !== 'waiting-hello' && stage !== 'waiting-client-hello') return;
     const message =
@@ -1164,6 +1576,7 @@ export class CompanionClient {
         retryable: true,
         details: { stage, timeoutMs: this.handshakeTimeoutMs },
       }),
+      'handshake-timeout',
     );
     this.finishConnection(1006, 'handshake-timeout', true);
   }
@@ -1176,16 +1589,62 @@ export class CompanionClient {
     }
   }
 
-  private emit<K extends keyof ClientEventMap>(event: K, payload: ClientEventMap[K]): void {
+  /**
+   * Deliver one client event to every handler, in registration order.
+   *
+   * `stage` is a fixed, secret-free name for the step that emitted (e.g. `frame:hello`), so a
+   * failure can be attributed without ever exposing the exception, the payload or a frame.
+   */
+  private emit<K extends keyof ClientEventMap>(event: K, payload: ClientEventMap[K], stage: string): void {
     const set = this.handlers.get(event);
     if (!set) return;
     for (const handler of [...set]) {
       try {
         handler(payload);
       } catch {
-        // handler failures must not break the socket loop
+        // Isolation stays (one bad handler must not skip the others); the swallow does not.
+        this.reportListenerFailure(stage);
       }
     }
+  }
+
+  /**
+   * A handler threw. Report it, and when the throw happened while a server frame was being
+   * processed, end the attempt: the frame is half-applied, so the client must not keep acting
+   * healthy. `retry: false` — a programming error repeats on every attempt and must not spin.
+   * Transport/native listeners are only *reported*: an unrelated listener bug never closes a
+   * socket (that rule lives in those layers and stays there).
+   */
+  private reportListenerFailure(stage: string): void {
+    const report = this.onListenerFailure;
+    if (report !== undefined) {
+      try {
+        report({ boundary: 'client', stage });
+      } catch {
+        // Diagnostics only: a reporter must not break the socket loop either.
+      }
+    }
+    if (!this.inProtocolProcessing || this.terminatingForListenerFailure || this.closeReported) return;
+    this.terminatingForListenerFailure = true;
+    this.finishConnection(1011, 'listener-failure', false);
+  }
+}
+
+/**
+ * The client error a pairing close code reports (contract §3.8), or null for any other code.
+ * Kept as a table so the close handler maps codes, not reason strings, which the contract does
+ * not pin (4403 alone covers refused / bad-nonce / busy / disabled).
+ */
+function pairingCloseError(code: number): { code: CoreErrorCode; message: string } | null {
+  switch (code) {
+    case PAIRING_CLOSE_CODES.rejected:
+      return { code: 'client/pairing-rejected', message: 'The computer rejected this pairing attempt' };
+    case PAIRING_CLOSE_CODES.timeout:
+      return { code: 'client/pairing-timeout', message: 'The computer did not pair this phone in time' };
+    case PAIRING_CLOSE_CODES.expired:
+      return { code: 'client/pairing-expired', message: 'The pairing code or the approval request expired' };
+    default:
+      return null;
   }
 }
 
@@ -1193,12 +1652,23 @@ function parseDevice(value: unknown): DeviceInfo | null {
   if (typeof value !== 'object' || value === null) return null;
   const device = value as Record<string, unknown>;
   if (typeof device.id !== 'string' || device.id.length === 0) return null;
+  // Spec 011: `hello.device` also carries `kind` and the device's granted `scopes` — the gateway's
+  // hello builder sends them (contract line 11: `paired`/`device-info` carry `kind`/`scopes` too).
+  // They were dropped here, which is why the app could not tell whether it may author sessions.
+  // An ABSENT `scopes` stays absent rather than becoming `[]`: "the host reported nothing" and "the
+  // host reported an empty grant" are different claims, and only the caller may interpret an older
+  // gateway. `snapshot().grantedScopes` renders the distinction as [] = UNKNOWN.
+  const scopes = Array.isArray(device.scopes)
+    ? (device.scopes.filter((scope): scope is string => typeof scope === 'string') as unknown as NonNullable<DeviceInfo['scopes']>)
+    : null;
   return {
     id: device.id,
     name: typeof device.name === 'string' ? device.name : device.id,
     ...(typeof device.createdAt === 'number' || typeof device.createdAt === 'string'
       ? { createdAt: device.createdAt }
       : {}),
+    ...(device.kind === 'mobile' || device.kind === 'desktop' ? { kind: device.kind } : {}),
+    ...(scopes === null ? {} : { scopes }),
   };
 }
 

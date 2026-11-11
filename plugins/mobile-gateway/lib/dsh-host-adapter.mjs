@@ -153,6 +153,53 @@ export function createDshHostAdapter(typertGateway, peer, connection, options = 
       ? request.address.childSessionId : request.address.sessionId)
   }
 
+  // -------------------------------------------------------------------------
+  // Durable subagent addressing (spec 011, measured live 2026-11-10).
+  //
+  // A `sessionId` the client holds may name a direct-subagent Session: 827 of 861
+  // sessions on the owner's Host were subagents. DSH refuses such an id when it is
+  // addressed as an ordinary Session — `validateAddress()` throws
+  // `session/agent-busy: "subagent Sessions require their durable parent address"`
+  // — so reading one requires the address `{kind:'subagent', parentSessionId,
+  // childSessionId, mode}`. `mode: 'unknown'` is the value DSH documents for "the
+  // caller does not know the descriptor mode"; DSH skips the mode comparison for it
+  // and still verifies that the child really belongs to that parent.
+  //
+  // The parent id comes from `session/list`, read through THIS adapter (so a device
+  // sees only sessions its own policy admits): the child's parent is not otherwise
+  // derivable from a client id, and the companion wire format carries no
+  // parentSessionId field. The map is a short-lived cache, never a grant: a wrong or
+  // stale parent makes DSH refuse with `subagent/unauthorized`, so it stays closed.
+  const SUBAGENT_PARENT_TTL_MS = 10_000
+  let subagentParents = new Map()
+  let subagentParentsAt = 0
+  const refreshSubagentParents = async (signal) => {
+    const frame = requireRecord(await invoke('session', 'list', sessionListArgs({}), signal), 'session/list')
+    const next = new Map()
+    for (const item of requireArray(frame.items, 'session/list items')) {
+      if (!item || typeof item !== 'object') continue
+      const childSessionId = typeof item.sessionId === 'string' ? item.sessionId : ''
+      const parentSessionId = typeof item.parentSessionId === 'string' ? item.parentSessionId : ''
+      if (childSessionId !== '' && parentSessionId !== '') next.set(childSessionId, parentSessionId)
+    }
+    subagentParents = next
+    subagentParentsAt = Date.now()
+    return next
+  }
+  /** The durable parent of `sessionId` when it names a subagent Session, else undefined. */
+  const subagentParentOf = async (sessionId, signal, { refresh = false } = {}) => {
+    if (!refresh && Date.now() - subagentParentsAt < SUBAGENT_PARENT_TTL_MS && subagentParents.size > 0) {
+      return subagentParents.get(sessionId)
+    }
+    const map = await refreshSubagentParents(signal)
+    return map.get(sessionId)
+  }
+  /** True when DSH refused an id BECAUSE it is a subagent addressed as an ordinary Session. */
+  const isDurableParentRequired = (error) =>
+    error?.code === 'session/agent-busy'
+    && typeof error.message === 'string'
+    && error.message.includes('durable parent address')
+
   const history = async (payload, signal) => {
     const request = {
       address: sessionAddress(payload),
@@ -359,13 +406,52 @@ export function createDshHostAdapter(typertGateway, peer, connection, options = 
           }, signal),
       updateQueue: (payload, signal) => invoke('session', 'updateQueue', requestArgs(payload), signal),
       rename: (payload, signal) => invoke('session', 'rename', requestArgs(payload), signal),
-      selectModel: (payload, signal) => invoke('session', 'selectModel', requestArgs(payload), signal),
+      // `session/selectModel` takes a plain `sessionId` and has NO durable-address
+      // parameter (its request schema is `{sessionId, provider, model,
+      // reasoningEffort?}`), so a subagent Session cannot be addressed here at all.
+      // DSH answers `session/agent-busy: 'session "…" is owned by subagent routing'`;
+      // we translate that single case into a stable code a client can branch on,
+      // instead of a busy-looking failure. Nothing about a root Session changes.
+      async selectModel(payload, signal) {
+        try {
+          return await invoke('session', 'selectModel', requestArgs(payload), signal)
+        } catch (error) {
+          if (error?.code !== 'session/agent-busy') throw error
+          const parentSessionId = await subagentParentOf(payload.sessionId, signal).catch(() => undefined)
+          if (parentSessionId === undefined) throw error
+          // Deliberately does not name the parent: a device learns only that this
+          // Session inherits its model, which it could already infer from its list.
+          throw Object.assign(
+            new Error('a subagent Session inherits the model of the parent Session that started it; select the model on that parent Session'),
+            { code: 'subagent/model-inherited' },
+          )
+        }
+      },
       history,
       async models(payload, signal) {
-        const [catalog, snapshot] = await Promise.all([
-          modelCatalog(signal),
-          sessionSnapshot({ address: { kind: 'session', sessionId: payload.sessionId }, maxMessages: 1 }, signal),
-        ])
+        // Per-session catalog. The root address is tried FIRST with exactly the
+        // arguments this endpoint has always used, so a root Session behaves
+        // byte-identically; only a subagent id pays the extra resolution.
+        const snapshotFor = async () => {
+          try {
+            return await sessionSnapshot({
+              address: { kind: 'session', sessionId: payload.sessionId }, maxMessages: 1,
+            }, signal)
+          } catch (error) {
+            if (!isDurableParentRequired(error)) throw error
+            // One forced refresh: the cache may predate the Session.
+            const parentSessionId = await subagentParentOf(payload.sessionId, signal, { refresh: true })
+            if (parentSessionId === undefined) throw error
+            return await sessionSnapshot({
+              address: {
+                kind: 'subagent', parentSessionId,
+                childSessionId: payload.sessionId, mode: 'unknown',
+              },
+              maxMessages: 1,
+            }, signal)
+          }
+        }
+        const [catalog, snapshot] = await Promise.all([modelCatalog(signal), snapshotFor()])
         const current = snapshot.projections?.values?.modelSelection?.next ?? catalog.default
         return {
           current,
