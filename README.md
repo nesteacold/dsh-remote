@@ -1,3 +1,5 @@
+> **Moved:** this project now lives in [nesteacold/dsh-mobile](https://github.com/nesteacold/dsh-mobile). This repository is archived and read-only.
+
 # DSH Remote
 
 Work in your DeepSeek Harness sessions from anywhere: another computer, a phone,
